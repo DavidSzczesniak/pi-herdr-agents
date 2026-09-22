@@ -1,0 +1,27 @@
+{
+  "name": "pi-herdr-agents",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24.18.0"
+  },
+  "scripts": {
+    "check": "tsc --noEmit --module esnext --moduleResolution bundler --target es2022 --strict --skipLibCheck --allowImportingTsExtensions index.ts protocol.ts runtime.ts pending-fixture.ts transport-check.ts",
+    "transport-check": "node --experimental-strip-types transport-check.ts",
+    "adapter-check": "node --experimental-strip-types adapter-check.mjs",
+    "launch-race-check": "node --experimental-strip-types launch-race-check.mjs",
+    "test": "npm run check && npm run transport-check && npm run adapter-check && npm run launch-race-check"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-ai": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.87.0",
+    "@earendil-works/pi-ai": "0.87.0",
+    "typebox": "1.1.38",
+    "typescript": "5.9.3",
+    "@types/node": "24.13.3"
+  }
+}

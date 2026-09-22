@@ -1,0 +1,10 @@
+{
+  "index.ts": "9905f1d46853fbbe803d00fa6d39557fcddf6b6520f5508c8b7362fab8bd9b60",
+  "protocol.ts": "37ca007262ab267ce675d044d9610cd58f92caa7c7081dccbefee6b1ba2af122",
+  "runtime.ts": "9931de9b2fa96211e4d406e1a69451ac9e00e4f5af6487659e2e11d333085062",
+  "pending-fixture.ts": "f7a56a93fce0a718b71e458b61894bf4188be651ef418adc2ab41acadd4ee335",
+  "adapter-check.mjs": "26e4d3c4c8e4242700d926e9ad1778128fd60af84e06ca41b80ed3ea3821fda3",
+  "transport-check.ts": "7774114cbd089234148a7cf20f142cf7594be18ba9ebf9473d8c6c4bd4429509",
+  "launch-race-check.mjs": "b6bcd1dc0cdfb987ec4c2a5867460aebf7fe4f75a68c3a29f32ad7bd1fbe373a",
+  "PROTOCOL.md": "af4fd695aa9fed7ac79b3b166c71afd229d215bfb255b802655cfb5424843fa6"
+}
