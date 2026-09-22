@@ -1,34 +1,35 @@
 // Pi and Herdr behavior is stubbed here. Files, Unix sockets, and Linux process identity are real.
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, openSync, closeSync, readFileSync, writeFileSync, existsSync, rmSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, existsSync, rmSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { fileURLToPath } from "node:url";
 import adapter from "./index.ts";
 import { atomicWrite, request } from "./protocol.ts";
+import { socketDirectory } from "./startup.ts";
 import { claimLaunch, isOriginalProcessLive, processIdentity, planLines, tabPane, verifySession, thinking } from "./runtime.ts";
 
-const directory = mkdtempSync(join(dirname(fileURLToPath(import.meta.url)), ".adapter-check-"));
-const fd = openSync(directory, "r");
-const state = `/proc/self/fd/${fd}`;
+const directory = mkdtempSync(join(tmpdir(), "piha-adapter-"));
+const state = directory;
 const originalEnv = { ...process.env };
 const fixtures = [];
 let processProbe;
 const pane = (id = "w1:p1") => ({ pane_id: id, workspace_id: "w1", terminal_id: `term-${id}`, tab_id: `tab-${id}` });
 const header = { type: "session", version: 3, id: "session-lead", timestamp: new Date().toISOString(), cwd: directory };
 
-function fixture({ workerId = "lead", role = "lead", parentId = "", auth = true, mode = "started", restart = "", sessionId = `session-${workerId}`, failReport = false, launchFault = "" } = {}) {
+function fixture({ workerId = "lead", role = "lead", parentId = "", auth = true, mode = "started", restart = "", sessionId = `session-${workerId}`, failReport = false, launchFault = "", launchId = "" } = {}) {
   Object.assign(process.env, { DS_HERDR_STATE_DIR: state, DS_HERDR_SESSION: "slice", DS_HERDR_WORKSPACE: directory,
     DS_HERDR_WORKER_ID: workerId, DS_HERDR_ROLE: role, DS_HERDR_PARENT_ID: parentId, DS_HERDR_RESTART_GENERATION: restart,
-    HERDR_ENV: "1", HERDR_PANE_ID: `w1:p-${workerId}` });
+    HERDR_ENV: "1", HERDR_SESSION_NAME: "slice", HERDR_SOCKET_PATH: "/fixture/herdr.sock", HERDR_WORKSPACE_ID: "w1", HERDR_PANE_ID: `w1:p-${workerId}` });
   delete process.env.DS_HERDR_WORKSPACE_ID;
-  delete process.env.DS_HERDR_LAUNCH_ID;
+  process.env.DS_HERDR_LAUNCH_ID = launchId;
   const hooks = new Map();
   const tools = new Map();
   const commands = [];
   const widgets = new Map();
-  let selectedTools = [];
+  let selectedTools = ["read", "bash", "external_evidence"];
+  let startupError;
   let effort = "high";
   let idle = true;
   let shutdowns = 0;
@@ -39,25 +40,28 @@ function fixture({ workerId = "lead", role = "lead", parentId = "", auth = true,
   const sessionFile = join(state, `${workerId}.jsonl`);
   if (!existsSync(sessionFile)) writeFileSync(sessionFile, JSON.stringify({ ...header, id: sessionId }) + "\n");
   const ctx = {
-    cwd: directory, hasUI: true, get signal() { return runSignal; },
+    cwd: directory, mode: "tui", hasUI: true, get signal() { return runSignal; },
     model: { provider: "fixture", id: "no-network" },
     modelRegistry: { hasConfiguredAuth: () => auth, getProviderAuthStatus: () => ({ configured: auth }) },
     sessionManager: { getSessionFile: () => sessionFile, getSessionId: () => sessionId },
     isIdle: () => idle, hasPendingMessages: () => false,
     abort: () => abortController?.abort(), shutdown: () => { shutdowns++; },
-    ui: { notify() {}, setWidget(key, lines) { widgets.set(key, lines); } },
+    ui: { notify(message) { startupError = message; }, setWidget(key, lines) { widgets.set(key, lines); } },
   };
   const emit = async (name, event = {}) => { for (const callback of hooks.get(name) ?? []) await callback(event, ctx); };
   const api = {
     on(name, callback) { hooks.set(name, [...(hooks.get(name) ?? []), callback]); },
     registerTool(tool) { tools.set(tool.name, tool); },
+    registerCommand() {},
     getAllTools: () => ["read", "bash", "edit", "write", "grep", "find", "ls", "external_evidence", ...tools.keys()].map(name => ({ name })),
     getActiveTools: () => selectedTools, setActiveTools: names => { selectedTools = names; },
     getThinkingLevel: () => effort, setThinkingLevel: level => { effort = level; },
     appendEntry(type, data) { writeFileSync(sessionFile, JSON.stringify({ type: "custom", customType: type, data }) + "\n", { flag: "a" }); },
     async exec(_command, args) {
-      commands.push(args);
-      const op = args.slice(2);
+      assert.equal(_command, "env");
+      assert.ok(args.includes("HERDR_SOCKET_PATH=/fixture/herdr.sock"));
+      const op = args.slice(args.indexOf("herdr") + 1);
+      commands.push(["--session", "slice", ...op]);
       if (op[0] === "tab" && op[1] === "create") {
         spawned = pane("w1:new");
         if (launchFault === "unknown-create") return { code: 1, killed: true, stderr: "fixture receipt lost", stdout: "" };
@@ -87,7 +91,7 @@ function fixture({ workerId = "lead", role = "lead", parentId = "", auth = true,
     tools, commands, widgets, ctx, emit, sessionFile,
     get sends() { return sends; }, get shutdowns() { return shutdowns; }, get effort() { return effort; }, get activeTools() { return selectedTools; },
     setAbort(controller) { abortController = controller; },
-    async start() { await emit("session_start", { reason: "startup" }); return JSON.parse(readFileSync(join(state, "workers", `${workerId}.json`))); },
+    async start(reason = "startup") { await emit("session_start", { reason }); if (startupError) throw new Error(startupError); return JSON.parse(readFileSync(join(state, "workers", `${workerId}.json`))); },
     async settle() { await emit("agent_before_settle", { outcome: "completed" }); idle = true; await emit("agent_settled"); },
     async stop() { await emit("session_shutdown"); },
   };
@@ -159,20 +163,26 @@ try {
   const wrongModel = fixture({ workerId: "model-owner", role: "implement", parentId: "lead", restart: deadModelOwner.generation });
   await assert.rejects(wrongModel.start(), /original Pi session required/, "startup refuses model fallback instead of silently changing it");
 
-  const claimed = fixture({ workerId: "claimed", parentId: "lead", role: "implement" });
+  const claimed = fixture({ workerId: "claimed", parentId: "lead", role: "implement", launchId: "wrong-token" });
   const launchClaim = claimLaunch(state, { launchId: "launch-token", workerId: "claimed", previousGeneration: null,
     piSessionPath: claimed.sessionFile, model: { provider: "fixture", id: "no-network" }, callerId: "lead",
     callerGeneration: lead.generation, pid: lead.pid, pidBirth: lead.pidBirth });
   process.env.DS_HERDR_LAUNCH_ID = "wrong-token";
   await assert.rejects(claimed.start(), /launch claim/, "child refuses an unrelated launch token");
   assert.ok(existsSync(join(launchClaim.path, "claim.json")), "child never releases caller's claim");
-  const matchingClaimed = fixture({ workerId: "claimed", parentId: "lead", role: "implement" });
+  const matchingClaimed = fixture({ workerId: "claimed", parentId: "lead", role: "implement", launchId: "launch-token" });
   process.env.DS_HERDR_LAUNCH_ID = "launch-token";
   const claimedIdentity = await matchingClaimed.start();
   assert.equal((await selfRequest(claimedIdentity, { kind: "status" })).identity.model.id, "no-network");
   launchClaim.release();
   assert.equal(existsSync(launchClaim.path), false, "launcher can release exact claim after matching live identity");
   await matchingClaimed.stop();
+  const reloadedClaimed = fixture({ workerId: "claimed", parentId: "lead", role: "implement", launchId: "launch-token" });
+  const reloadedIdentity = await reloadedClaimed.start("reload");
+  assert.equal(reloadedIdentity.piSessionId, claimedIdentity.piSessionId, "worker reload keeps assigned conversation");
+  assert.notEqual(reloadedIdentity.generation, claimedIdentity.generation);
+  assert.equal(reloadedClaimed.sends, 0, "reload never replays submissions");
+  await reloadedClaimed.stop();
 
   const pendingWorker = fixture({ workerId: "pending", parentId: "lead", role: "implement", mode: "pending" });
   const pending = await pendingWorker.start();
@@ -254,6 +264,6 @@ try {
   for (const fixture of fixtures.reverse()) { try { await fixture.stop(); } catch {} }
   for (const key of Object.keys(process.env)) if (!(key in originalEnv)) delete process.env[key];
   Object.assign(process.env, originalEnv);
-  closeSync(fd);
+  rmSync(socketDirectory(state, originalEnv.XDG_RUNTIME_DIR || "/tmp"), { recursive: true, force: true });
   rmSync(directory, { recursive: true, force: true });
 }

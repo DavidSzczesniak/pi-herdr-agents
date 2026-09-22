@@ -1,11 +1,12 @@
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, type ExtensionAPI, type ExtensionContext, type SessionStartEvent } from "@earendil-works/pi-coding-agent";
 import { StringEnum, type AssistantMessage } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { createServer, type Server, type Socket } from "node:net";
 import { randomUUID } from "node:crypto";
-import { appendFileSync, chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { isAbsolute, join, resolve } from "node:path";
-import { atomicWrite, errorText, IdentitySchema, parse, readRecord, RequestSchema, request, Role, SafeId, socketAlive, TaskSchema, type Identity, type Request, type Result, type Task } from "./protocol.ts";
+import { appendFileSync, chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { extensionPath, herdrCommand, privateDirectory, startupConfig, type StartupConfig } from "./startup.ts";
+import { atomicWrite, errorText, IdentitySchema, parse, readRecord, RequestSchema, request, SafeId, socketAlive, TaskSchema, type Identity, type Request, type Result, type Task } from "./protocol.ts";
 import { claimLaunch, LaunchClaimSchema, isOriginalProcessLive, PaneResponse, PlanRecordSchema, PlanSchema, planLines, processIdentity, roleBrief, tabPane, thinking, verifySession, type Pane } from "./runtime.ts";
 
 const toolNames = ["spawn_agent", "list_agents", "wait_agent", "followup_task", "interrupt_agent", "update_plan"];
@@ -14,24 +15,33 @@ const idSchema = Type.String({ pattern: "^[a-zA-Z0-9_-]{1,64}$" });
 const targetFields = { agent_id: idSchema, submission_id: idSchema };
 
 export default function (pi: ExtensionAPI) {
-  function required(name: string): string {
-    const value = process.env[name];
-    if (!value) throw new Error(`Missing ${name}`);
-    return value;
-  }
-  const stateDir = required("DS_HERDR_STATE_DIR");
-  const workerId = parse(SafeId, required("DS_HERDR_WORKER_ID"));
-  const parentId = process.env.DS_HERDR_PARENT_ID ? parse(SafeId, process.env.DS_HERDR_PARENT_ID) : null;
-  const role = parse(Role, required("DS_HERDR_ROLE"));
-  const herdrSession = required("DS_HERDR_SESSION");
-  let workspaceId = process.env.DS_HERDR_WORKSPACE_ID ?? "";
-  const cwd = required("DS_HERDR_WORKSPACE");
-  const paneId = required("HERDR_PANE_ID");
-  if (process.env.HERDR_ENV !== "1" || !isAbsolute(stateDir) || !isAbsolute(cwd)) throw new Error("Requires Herdr and absolute private paths");
-  if (workerId === "lead" ? parentId !== null || role !== "lead" : parentId === null || role === "lead") throw new Error("Only lead may be root");
+  const env: NodeJS.ProcessEnv = { ...process.env, PI_CODING_AGENT_DIR: resolve(getAgentDir()) };
+  let runtime: ReturnType<typeof createRuntime> | undefined;
+  pi.on("session_start", async (_event, ctx) => {
+    if (runtime) return;
+    try {
+      const config = startupConfig(ctx, env);
+      if (!config) return;
+      runtime = createRuntime(pi, config);
+      await runtime.startup(ctx, _event.reason);
+      runtime.registerTools();
+    } catch (error) {
+      await runtime?.cleanup().catch(() => {});
+      ctx.ui.notify(`Herdr adapter disabled: ${errorText(error)}`, "error");
+      if (env.DS_HERDR_WORKER_ID && env.DS_HERDR_WORKER_ID !== "lead") {
+        ctx.shutdown();
+        throw error;
+      }
+    }
+  });
+  pi.on("session_shutdown", async () => { await runtime?.cleanup(); });
+}
+
+function createRuntime(pi: ExtensionAPI, config: StartupConfig) {
+  const { stateDir, socketDir, workerId, parentId, role, herdrSession, cwd, paneId } = config;
+  let workspaceId = config.workspaceId;
   const generation = randomUUID();
-  const socketPath = join(stateDir, "sockets", `${workerId}-${generation}.sock`);
-  if (Buffer.byteLength(socketPath) > 103) throw new Error("State path too long for Unix socket");
+  const socketPath = join(socketDir, `${generation}.sock`);
   const identityPath = (id: string) => join(stateDir, "workers", `${parse(SafeId, id)}.json`);
   const taskPath = (id: string) => join(stateDir, "tasks", workerId, `${parse(SafeId, id)}.json`);
   const lockPath = join(stateDir, "locks", workerId);
@@ -48,10 +58,13 @@ export default function (pi: ExtensionAPI) {
   let shutdownCleaned = false;
   let sequence = Date.now();
   let reportQueue = Promise.resolve();
+  const launches = new Set<Promise<unknown>>();
+  const detachedPath = join(stateDir, "locks", `${workerId}.detached.json`);
   const connections = new Set<Socket>();
   const waiters = new Map<string, Set<(result: Task) => void>>();
 
   function audit(event: string, data: unknown = {}) {
+    if (!identity) return;
     appendFileSync(join(stateDir, "audit", `${workerId}.ndjson`), JSON.stringify({
       at: new Date().toISOString(), workerId, generation, submissionId: active?.submissionId ?? null, event, data,
     }) + "\n", { mode: 0o600 });
@@ -74,11 +87,12 @@ export default function (pi: ExtensionAPI) {
     return false;
   }
   function owned(id: string): Identity {
+    current();
     if (id === workerId || !isDescendant(id, workerId)) throw new Error("Target is not this caller's descendant");
     return readIdentity(id);
   }
   async function herdr(args: string[], signal?: AbortSignal): Promise<unknown> {
-    const output = await pi.exec("herdr", ["--session", herdrSession, ...args], { timeout: 30000, signal });
+    const output = await pi.exec("env", herdrCommand(config, args), { timeout: 30000, signal });
     if (output.code !== 0 || output.killed) throw new Error(`Herdr ${args.slice(0, 2).join(" ")}: ${output.stderr || output.stdout}`);
     if (args[0] === "pane" && ["report-agent", "release-agent", "close"].includes(args[1] ?? "") && !output.stdout.trim()) return undefined;
     return JSON.parse(output.stdout);
@@ -242,16 +256,28 @@ export default function (pi: ExtensionAPI) {
       } catch (error) { respond({ ok: false, error: errorText(error) }); }
     });
   }
-  async function startup(ctx: ExtensionContext) {
+  function isDetached(previous: Identity): boolean {
+    return !previous.available && !existsSync(lockPath) && existsSync(detachedPath) &&
+      readRecord(Type.Object({ generation: SafeId }), detachedPath).generation === previous.generation;
+  }
+  async function startup(ctx: ExtensionContext, reason: SessionStartEvent["reason"]) {
     context = ctx;
     if (resolve(ctx.cwd) !== resolve(cwd)) throw new Error("Worker cwd mismatch");
     const sessionPath = ctx.sessionManager.getSessionFile();
     if (!sessionPath) throw new Error("Explicit persistent Pi session required");
-    mkdirSync(stateDir, { recursive: true, mode: 0o700 });
-    const directory = statSync(stateDir);
-    if (directory.uid !== process.getuid?.() || (directory.mode & 0o077) !== 0) throw new Error("State directory must be private to current user");
-    for (const name of ["workers", "tasks", "sockets", "sessions", "audit", "locks", "artifacts", "plans", "operations"]) mkdirSync(join(stateDir, name), { recursive: true, mode: 0o700 });
-    mkdirSync(join(stateDir, "tasks", workerId), { recursive: true, mode: 0o700 });
+    privateDirectory(stateDir);
+    privateDirectory(dirname(socketDir));
+    privateDirectory(socketDir);
+    const bindingPath = join(stateDir, "binding.json");
+    const bindingSchema = Type.Object({ herdrSocket: Type.String(), herdrSession: Type.String() });
+    if (existsSync(bindingPath)) {
+      const binding = readRecord(bindingSchema, bindingPath);
+      if (binding.herdrSocket !== config.herdrSocket || binding.herdrSession !== herdrSession) throw new Error("Herdr endpoint binding mismatch");
+    } else {
+      writeFileSync(bindingPath, JSON.stringify({ herdrSocket: config.herdrSocket, herdrSession }), { flag: "wx", mode: 0o600 });
+    }
+    for (const name of ["workers", "tasks", "sessions", "audit", "locks", "artifacts", "plans", "operations"]) privateDirectory(join(stateDir, name));
+    privateDirectory(join(stateDir, "tasks", workerId));
     const { pane } = parse(PaneResponse, await herdr(["pane", "get", paneId])).result;
     if (pane.pane_id !== paneId || (workspaceId && pane.workspace_id !== workspaceId)) throw new Error("Explicit private workspace/pane mismatch");
     workspaceId = pane.workspace_id;
@@ -262,24 +288,32 @@ export default function (pi: ExtensionAPI) {
     const birth = processIdentity(process.pid);
     if (!birth) throw new Error("Own Linux process identity unavailable");
     const model = ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : null;
-    const launchId = process.env.DS_HERDR_LAUNCH_ID;
-    if (launchId) {
+    const previous = existsSync(identityPath(workerId)) ? readIdentity(workerId) : undefined;
+    const workerReload = reason === "reload" && role !== "lead" && previous && previous.pid === process.pid &&
+      previous.pidBirth === birth.birth && isDetached(previous);
+    const launchId = config.launchId;
+    if (launchId && !workerReload) {
       const claim = readRecord(LaunchClaimSchema, join(stateDir, "locks", `launch-${workerId}`, "claim.json"));
       if (claim.launchId !== launchId || claim.workerId !== workerId || claim.piSessionPath !== sessionPath ||
-        claim.previousGeneration !== (process.env.DS_HERDR_RESTART_GENERATION || null) ||
+        claim.previousGeneration !== config.restartGeneration ||
         claim.model.provider !== model?.provider || claim.model.id !== model?.id) throw new Error("Native launch claim or selected model mismatch");
     }
-    if (existsSync(identityPath(workerId))) {
-      const previous = readIdentity(workerId);
-      if (process.env.DS_HERDR_RESTART_GENERATION !== previous.generation || previous.parentId !== parentId || previous.role !== role ||
+    if (previous) {
+      if ((!config.automatic && !workerReload && config.restartGeneration !== previous.generation) || previous.parentId !== parentId || previous.role !== role ||
         previous.herdrSession !== herdrSession || previous.workspaceId !== workspaceId || previous.cwd !== cwd ||
         previous.piSessionId !== ctx.sessionManager.getSessionId() || previous.piSessionPath !== sessionPath ||
-        previous.model?.provider !== model?.provider || previous.model?.id !== model?.id)
+        (!config.automatic && (previous.model?.provider !== model?.provider || previous.model?.id !== model?.id)))
         throw new Error("Identity exists; explicit matching restart generation and original Pi session required");
       const claim = join(stateDir, "locks", `restart-${previous.generation}`);
       mkdirSync(claim);
       try {
-        await proveDead(previous);
+        const detached = (config.automatic || workerReload) && isDetached(previous);
+        if (detached) {
+          if (await socketAlive(previous.socketPath)) throw new Error("Detached endpoint still live or unknown");
+          // Pi may not flush an empty conversation yet. The same live native runtime
+          // supplies the matching UUID/path above; cold opens still require the header.
+          if (previous.pid !== process.pid || previous.pidBirth !== birth.birth) verifySession(previous);
+        } else await proveDead(previous);
         if (readIdentity(workerId).generation !== previous.generation) throw new Error("Restart generation changed");
         rmSync(previous.socketPath, { force: true });
         if (existsSync(lockPath)) {
@@ -304,7 +338,6 @@ export default function (pi: ExtensionAPI) {
     await new Promise<void>((resolve, reject) => { server?.once("error", reject); server?.listen(socketPath, resolve); });
     chmodSync(socketPath, 0o600);
     atomicWrite(identityPath(workerId), identity);
-    pi.setActiveTools(pi.getAllTools().map((tool) => tool.name));
     if (role !== "lead") pi.setThinkingLevel(thinking(role));
     const planPath = join(stateDir, "plans", `${workerId}.json`);
     if (existsSync(planPath)) {
@@ -312,30 +345,22 @@ export default function (pi: ExtensionAPI) {
       if (plan.workerId !== workerId || plan.piSessionId !== identity.piSessionId) throw new Error("Plan session mismatch");
       if (ctx.hasUI) ctx.ui.setWidget("ds-plan", planLines(plan));
     }
-    audit("session_start", { ...identity, activeTools: pi.getActiveTools(), model: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : null, thinking: pi.getThinkingLevel() });
     await report("idle");
   }
-  pi.on("session_start", async (_event, ctx) => {
-    try { await startup(ctx); }
-    catch (error) {
-      shuttingDown = true;
-      pi.setActiveTools([]);
-      ctx.ui.notify(`Herdr adapter unavailable: ${errorText(error)}`, "error");
-      ctx.shutdown();
-      throw error;
-    }
-  });
   pi.on("model_select", (event) => {
     if (!identity || shuttingDown) return;
     identity = { ...identity, model: { provider: event.model.provider, id: event.model.id } };
     atomicWrite(identityPath(workerId), identity);
     audit("model_select", { model: identity.model, source: event.source });
   });
-  pi.on("session_before_switch", () => ({ cancel: true }));
-  pi.on("session_before_fork", () => ({ cancel: true }));
-  pi.on("session_before_tree", () => ({ cancel: true }));
+  const guardWorkerConversation = () => {
+    if (role !== "lead") return { cancel: true };
+  };
+  pi.on("session_before_switch", guardWorkerConversation);
+  pi.on("session_before_fork", guardWorkerConversation);
+  pi.on("session_before_tree", guardWorkerConversation);
   pi.on("input", (event) => {
-    if (shuttingDown) return { action: "handled" };
+    if (!identity || shuttingDown) return;
     if (!active) return;
     if (event.source !== "extension" || event.text !== `[ds-task ${active.nonce}]\n${active.task}`) return { action: "handled" };
     active = { ...active, phase: "input_observed" };
@@ -343,15 +368,16 @@ export default function (pi: ExtensionAPI) {
     audit("input_observed", { nonce: active.nonce });
   });
   pi.on("before_agent_start", (event) => {
+    if (!identity || shuttingDown) return;
     if (active && event.prompt === `[ds-task ${active.nonce}]\n${active.task}`) startNonce = active.nonce;
     event.systemPromptOptions.promptGuidelines.push("Host binding: ds-mode's Codex lead/worker references mean the corresponding native Pi roles here. Use matching update_plan, spawn_agent, wait_agent, list_agents, followup_task and interrupt_agent tools. Use read, grep, find and bash for Read/Grep/Glob/Shell. Preserve all skill phases, triggers, ownership and proof requirements. A genuine human question requires a real user answer; stop and report it if no interactive question tool is available.");
   });
   pi.on("tool_call", () => {
-    if (shuttingDown) return { block: true, reason: "Runtime shutting down" };
+    if (shuttingDown && role !== "lead") return { block: true, reason: "Runtime shutting down" };
   });
   pi.on("agent_start", async (_event, ctx) => {
     context = ctx;
-    if (shuttingDown) { ctx.abort(); return; }
+    if (!identity || shuttingDown) return;
     if (active && startNonce === active.nonce) {
       active = { ...active, phase: "started" };
       atomicWrite(taskPath(active.submissionId), active);
@@ -362,19 +388,22 @@ export default function (pi: ExtensionAPI) {
     }
     await report("working");
   });
-  pi.on("before_provider_request", () => { audit("provider_request"); });
-  pi.on("cache_warming_decision", () => ({ action: "stop" }));
+  pi.on("before_provider_request", () => { if (identity && !shuttingDown) audit("provider_request"); });
+  pi.on("cache_warming_decision", () => {
+    if (identity && !shuttingDown && role !== "lead") return { action: "stop" };
+  });
   pi.on("message_end", (event) => {
-    if (event.message.role !== "assistant") return;
+    if (!identity || shuttingDown || event.message.role !== "assistant") return;
     audit("assistant_usage", { model: event.message.model, provider: event.message.provider, usage: event.message.usage, stopReason: event.message.stopReason });
     if (active) assistants.push(event.message);
   });
-  pi.on("tool_execution_start", (event) => audit("tool_start", { toolName: event.toolName, toolCallId: event.toolCallId }));
-  pi.on("tool_execution_end", (event) => audit("tool_end", { toolName: event.toolName, toolCallId: event.toolCallId, isError: event.isError }));
+  pi.on("tool_execution_start", (event) => { if (identity && !shuttingDown) audit("tool_start", { toolName: event.toolName, toolCallId: event.toolCallId }); });
+  pi.on("tool_execution_end", (event) => { if (identity && !shuttingDown) audit("tool_end", { toolName: event.toolName, toolCallId: event.toolCallId, isError: event.isError }); });
   pi.on("agent_before_settle", (event) => {
     boundaryOutcome = event.outcome === "aborted" ? "interrupted" : event.outcome === "error" ? "error" : "completed";
   });
   pi.on("agent_settled", async (_event, ctx) => {
+    if (!identity || shuttingDown) return;
     context = ctx;
     if (active?.phase === "started") {
       const lastStopReason = assistants.at(-1)?.stopReason;
@@ -394,14 +423,17 @@ export default function (pi: ExtensionAPI) {
     }
     await report("idle");
   });
-  pi.on("session_shutdown", async () => {
+  async function cleanup() {
+    shuttingDown = true;
     if (!identity || shutdownCleaned) return;
     shutdownCleaned = true;
-    shuttingDown = true;
-    if (active) publish({ ...active, kind: "unavailable", reason: "Session shutdown before settlement" });
-    atomicWrite(identityPath(workerId), { ...identity, available: false });
-    audit("session_shutdown");
+    await Promise.allSettled(launches);
+    let detached = false;
     try {
+      if (active) publish({ ...active, kind: "unavailable", reason: "Session shutdown before settlement" });
+      atomicWrite(identityPath(workerId), { ...identity, available: false });
+      detached = true;
+      audit("session_shutdown");
       await reportQueue;
       await herdr(["pane", "release-agent", identity.paneId, "--source", "ds-slice", "--agent", "pi", "--seq", String(++sequence)]);
       audit("agent_released");
@@ -411,14 +443,18 @@ export default function (pi: ExtensionAPI) {
       try { if (server?.listening) await new Promise<void>((resolve) => server?.close(() => resolve())); }
       finally {
         rmSync(socketPath, { force: true });
-        if (readIdentity(workerId).generation === generation) rmSync(lockPath, { recursive: true, force: true });
+        if (readIdentity(workerId).generation === generation) {
+          rmSync(lockPath, { recursive: true, force: true });
+          if (detached) atomicWrite(detachedPath, { generation });
+        }
+        context?.ui.setWidget("ds-plan", undefined);
       }
     }
-  });
+  }
 
   async function proveDead(previous: Identity) {
     if (previous.herdrSession !== herdrSession || previous.workspaceId !== workspaceId) throw new Error("Restart workspace mismatch");
-    if (previous.socketPath !== join(stateDir, "sockets", `${previous.workerId}-${previous.generation}.sock`)) throw new Error("Socket identity path mismatch");
+    if (previous.socketPath !== join(socketDir, `${previous.generation}.sock`)) throw new Error("Socket identity path mismatch");
     if (readIdentity(previous.workerId).generation !== previous.generation) throw new Error("Restart generation changed");
     if (isOriginalProcessLive(previous)) throw new Error("Original PID/birth still live; duplicate writer refused");
     if (await socketAlive(previous.socketPath)) throw new Error("Previous endpoint live or unknown; replacement refused");
@@ -453,7 +489,13 @@ export default function (pi: ExtensionAPI) {
       return result;
     }
   }
-  async function launch(spec: { childId: string; parent: string | null; childRole: Identity["role"]; childCwd: string;
+  function launch(...args: Parameters<typeof launchNative>) {
+    const pending = launchNative(...args);
+    launches.add(pending);
+    void pending.finally(() => launches.delete(pending)).catch(() => {});
+    return pending;
+  }
+  async function launchNative(spec: { childId: string; parent: string | null; childRole: Identity["role"]; childCwd: string;
     sessionPath: string; task: string; previous?: Identity }, ctx: ExtensionContext, signal?: AbortSignal) {
     current();
     signal?.throwIfAborted();
@@ -475,7 +517,8 @@ export default function (pi: ExtensionAPI) {
       save({ kind: "creating" });
       if (spec.previous) await proveDead(spec.previous);
       if (!spec.previous) writeFileSync(spec.sessionPath, "", { flag: "wx", mode: 0o600 });
-      const env = { DS_HERDR_STATE_DIR: stateDir, DS_HERDR_SESSION: herdrSession, DS_HERDR_WORKSPACE_ID: workspaceId,
+      const env = { ...config.childEnvironment, HERDR_SOCKET_PATH: config.herdrSocket, HERDR_SESSION_NAME: herdrSession,
+        DS_HERDR_SOCKET_DIR: socketDir, DS_HERDR_STATE_DIR: stateDir, DS_HERDR_SESSION: herdrSession, DS_HERDR_WORKSPACE_ID: workspaceId,
         DS_HERDR_WORKER_ID: spec.childId, DS_HERDR_PARENT_ID: spec.parent ?? "", DS_HERDR_ROLE: spec.childRole,
         DS_HERDR_WORKSPACE: spec.childCwd, DS_HERDR_RESTART_GENERATION: spec.previous?.generation ?? "", DS_HERDR_LAUNCH_ID: launchId };
       // Finish bounded creation even on caller abort so its exact receipt remains available for cleanup.
@@ -485,10 +528,11 @@ export default function (pi: ExtensionAPI) {
       save({ kind: "tab_response", response: created });
       pane = tabPane(created, workspaceId);
       save({ kind: "starting" });
+      current();
       signal?.throwIfAborted();
       nativeStartAttempted = true;
       await herdr(["agent", "start", `${spec.childId}-${launchId.slice(0, 8)}`, "--kind", "pi", "--pane", pane.pane_id, "--timeout", "25000", "--",
-        "--no-extensions", "-e", "/opt/adapter/index.ts", "--session", spec.sessionPath,
+        "--no-extensions", "-e", extensionPath, "--session", spec.sessionPath,
         "--model", `${model.provider}/${model.id}`,
         "--thinking", thinking(spec.childRole), "--tools", normalTools.join(","), "--append-system-prompt", roleBrief(spec.childRole)]);
       signal?.throwIfAborted();
@@ -540,6 +584,7 @@ export default function (pi: ExtensionAPI) {
     }
     return { content: [{ type: "text" as const, text }], details: {} };
   }
+  function registerTools() {
   pi.registerTool({
     name: "update_plan", label: "Update plan", description: "Replace this session's own checklist. Preserve exact step text, including verbatim playbook steps. Workers cannot target another session's plan.",
     parameters: PlanSchema,
@@ -565,6 +610,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "list_agents", label: "List agents", description: "List this caller's descendants with exact runtime status. Registry alone does not prove liveness. Output capped at 50 KiB with artifact path.", parameters: Type.Object({}),
     async execute(_id, _params, signal) {
+      current();
       const rows: unknown[] = [];
       for (const file of readdirSync(join(stateDir, "workers"))) {
         if (!file.endsWith(".json")) continue;
@@ -614,4 +660,16 @@ export default function (pi: ExtensionAPI) {
       return toolResult(readRecord(TaskSchema, join(stateDir, "tasks", target.workerId, `${params.submission_id}.json`)));
     },
   });
+  if (role !== "lead") pi.setActiveTools(normalTools);
+  pi.registerCommand("herdr-agents", {
+    description: "Show this adapter's identity, state directory, and enabled tools",
+    handler: async (_args, ctx) => {
+      const own = current();
+      const enabled = pi.getActiveTools().filter(name => toolNames.includes(name));
+      ctx.ui.notify(`Herdr agents: ${own.workerId}, session ${own.piSessionId}\nState: ${stateDir}\nEnabled: ${enabled.join(", ") || "none"}`, "info");
+    },
+  });
+  audit("session_start", { ...current(), activeTools: pi.getActiveTools(), thinking: pi.getThinkingLevel() });
+  }
+  return { startup, cleanup, registerTools };
 }

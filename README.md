@@ -4,41 +4,69 @@ A Pi extension that hosts delegated Pi workers in Herdr tabs. It provides `spawn
 
 ## Current status
 
-This repository preserves the reviewed hardening prototype. **It is not installed in Pi and is not ready for ordinary autoload.** Starting a new Pi session does not enable it.
+Normal startup is available for supervised dogfooding. Focused native checks and independent review passed. See [the startup verification record](docs/normal-startup-verification.md) for coverage and limits. Cloning this repository does not install it.
 
-Native trials used a private Herdr server, private Pi configuration, explicit `DS_HERDR_*` environment variables, and this source mounted at `/opt/adapter`. Child startup still references `/opt/adapter/index.ts`. Loading `index.ts` without that setup fails its startup checks and can shut down the Pi session. Do not globally install it yet.
+Once installed, ordinary `pi` in a Herdr pane activates the adapter automatically. The lead needs no `DS_HERDR_*` exports, explicit extension flag, source mount, or private launcher. Pi outside Herdr, print mode, JSON mode, RPC, ordinary SDK use, and `--no-session` stay inert. Activation requires `ctx.mode === "tui"` and a persistent native session. RPC's `hasUI` flag is not an activation signal.
 
-The next integration work is a normal startup path that locates this checkout, initializes session-owned state, and attaches to the intended Herdr workspace. Switching away from the currently installed Gotgenes package is a separate, explicitly authorized installation change.
+The integration targets Pi 0.87.0, Herdr 0.8.0 protocol 19, and Node 24.18.0 on Linux. Development dependencies are pinned. Broad peer declarations follow Pi's package convention and do not claim compatibility with other versions.
 
-Tested native versions were Pi 0.87.0, Herdr 0.8.0 protocol 19, and Node 24.18.0 on Linux. The broad peer dependency declarations follow Pi's package convention; they are not compatibility claims for other versions.
+## Install or remove the local package
+
+After review and native verification, install the checkout with:
+
+```sh
+pi install /absolute/path/to/pi-herdr-agents
+```
+
+Pi records the local path without copying it. Keep that directory available. The package manifest loads only `index.ts`, never test fixtures. Start ordinary `pi` in a Herdr pane after installation. The active tools include the adapter tools unless your tool allowlist or exclusions disable them. Run `/herdr-agents` to inspect adapter identity, state path, and enabled tools.
+
+Remove or disable the previous delegation package before loading this one to avoid competing delegation tools. Use `pi list` to find its exact source, then `pi remove <source>`. This repository does not perform that migration.
+
+To remove this adapter:
+
+```sh
+pi remove /absolute/path/to/pi-herdr-agents
+```
+
+Restart Pi or use `/reload` after changing packages. Removal does not close workers or delete their state. Finish or explicitly stop owned workers before removal. Leave Herdr's managed `herdr-agent-state.ts` integration installed. This adapter uses its own report source and does not edit that file.
+
+## Runtime behavior
+
+Each native lead conversation owns a separate private directory under `$XDG_STATE_HOME/pi-herdr-agents/v1`, or `~/.local/state/pi-herdr-agents/v1`. The key includes the exact Herdr socket, native Pi UUID, and native session path. Runtime files never go into the project checkout.
+
+Unix sockets use a short directory under `$XDG_RUNTIME_DIR`, or `/tmp` when unset. A long durable state path is supported. An overlong runtime socket path disables the adapter with a notification. Use a short `XDG_RUNTIME_DIR` in sandbox environments where `/tmp` is not shared with children.
+
+All Herdr commands target the captured `HERDR_SOCKET_PATH`. Startup verifies the actual `HERDR_PANE_ID` and workspace. Default and named servers are supported. No command falls back to the focused pane.
+
+Workers start fresh conversations and own their descendants. Children receive their complete task brief, not parent conversation history. They use the installed extension's actual path, the caller's model, role-specific thinking, and normal tools, including Bash, Git through Bash, edits, writes, and nested delegation. A read-only review is an assignment, not a reduced tool profile. The lead retains its selected tools and thinking level.
+
+Child launches explicitly inherit the caller's effective Pi config directory, including the default when no override is set, and selected non-secret Pi startup settings. They load only this extension. Skills, context files, settings, and file-based authentication use normal Pi discovery. Other extensions and credentials supplied only to the lead process are not copied into children.
+
+A task receipt requires a correlated native start event. Bounded waits do not cancel work. Interruption and cold continuation retain exact task, worker, process, model, and conversation identities. Ambiguous submissions are never automatically replayed. There are no adapter turn ceilings.
+
+## Session lifecycle and recovery
+
+The lead can use `/new`, `/resume`, `/fork`, `/clone`, `/tree`, and `/reload`. Pi's documented shutdown/start lifecycle detaches the old runtime and binds the replacement to its native conversation. Descendants remain in their tabs. Returning to the same session restores its descendants and latest session-owned plan. A fork gets a new adapter state directory. Plans and descendants are session-wide, not branch-local, so `/tree` does not rewind them.
+
+A clean shutdown records a detached generation after closing the socket and removing its runtime lock. Reload and same-process resume can reclaim that generation, including an empty native session that Pi has not flushed to disk. After a crash, resumption instead requires proof that the previous PID/birth and socket are dead. An active duplicate owner disables the new adapter without shutting down the user's Pi. External duplicate native session opens can still write Pi metadata before extension initialization and remain outside the ownership guarantee.
+
+Workers cannot switch, fork, or navigate away from their assigned conversation history. Worker `/reload` can rebind only after a clean same-process detach. It never replays a task. Child startup failures may request native shutdown. Ordinary lead startup failures notify the user and leave Pi usable without adapter tools.
+
+See [the protocol](PROTOCOL.md) for state files, correlation, launch fences, recovery proofs, and internal child configuration.
 
 ## Development checks
-
-Install the pinned development dependencies, then run all four checks:
 
 ```sh
 npm ci --ignore-scripts --no-audit --no-fund
 npm test
 ```
 
-The dependency lockfile makes this checkout independent of the earlier prototype's dependency symlink.
+Transport checks use real Unix sockets. Adapter and startup checks use real files, sockets, and Linux process identities but stub TUI events and Herdr commands. Startup checks also exercise real Pi package discovery and headless SDK binding. The launch-race check uses two real processes with a stubbed native session-open boundary. These checks launch neither Herdr nor models. Native lifecycle verification requires a disposable Herdr server and ordinary package autoload.
 
-Transport checks use real Unix sockets. Adapter checks use real files, sockets, and Linux process identities but stub Pi lifecycle events and Herdr commands. The launch-race check uses two real processes with a stubbed native session-open boundary. These checks launch neither Herdr nor models.
+## Limits and evidence
 
-## Runtime contract
+The adapter does not protect against malicious peers sharing its UID. Whole-Herdr-server crash recovery and automatic reconciliation of uncertain launch claims are unsupported. Structured `AskQuestion` is not implemented. Workers must report genuine human questions and wait for a real answer.
 
-Workers start fresh conversations and own their descendants. A task receipt requires a correlated native start event. Bounded waits do not cancel work. Interruption and cold continuation retain exact task, worker, process, and conversation identities. Ambiguous submissions are not automatically replayed.
+The historical hardening checks passed independent runtime review. One ds-mode bug-fix journey produced a correct fix and passed 32 external checks, but its workflow assessment was partial because the lead skipped prescribed skill steps.
 
-Every role has normal tools, including Bash, Git through Bash, edits, writes, and delegation. A read-only review is a task instruction to report findings without applying implementation fixes. It is not a reduced tool profile.
-
-Each worker owns its plan and gets a separate Herdr tab. Plans and task records persist locally. See [the protocol](PROTOCOL.md) for environment requirements, state files, recovery behavior, and limits.
-
-The adapter does not protect workers from malicious peers sharing their UID. It does not support arbitrary external writers opening the same Pi session, session switching, reload, or automatic reconciliation of uncertain launch claims. A whole-server restart is not an accepted recovery case.
-
-## Evidence and provenance
-
-The native hardening checks passed independent runtime review. One ds-mode bug-fix journey produced a correct fix and passed 32 external checks, but its workflow assessment was partial because the lead skipped prescribed skill steps.
-
-See [provenance and review records](docs/provenance.md). This repository contains source, checks, and review summaries, not credentials or raw session transcripts. The original trial archive remains separate and unchanged.
-
-This is a local Git repository. No remote backup or publication is configured.
+See [provenance and review records](docs/provenance.md). This repository contains source, checks, and review summaries, not credentials or raw transcripts. The original trial archive remains separate and unchanged. No remote backup or publication is configured.

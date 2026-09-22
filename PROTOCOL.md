@@ -1,10 +1,10 @@
 # Adapter protocol
 
-One newline-delimited JSON request and response uses each Unix socket connection. `protocol.ts` owns the wire schemas. `runtime.ts` owns the Linux identity, plan, role, and Herdr receipt helpers. This protocol is private to this prototype and does not migrate old-slice identity records.
+One newline-delimited JSON request and response uses each Unix socket connection. `protocol.ts` owns the wire schemas. `runtime.ts` owns the Linux identity, plan, role, and Herdr receipt helpers. This protocol is private to this package. Normal-startup state uses the `v1` namespace and does not migrate earlier prototype directories.
 
 ## Identity and ownership
 
-An identity records `workerId`, `parentId`, `role`, `herdrSession`, `workspaceId`, `paneId`, `terminalId`, `generation`, `socketPath`, `pid`, `pidBirth`, `piSessionId`, `piSessionPath`, `cwd`, `available`, and `model`.
+An identity records `workerId`, `parentId`, `role`, `herdrSession`, `workspaceId`, `paneId`, `terminalId`, `generation`, `socketPath`, `pid`, `pidBirth`, `piSessionId`, `piSessionPath`, `cwd`, `available`, and `model`. `herdrSession` captures `HERDR_SESSION_NAME` when available, otherwise an empty string. The socket binding, not this optional name, determines the server.
 
 `model` is the native selected `{provider, id}`, or null when no model is selected. Startup captures `ctx.model`; native `model_select` updates it durably. Cold launch requires a recorded model, passes it explicitly, and verifies the selected model. This avoids Pi's default fallback for sessions without messages. Attempt-1 identity records lack this required field and need a fresh private state directory.
 
@@ -16,21 +16,26 @@ Safe IDs match `[a-zA-Z0-9_-]{1,64}`. Worker IDs, task submission IDs, Pi UUIDs,
 
 ## Persisted files
 
-Under `DS_HERDR_STATE_DIR`:
+Each ordinary lead uses `$XDG_STATE_HOME/pi-herdr-agents/v1/<key>`, defaulting to `~/.local/state/pi-herdr-agents/v1/<key>`. The SHA-256 key includes the exact Herdr socket path, native Pi session ID, and native Pi session path. Children inherit this directory as `DS_HERDR_STATE_DIR`. Adapter runtime state never goes into the project checkout.
+
+Under that directory:
 
 | Path | Content |
 |---|---|
+| `binding.json` | Exact Herdr socket path and captured server name, empty when unset |
 | `workers/<workerId>.json` | Current runtime identity |
 | `tasks/<workerId>/<submissionId>.json` | Exact task, generation, Pi UUID, state, and result |
-| `sockets/<workerId>-<generation>.sock` | Runtime endpoint |
 | `sessions/<workerId>.jsonl` | Child's native Pi conversation |
 | `plans/<workerId>.json` | Plan with owning worker ID and Pi UUID |
 | `operations/*.json` | Launch and outbound submission receipts, including uncertain failures |
 | `audit/<workerId>.ndjson` | Events across generations |
 | `artifacts/<workerId>-<submissionId>.md` | Full settled assistant text |
 | `locks/<workerId>/generation` | Exclusive runtime claim |
+| `locks/<workerId>.detached.json` | Generation whose clean shutdown persisted unavailability and finished socket/lock cleanup |
 | `locks/restart-<oldGeneration>` | Temporary child-startup admission claim |
 | `locks/launch-<workerId>/claim.json` | Cross-process pre-launch fence with launch token, previous generation, model, session path, and caller process identity |
+
+Sockets live separately at `<runtimeRoot>/piha-<uid>/<state-directory-hash>/<generation>.sock`. `runtimeRoot` is `XDG_RUNTIME_DIR`, or `/tmp` when unset. Socket paths must fit 103 bytes. Children inherit the exact socket directory. Directories must belong to the current UID, have no group/other permission bits, and not be symlinks. Runtime state paths can be long without lengthening sockets.
 
 Record writes use mode 0600 and atomic rename. Runtime directories use mode 0700. Retired lock directories remain as evidence. Old task and conversation files are not deleted.
 
@@ -91,7 +96,7 @@ Cold continuation proves all of the following:
 - The original PID and birth no longer identify a live writer.
 - The old socket is absent or refuses connections. Unknown liveness refuses replacement.
 - The original session header matches the saved Pi UUID and exact session path.
-- The role, original parent, cwd, named Herdr session, and private workspace match.
+- The role, original parent, cwd, Herdr server binding, and workspace match.
 
 The caller first acquires the per-worker launch claim with atomic directory creation, before native Pi can open the session. It repeats death/generation checks under the claim. The child verifies its launch token, session path, and selected model against that claim. Startup separately claims the old generation, repeats the death checks, removes only that dead socket, and retires only a matching old lock. It marks active records from the old generation unavailable. The new runtime keeps worker ID and Pi UUID but receives a new generation, process, pane, and tab. It submits only the new follow-up task. Parent restart leaves descendants intact.
 
@@ -99,22 +104,39 @@ Historical settled or unavailable results remain readable with their original ta
 
 Failed or cancelled spawn attempts retain a launch receipt. Creation commands finish within their CLI timeout even if the tool aborts, so the adapter can capture exact created identities. Cleanup verifies workspace, tab, and terminal before closing the new pane. Missing receipts or uncertain cleanup remain explicit failures for operator inspection. Successful completed conversations are never closed automatically. The caller releases the launch claim only after live native identity confirmation or proven cleanup. A closed pane without a known native process identity is insufficient cleanup proof after `agent start` was attempted. The claim then remains for operator reconciliation. No automatic retry or stale-claim removal occurs.
 
-Native shutdown releases only its own Herdr report source. Socket and owned-lock cleanup runs in `finally` even if the release command fails. Shutdown cleanup is idempotent.
+Native shutdown first stops admission and waits for outstanding bounded launch operations to finish or clean up. It marks its active task unavailable and releases only its own Herdr report source. Socket and owned-lock cleanup runs in `finally` even if the release command fails. Shutdown cleanup is idempotent.
+
+### Ordinary lead lifecycle
+
+Pi 0.87 emits `session_shutdown` for quit, reload, new, resume, and fork. Replacement and reload create a fresh extension instance before `session_start`. The adapter follows those events rather than scheduling session transitions. Roots do not cancel session operations. `/tree` keeps the same session-wide plan and descendant registry. A fork or clone has a different native session ID/path and therefore starts a new registry.
+
+Clean shutdown writes a detached-generation receipt only after persisting `available: false`, closing the socket, and releasing the generation lock. Normal lead resumption accepts that receipt only for the current recorded generation, absent lock, dead socket, and matching role, parent, workspace, cwd, native UUID, and session path. A same-PID/birth handoff uses the native session manager's matching identity even if Pi has not flushed an empty conversation file yet. A different process must verify the native file header. Without the receipt, the original process and socket must be proven dead through the existing cold proof. `available: false` alone is never enough.
+
+Normal root resumption takes the model selected by Pi, including explicit user model changes. Cold worker continuation still requires the saved model and verifies it against the launch claim. A duplicate active root disables only the new adapter. Startup cannot prevent external Pi processes from opening the native session before extension initialization.
+
+Workers cancel switch, fork, and tree-navigation events to keep their assigned conversation history. A worker reload can bypass its now-released initial launch claim only after a clean detach by the same PID/birth, with matching session and model. It receives a new runtime generation and never replays an active task. A failed owned-child startup may request native shutdown.
 
 ## Environment and native launch
 
-Every process requires `HERDR_ENV=1`, its actual `HERDR_PANE_ID`, and:
+The installed package autoloads through its `pi.extensions` manifest, which names only `index.ts`. Extension construction captures configuration without creating background resources. Activation happens only in `session_start` when `ctx.mode === "tui"`, `HERDR_ENV=1`, and Pi has a persistent session path. Other modes and ephemeral sessions create no adapter resources, tools, host-binding instructions, or session guards.
 
-- `DS_HERDR_STATE_DIR`, an absolute private path short enough for Unix sockets.
-- `DS_HERDR_SESSION`, the explicit private Herdr session name.
-- `DS_HERDR_WORKER_ID` and `DS_HERDR_ROLE`.
-- `DS_HERDR_PARENT_ID`, empty only for root `lead` with role `lead`.
-- `DS_HERDR_WORKSPACE`, the absolute working directory.
+An ordinary lead needs native `HERDR_SOCKET_PATH` and `HERDR_PANE_ID`. Startup validates its exact pane and `HERDR_WORKSPACE_ID` when present. `HERDR_SESSION_NAME` is optional. Herdr can omit it even for a named server, so the socket remains authoritative. Missing or invalid Herdr metadata disables the adapter with a TUI notification. Ordinary Pi remains usable and its selected tools are unchanged.
 
-`DS_HERDR_WORKSPACE_ID` is optional for initial launch. Startup derives and verifies it through the exact own pane, never the focused pane. Child launches pass it explicitly and use `tab create --workspace <id> --no-focus`.
+Configuration is per extension instance. The adapter never modifies `process.env`. Every Herdr invocation uses argv-safe `env -u HERDR_SESSION_NAME HERDR_SOCKET_PATH=<captured-path> herdr ...`. It does not pass `--session`, which could redirect the request away from the pane's actual socket. This handles both default and named servers without guessing their names or discovering a focused session.
 
-A same-worker process restart also requires `DS_HERDR_RESTART_GENERATION` and the original session path. Model-facing `followup_task` supplies these after death proof. The lead's controller uses them for lead restart and must explicitly select the saved provider/model. Manual external Pi launches are outside the adapter's pre-launch fence. Startup rejection alone cannot prevent those processes from writing earlier SDK metadata.
+The adapter supplies internal child variables through `tab create --env`:
 
-Native arguments include `--no-extensions -e /opt/adapter/index.ts --session <path> --model <provider>/<id>`. Adapter launch also supplies `DS_HERDR_LAUNCH_ID` to match its held claim. Fresh workers select the caller's model and role effort. Lead effort remains launcher-owned. Startup enables configured tools without role bans. `update_plan` uses only its current session identity. `AskQuestion` has no tool implementation; the brief requires a real human answer or explicit stop-and-report.
+- `DS_HERDR_STATE_DIR` and `DS_HERDR_SOCKET_DIR`, the shared private durable and socket directories.
+- `DS_HERDR_SESSION`, the captured server name, empty when native `HERDR_SESSION_NAME` is unset.
+- `DS_HERDR_WORKER_ID`, `DS_HERDR_ROLE`, and `DS_HERDR_PARENT_ID`.
+- `DS_HERDR_WORKSPACE`, the absolute child cwd, and `DS_HERDR_WORKSPACE_ID`.
+- `DS_HERDR_RESTART_GENERATION`, empty for a fresh child.
+- `DS_HERDR_LAUNCH_ID`, matching the caller's held launch claim.
 
-All Herdr commands use `--session <private-name>`. Reports use source `ds-slice` and Pi session metadata. Reports support presentation and readiness only, never task settlement.
+Children also receive the captured Herdr socket/name and an absolute `PI_CODING_AGENT_DIR` resolved with Pi's `getAgentDir()` during extension construction. This pins the lead's effective default even when the lead has no config-directory export and the Herdr server has a different environment. When set, `PI_OFFLINE`, `PI_SKIP_VERSION_CHECK`, `PI_TELEMETRY`, and `PI_CACHE_RETENTION` are forwarded too. No credentials or parent transcript are copied. The child uses its normal Pi config files and Herdr-created pane environment. Environment-only credentials and unrelated provider extensions are not forwarded by the adapter.
+
+Child creation uses `tab create --workspace <id> --cwd <cwd> --no-focus`. Native arguments include `--no-extensions -e <installed-index-path> --session <path> --model <provider>/<id>`. The extension path derives from `import.meta.url`, not the working directory. Children load only this extension, with normal built-in and delegation tools and role-specific thinking. The lead retains its selected tools and thinking. Pi's dynamic registration respects lead tool allowlists and exclusions.
+
+`/herdr-agents` reports the current worker/session, durable state path, and enabled adapter tools. `update_plan` uses only its current session identity. `AskQuestion` has no implementation. The brief requires a real human answer or explicit stop-and-report.
+
+Reports use source `ds-slice` and Pi session metadata. Herdr's managed native integration remains separate. Reports support presentation and readiness only, never task settlement. Whole-server restart recovery and automatic reconciliation of uncertain launch claims are outside this contract.
