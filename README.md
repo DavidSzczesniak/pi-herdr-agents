@@ -38,7 +38,21 @@ Unix sockets use a short directory under `$XDG_RUNTIME_DIR`, or `/tmp` when unse
 
 All Herdr commands target the captured `HERDR_SOCKET_PATH`. Startup verifies the actual `HERDR_PANE_ID` and workspace. Default and named servers are supported. No command falls back to the focused pane.
 
-Workers start fresh conversations and own their descendants. Children receive their complete task brief, not parent conversation history. They use the installed extension's actual path, the caller's model, role-specific thinking, and normal tools, including Bash, Git through Bash, edits, writes, and nested delegation. A read-only review is an assignment, not a reduced tool profile. The lead retains its selected tools and thinking level.
+Workers start fresh conversations and own their descendants. Children receive their complete task brief, not parent conversation history. They use the installed extension's actual path and normal tools, including Bash, Git through Bash, edits, writes, and nested delegation. A read-only review is an assignment, not a reduced tool profile. The lead retains its selected tools and thinking level.
+
+### Worker model and thinking
+
+`spawn_agent` requires `role`, `thinking`, and `task`. Optional `model: {provider, id}` must match Pi's registry exactly. Omitted model inherits the immediate caller's current native model, including on nested spawns. The runtime does not map roles to thinking levels. ds-mode's profile table supplies the explicit levels.
+
+`thinking` accepts Pi's `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max` levels, but only when the selected model supports that level. Missing or invalid thinking, unsupported levels, unknown models, and missing configured authentication are rejected before creating a session, launch claim, or tab. The runtime passes the supplied level unchanged.
+
+Spawn and follow-up keep their existing flat task receipts. `selection` records `{boundary: "agent_start", model, thinking}` observed by the worker's first correlated `agent_start` handler. The receipt's `identity.model` and `identity.thinking` mirror that observation, not an earlier or later status poll. Missing legacy evidence, ambiguous submissions, and tasks rejected before start report `selection: null` and null identity selection fields.
+
+`list_agents` reports the worker's current selection instead. Later native changes and retry starts do not rewrite a task's first observation. This observation does not establish the settings used for every provider request. Native session evidence is needed for attribution when settings change during a task. It says nothing about upstream router substitutions or comparative performance.
+
+Follow-up has no overrides. It keeps the worker's selection, including native `/model` and `/thinking` changes, through reload and cold continuation. The lead's model, thinking, and tools stay unchanged.
+
+Pre-change worker records remain readable with `thinking: null` until observed by the new runtime. Reload captures the native level. Cold continuation can recover it from the original session's active branch when a native thinking entry exists; otherwise it refuses to guess. Existing ownership, session-header, death, and launch-claim checks still apply.
 
 Child launches explicitly inherit the caller's effective Pi config directory, including the default when no override is set, and selected non-secret Pi startup settings. They load only this extension. Skills, context files, settings, and file-based authentication use normal Pi discovery. Other extensions and credentials supplied only to the lead process are not copied into children.
 
@@ -61,7 +75,7 @@ npm ci --ignore-scripts --no-audit --no-fund
 npm test
 ```
 
-Transport checks use real Unix sockets. Adapter and startup checks use real files, sockets, and Linux process identities but stub TUI events and Herdr commands. Startup checks also exercise real Pi package discovery and headless SDK binding. The launch-race check uses two real processes with a stubbed native session-open boundary. These checks launch neither Herdr nor models. Native lifecycle verification requires a disposable Herdr server and ordinary package autoload.
+Transport checks use real Unix sockets. Adapter and startup checks use real files, sockets, and Linux process identities but stub TUI events and Herdr commands. Startup checks also exercise real Pi package discovery and headless SDK binding. The launch-race check uses two real processes with a stubbed native session-open boundary. Selection checks use Pi's installed catalog, capability helpers, and SDK model/thinking events and empty-history reload, with Herdr controls and provider turns stubbed. These checks launch neither Herdr nor models. Native lifecycle verification requires a disposable Herdr server and ordinary package autoload.
 
 ## Limits and evidence
 

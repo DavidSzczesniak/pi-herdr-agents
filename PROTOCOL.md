@@ -4,9 +4,13 @@ One newline-delimited JSON request and response uses each Unix socket connection
 
 ## Identity and ownership
 
-An identity records `workerId`, `parentId`, `role`, `herdrSession`, `workspaceId`, `paneId`, `terminalId`, `generation`, `socketPath`, `pid`, `pidBirth`, `piSessionId`, `piSessionPath`, `cwd`, `available`, and `model`. `herdrSession` captures `HERDR_SESSION_NAME` when available, otherwise an empty string. The socket binding, not this optional name, determines the server.
+An identity records `workerId`, `parentId`, `role`, `herdrSession`, `workspaceId`, `paneId`, `terminalId`, `generation`, `socketPath`, `pid`, `pidBirth`, `piSessionId`, `piSessionPath`, `cwd`, `available`, `model`, and `thinking`. `herdrSession` captures `HERDR_SESSION_NAME` when available, otherwise an empty string. The socket binding, not this optional name, determines the server.
 
 `model` is the native selected `{provider, id}`, or null when no model is selected. Startup captures `ctx.model`; native `model_select` updates it durably. Cold launch requires a recorded model, passes it explicitly, and verifies the selected model. This avoids Pi's default fallback for sessions without messages. Attempt-1 identity records lack this required field and need a fresh private state directory.
+
+`thinking` is Pi's effective level. Startup captures `pi.getThinkingLevel()` without resetting it. Native `thinking_level_select` writes both the current model and level atomically because Pi emits a model-change clamp before `model_select`. The latter also saves both fields. No status poll is needed to persist a change.
+
+Pre-selection identities with no `thinking` field parse as `thinking: null`; invalid present values are rejected. They remain usable for status, historical results, and live follow-up. A verified reload captures the native value. For cold continuation, a known saved level is authoritative even when Pi has not flushed empty-session metadata. An unknown level requires a native `thinking_level_change` on the original session's active branch. Read-only Pi parsing restores that branch, rejects malformed paths or a conflicting native model, and never opens a SessionManager. The caller repeats the lookup under the launch claim after death proof. With no saved level or native evidence, continuation refuses before tab creation rather than assuming `off` or a role default. Old unresolved launch claims without a thinking field remain fenced for operator reconciliation.
 
 `pid` belongs to the adapter's PID namespace. `pidBirth` combines Linux boot ID and process start ticks. A matching non-zombie process is live. A different birth identifies PID reuse. Unreadable process identity fails closed. `available` alone does not establish liveness.
 
@@ -33,7 +37,7 @@ Under that directory:
 | `locks/<workerId>/generation` | Exclusive runtime claim |
 | `locks/<workerId>.detached.json` | Generation whose clean shutdown persisted unavailability and finished socket/lock cleanup |
 | `locks/restart-<oldGeneration>` | Temporary child-startup admission claim |
-| `locks/launch-<workerId>/claim.json` | Cross-process pre-launch fence with launch token, previous generation, model, session path, and caller process identity |
+| `locks/launch-<workerId>/claim.json` | Cross-process pre-launch fence with launch token, previous generation, model, thinking, session path, and caller process identity |
 
 Sockets live separately at `<runtimeRoot>/piha-<uid>/<state-directory-hash>/<generation>.sock`. `runtimeRoot` is `XDG_RUNTIME_DIR`, or `/tmp` when unset. Socket paths must fit 103 bytes. Children inherit the exact socket directory. Directories must belong to the current UID, have no group/other permission bits, and not be symlinks. Runtime state paths can be long without lengthening sockets.
 
@@ -71,7 +75,7 @@ Responses are `{"ok":true,"result":RESULT}` or `{"ok":false,"error":"reason"}`.
 | `settled` | Native settlement with idle and outcome evidence |
 | `unavailable` | Explicit rejection, process loss, shutdown, or insufficient outcome evidence |
 
-Task records include `workerId`, `generation`, `piSessionId`, `submissionId`, `task`, and `startedAt`. Active tasks also include a random `nonce` and one of these phases:
+Task records include `workerId`, `generation`, `piSessionId`, `submissionId`, `task`, and `startedAt`. New records also contain `selection`, initially null. Active tasks also include a random `nonce` and one of these phases:
 
 1. `pending` means the adapter durably reserved the submission.
 2. `input_observed` means Pi's input hook saw that exact nonce and task text.
@@ -83,6 +87,12 @@ The native prompt contains `[ds-task <nonce>]` followed by the complete brief. O
 The adapter refuses known missing model or configured-auth snapshots before `sendUserMessage`. Those records are `unavailable`, and the runtime can accept a different submission immediately. Native asynchronous failures not visible through the extension API remain ambiguous. Idle alone never frees an unresolved preflight.
 
 Settled outcomes are `completed`, `interrupted`, or `error`. `agent_settled` plus idle is required. The captured native run signal or a terminal assistant abort reason establishes interruption. Otherwise, the final assistant error or `agent_before_settle` outcome supplies the result. Missing evidence becomes unavailable.
+
+At the first correlated `agent_start`, the worker records `selection: {boundary: "agent_start", model, thinking}` from the handler's native context and thinking API. It persists the observation on the exact task before acknowledging start. Accepted socket receipts carry this additive field. Settlement and historical task reads retain it; later selection changes and retry starts do not replace it. A correlated late start can record an observation for an ambiguous task without replaying the submission.
+
+Model-facing spawn and follow-up receipts retain their flat task fields and add `identity`. Its `model` and `thinking` mirror the task observation returned by the worker, never the caller's status snapshot. Legacy receipts and task records without `selection` remain readable. Missing task evidence, ambiguous submissions, and pre-start rejection report `selection: null` and null identity selection fields. Caller-side transport failures or mismatched receipt IDs retain the chosen submission ID as ambiguous with unknown selection. No automatic replay occurs.
+
+Status responses report current selection in `identity`; old runtime responses without thinking normalize to null. Task selection describes the worker's first correlated start-handler observation, not a guarantee about every provider request. Native changes remain allowed during a task, so later provider attribution can require native session evidence.
 
 Public task records replace the brief with an empty string. Settled responses cap JSON at 45000 bytes and point to the full artifact. Model-tool output over 50000 bytes goes to an artifact. `startedAt` is reservation time, not a claim about provider execution.
 
@@ -98,7 +108,7 @@ Cold continuation proves all of the following:
 - The original session header matches the saved Pi UUID and exact session path.
 - The role, original parent, cwd, Herdr server binding, and workspace match.
 
-The caller first acquires the per-worker launch claim with atomic directory creation, before native Pi can open the session. It repeats death/generation checks under the claim. The child verifies its launch token, session path, and selected model against that claim. Startup separately claims the old generation, repeats the death checks, removes only that dead socket, and retires only a matching old lock. It marks active records from the old generation unavailable. The new runtime keeps worker ID and Pi UUID but receives a new generation, process, pane, and tab. It submits only the new follow-up task. Parent restart leaves descendants intact.
+The caller first acquires the per-worker launch claim with atomic directory creation, before native Pi can open the session. It repeats death/generation checks under the claim. The child verifies its launch token, session path, selected model, and effective thinking against that claim. The caller also checks both selection fields from the live native identity before submitting. Explicit or saved thinking is never silently clamped during continuation. Startup separately claims the old generation, repeats the death checks, removes only that dead socket, and retires only a matching old lock. It marks active records from the old generation unavailable. The new runtime keeps worker ID and Pi UUID but receives a new generation, process, pane, and tab. It submits only the new follow-up task. Parent restart leaves descendants intact.
 
 Historical settled or unavailable results remain readable with their original task generation. Old active tasks cannot be matched to the new execution. Historical reads do not clear or wait for a current active task. Interrupt refuses a historical generation.
 
@@ -114,7 +124,7 @@ Clean shutdown writes a detached-generation receipt only after persisting `avail
 
 Normal root resumption takes the model selected by Pi, including explicit user model changes. Cold worker continuation still requires the saved model and verifies it against the launch claim. A duplicate active root disables only the new adapter. Startup cannot prevent external Pi processes from opening the native session before extension initialization.
 
-Workers cancel switch, fork, and tree-navigation events to keep their assigned conversation history. A worker reload can bypass its now-released initial launch claim only after a clean detach by the same PID/birth, with matching session and model. It receives a new runtime generation and never replays an active task. A failed owned-child startup may request native shutdown.
+Workers cancel switch, fork, and tree-navigation events to keep their assigned conversation history. A worker reload can bypass its now-released initial launch claim only after a clean detach by the same PID/birth, with matching session, model, and recorded thinking when known. It receives a new runtime generation and never replays an active task. A failed owned-child startup may request native shutdown.
 
 ## Environment and native launch
 
@@ -135,7 +145,7 @@ The adapter supplies internal child variables through `tab create --env`:
 
 Children also receive the captured Herdr socket/name and an absolute `PI_CODING_AGENT_DIR` resolved with Pi's `getAgentDir()` during extension construction. This pins the lead's effective default even when the lead has no config-directory export and the Herdr server has a different environment. When set, `PI_OFFLINE`, `PI_SKIP_VERSION_CHECK`, `PI_TELEMETRY`, and `PI_CACHE_RETENTION` are forwarded too. No credentials or parent transcript are copied. The child uses its normal Pi config files and Herdr-created pane environment. Environment-only credentials and unrelated provider extensions are not forwarded by the adapter.
 
-Child creation uses `tab create --workspace <id> --cwd <cwd> --no-focus`. Native arguments include `--no-extensions -e <installed-index-path> --session <path> --model <provider>/<id>`. The extension path derives from `import.meta.url`, not the working directory. Children load only this extension, with normal built-in and delegation tools and role-specific thinking. The lead retains its selected tools and thinking. Pi's dynamic registration respects lead tool allowlists and exclusions.
+Child creation uses `tab create --workspace <id> --cwd <cwd> --no-focus`. Native arguments include `--no-extensions -e <installed-index-path> --session <path> --model <provider>/<id> --thinking <level>`. The extension path derives from `import.meta.url`, not the working directory. Children load only this extension, with normal built-in and delegation tools. Spawn requires `role`, `thinking`, and `task` and accepts optional `model: {provider, id}`. Omitted model inherits the immediate caller's native selection. Missing or invalid thinking fails schema validation. The supplied level must occur in Pi's `getSupportedThinkingLevels` for the exact registry model and is passed unchanged. The runtime has no role-to-level mapping or omitted-thinking fallback. Registry and configured-auth snapshot checks run before allocation. These checks do not prove remote credentials valid or copy process-only credentials/provider extensions into the child. The native child must still match the launch claim. The lead retains its selected tools and thinking. Pi's dynamic registration respects lead tool allowlists and exclusions.
 
 `/herdr-agents` reports the current worker/session, durable state path, and enabled adapter tools. `update_plan` uses only its current session identity. `AskQuestion` has no implementation. The brief requires a real human answer or explicit stop-and-report.
 

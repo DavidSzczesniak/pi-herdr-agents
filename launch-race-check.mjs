@@ -29,7 +29,9 @@ if (process.argv[2] === "contender") {
   delete process.env.DS_HERDR_LAUNCH_ID;
   let release;
   const held = new Promise(resolve => { release = resolve; });
-  const ctx = { cwd: dirname(file), mode: "tui", hasUI: false, model: { provider: "caller", id: "wrong-default" },
+  const ctx = { cwd: dirname(file), mode: "tui", hasUI: false, model: { provider: "caller", id: "wrong-default", reasoning: true },
+    modelRegistry: { find: (provider, id) => ({ provider, id, reasoning: true }),
+      hasConfiguredAuth: () => true, getProviderAuthStatus: () => ({ configured: true }) },
     sessionManager: { getSessionFile: () => ownSession, getSessionId: () => `session-${worker}` },
     isIdle: () => true, hasPendingMessages: () => false, shutdown() {}, ui: { notify() {}, setWidget() {} } };
   const emit = async name => { for (const callback of hooks.get(name) ?? []) await callback({}, ctx); };
@@ -48,7 +50,7 @@ if (process.argv[2] === "contender") {
         const model = op[op.indexOf("--model") + 1];
         // SDK initialization may write before session_start. This is the deliberately stubbed external boundary.
         writeFileSync(path, JSON.stringify({ type: "model_change", provider: "selected", modelId: model, opener: worker }) + "\n", { flag: "a" });
-        process.send({ kind: "opened", worker, model });
+        process.send({ kind: "opened", worker, model, thinking: op[op.indexOf("--thinking") + 1] });
         await held;
         return { code: 1, killed: false, stderr: "fixture readiness unknown", stdout: "" };
       } else if (op[1] === "close") return { code: 1, killed: false, stderr: "fixture cleanup uncertain", stdout: "" };
@@ -97,13 +99,17 @@ if (process.argv[2] === "contender") {
     const parent = JSON.parse(readFileSync(join(state, "workers", "owner.json")));
     atomicWrite(join(state, "workers", "dead.json"), { ...parent, workerId: "dead", parentId: "owner", generation: "old-generation",
       pidBirth: "proven-nonmatching-birth", piSessionId: "original-pi-uuid", piSessionPath: originalSession,
-      socketPath: runtimeSocket(state, "old-generation", process.env.XDG_RUNTIME_DIR || "/tmp"), model: { provider: "original-provider", id: "assigned-model" } });
+      socketPath: runtimeSocket(state, "old-generation", process.env.XDG_RUNTIME_DIR || "/tmp"), model: { provider: "original-provider", id: "assigned-model" }, thinking: "low" });
     lead.send("go");
     owner.send("go");
     await waitFor(() => messages.some(message => message.kind === "opened") && messages.some(message => message.kind === "result"));
     const opened = messages.filter(message => message.kind === "opened");
     assert.equal(opened.length, 1, "only one authorized ancestor crosses native session-open boundary");
     assert.equal(opened[0].model, "original-provider/assigned-model", "no-message revival explicitly uses original model, not caller/default");
+    assert.equal(opened[0].thinking, "low", "cold continuation keeps saved effort, not role default");
+    const claim = JSON.parse(readFileSync(join(state, "locks", "launch-dead", "claim.json")));
+    assert.deepEqual(claim.model, { provider: "original-provider", id: "assigned-model" });
+    assert.equal(claim.thinking, "low");
     assert.match(messages.find(message => message.kind === "result").error, /EEXIST/);
     const entries = readFileSync(originalSession, "utf8").trim().split("\n").map(JSON.parse);
     assert.equal(entries.length, 2, "losing attempt never appends pre-hook SDK metadata");

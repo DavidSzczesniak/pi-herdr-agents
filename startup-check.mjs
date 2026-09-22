@@ -21,7 +21,9 @@ function fixture({ id = "session-a", mode = "tui", persistent = true, env = {}, 
   const hooks = new Map(), tools = new Map(), widgets = new Map();
   const commands = [], notifications = [];
   let selected = ["read", "bash", "my-selected-tool"], changes = 0, shutdowns = 0;
-  const ctx = { mode, hasUI: mode === "tui" || mode === "rpc", cwd: project, model: { provider: "fixture", id: "no-network" },
+  const ctx = { mode, hasUI: mode === "tui" || mode === "rpc", cwd: project, model: { provider: "fixture", id: "no-network", reasoning: true },
+    modelRegistry: { find: (provider, id) => ({ provider, id, reasoning: true }),
+      hasConfiguredAuth: () => true, getProviderAuthStatus: () => ({ configured: true }) },
     sessionManager: { getSessionFile: () => persistent ? sessionFile : undefined, getSessionId: () => id },
     isIdle: () => true, hasPendingMessages: () => false, shutdown() { shutdowns++; },
     ui: { notify(message) { notifications.push(message); }, setWidget(key, value) { widgets.set(key, value); } } };
@@ -149,7 +151,7 @@ try {
   const status = await request(recovered.identity().socketPath, { kind: "status", generation: recovered.identity().generation,
     callerId: "lead", callerGeneration: recovered.identity().generation });
   assert.equal(status.kind, "status");
-  await assert.rejects(recovered.tools.get("spawn_agent").execute("child", { role: "implement", task: "new task" }, undefined, undefined, recovered.ctx), /fixture child failure/);
+  await assert.rejects(recovered.tools.get("spawn_agent").execute("child", { role: "implement", thinking: "medium", task: "new task" }, undefined, undefined, recovered.ctx), /fixture child failure/);
   const created = recovered.commands.find(({ args }) => args[4] === "tab").args;
   assert.ok(created.includes(`PI_CODING_AGENT_DIR=${join(root, "pi-config")}`));
   assert.ok(created.includes(`DS_HERDR_SOCKET_DIR=${recovered.config.socketDir}`));
@@ -161,7 +163,7 @@ try {
   assert.equal(started[started.indexOf("--model") + 1], "fixture/no-network");
   const defaultConfig = fixture({ id: "default-config", env: { HOME: root, PI_CODING_AGENT_DIR: undefined } });
   await defaultConfig.start();
-  await assert.rejects(defaultConfig.tools.get("spawn_agent").execute("default-child", { role: "implement", task: "new task" }, undefined, undefined, defaultConfig.ctx), /fixture child failure/);
+  await assert.rejects(defaultConfig.tools.get("spawn_agent").execute("default-child", { role: "implement", thinking: "medium", task: "new task" }, undefined, undefined, defaultConfig.ctx), /fixture child failure/);
   const defaultLaunch = defaultConfig.commands.find(({ args }) => args[4] === "tab").args;
   assert.ok(defaultLaunch.includes(`PI_CODING_AGENT_DIR=${join(root, ".pi", "agent")}`),
     "unset config uses the lead's effective default, not Herdr server environment");

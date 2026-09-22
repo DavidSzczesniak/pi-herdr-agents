@@ -1,12 +1,13 @@
 import { mkdirSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { Type, type Static } from "typebox";
-import { StringEnum } from "@earendil-works/pi-ai";
-import { atomicWrite, ModelSchema, parse, readRecord, SafeId, type Identity } from "./protocol.ts";
+import { getSupportedThinkingLevels, StringEnum } from "@earendil-works/pi-ai";
+import { buildSessionContext, parseSessionEntries, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { atomicWrite, SelectionSchema, ThinkingSchema, parse, readRecord, SafeId, type Identity, type Selection } from "./protocol.ts";
 
 export const LaunchClaimSchema = Type.Object({
   launchId: SafeId, workerId: SafeId, previousGeneration: Type.Union([SafeId, Type.Null()]),
-  piSessionPath: Type.String(), model: ModelSchema, callerId: SafeId, callerGeneration: SafeId,
+  piSessionPath: Type.String(), ...SelectionSchema.properties, callerId: SafeId, callerGeneration: SafeId,
   pid: Type.Integer({ minimum: 1 }), pidBirth: Type.String({ minLength: 1 }),
 });
 export function claimLaunch(stateDir: string, claim: Static<typeof LaunchClaimSchema>) {
@@ -32,8 +33,45 @@ export const PlanRecordSchema = Type.Object({ workerId: Type.String(), piSession
 export function planLines(plan: Plan): string[] {
   return plan.plan.map(({ step, status }) => `[${status === "completed" ? "x" : status === "in_progress" ? ">" : " "}] ${step}`);
 }
-export function thinking(role: Identity["role"]): "low" | "medium" | "high" {
-  return role === "judgment" ? "high" : role === "implement" || role === "review" ? "medium" : "low";
+export function selectWorker(ctx: ExtensionContext, choice: { model: Identity["model"]; thinking: Selection["thinking"] }): Selection {
+  if (!choice.model) throw new Error("No authoritative model for launch; select a Pi model first");
+  const { provider, id } = choice.model;
+  const model = ctx.modelRegistry.find(provider, id);
+  if (!model) throw new Error(`Unknown model ${provider}/${id}; choose an exact provider/id from Pi's model registry`);
+  const supported = getSupportedThinkingLevels(model);
+  const level = choice.thinking;
+  if (!supported.includes(level)) throw new Error(`Unsupported thinking ${level} for ${provider}/${id}; supported: ${supported.join(", ")}`);
+  if (!ctx.modelRegistry.hasConfiguredAuth(model) && !ctx.modelRegistry.getProviderAuthStatus(provider).configured)
+    throw new Error(`No configured provider authentication for ${provider}/${id}; configure it in Pi before spawning`);
+  return { model: { provider, id }, thinking: level };
+}
+export function recordedThinking(previous: Identity): Selection["thinking"] {
+  if (previous.thinking !== null) return previous.thinking;
+  // Read-only recovery for pre-selection records. Never open a SessionManager here.
+  verifySession(previous);
+  const content = readFileSync(previous.piSessionPath, "utf8");
+  const entries = parseSessionEntries(content);
+  if (entries.length !== content.split("\n").filter(line => line.trim()).length)
+    throw new Error("Malformed native history; thinking recovery refused");
+  const sessionEntries = entries.filter(entry => entry.type !== "session");
+  const byId = new Map<string, (typeof sessionEntries)[number]>();
+  for (const entry of sessionEntries) {
+    const base = parse(Type.Object({ id: Type.String({ minLength: 1 }), parentId: Type.Union([Type.String(), Type.Null()]) }), entry);
+    if (byId.has(base.id) || (base.parentId !== null && !byId.has(base.parentId)))
+      throw new Error("Invalid native history path; thinking recovery refused");
+    byId.set(base.id, entry);
+  }
+  let entry = sessionEntries.at(-1);
+  let hasThinking = false;
+  while (entry) {
+    if (entry.type === "thinking_level_change") hasThinking = true;
+    entry = entry.parentId === null ? undefined : byId.get(entry.parentId);
+  }
+  if (!hasThinking) throw new Error("Worker thinking is unknown: no saved value or native thinking history; reload the original live worker or spawn a fresh worker");
+  const restored = buildSessionContext(sessionEntries);
+  if (restored.model && (restored.model.provider !== previous.model?.provider || restored.model.modelId !== previous.model?.id))
+    throw new Error("Native history model differs from recorded worker model; recovery refused");
+  return parse(ThinkingSchema, restored.thinkingLevel);
 }
 export function roleBrief(role: Identity["role"]): string {
   return `Role: ${role}. Own the complete task in your brief and any descendants you spawn. Fresh children receive only their brief, not parent conversation history. Respect the brief's writable paths and edit permission. Use Git, tests, and scratch probes as needed. ${role === "review" || role === "explore" ? "Report findings rather than apply implementation fixes." : "Produce the deliverable requested by the brief."} Keep reports under 800 words with changed paths, checks, evidence paths, and open risks. Record workerId and submissionId; wait on the exact submission. update_plan changes only your own session plan, never the lead's. For a genuine human preference question, stop and report the question for the real user; never invent their answer.`;

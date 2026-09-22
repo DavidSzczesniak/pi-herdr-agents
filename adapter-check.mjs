@@ -8,7 +8,7 @@ import { once } from "node:events";
 import adapter from "./index.ts";
 import { atomicWrite, request } from "./protocol.ts";
 import { socketDirectory } from "./startup.ts";
-import { claimLaunch, isOriginalProcessLive, processIdentity, planLines, tabPane, verifySession, thinking } from "./runtime.ts";
+import { claimLaunch, isOriginalProcessLive, processIdentity, planLines, tabPane, verifySession } from "./runtime.ts";
 
 const directory = mkdtempSync(join(tmpdir(), "piha-adapter-"));
 const state = directory;
@@ -18,7 +18,7 @@ let processProbe;
 const pane = (id = "w1:p1") => ({ pane_id: id, workspace_id: "w1", terminal_id: `term-${id}`, tab_id: `tab-${id}` });
 const header = { type: "session", version: 3, id: "session-lead", timestamp: new Date().toISOString(), cwd: directory };
 
-function fixture({ workerId = "lead", role = "lead", parentId = "", auth = true, mode = "started", restart = "", sessionId = `session-${workerId}`, failReport = false, launchFault = "", launchId = "" } = {}) {
+function fixture({ workerId = "lead", role = "lead", thinking = "high", parentId = "", auth = true, mode = "started", restart = "", sessionId = `session-${workerId}`, failReport = false, launchFault = "", launchId = "" } = {}) {
   Object.assign(process.env, { DS_HERDR_STATE_DIR: state, DS_HERDR_SESSION: "slice", DS_HERDR_WORKSPACE: directory,
     DS_HERDR_WORKER_ID: workerId, DS_HERDR_ROLE: role, DS_HERDR_PARENT_ID: parentId, DS_HERDR_RESTART_GENERATION: restart,
     HERDR_ENV: "1", HERDR_SESSION_NAME: "slice", HERDR_SOCKET_PATH: "/fixture/herdr.sock", HERDR_WORKSPACE_ID: "w1", HERDR_PANE_ID: `w1:p-${workerId}` });
@@ -30,7 +30,7 @@ function fixture({ workerId = "lead", role = "lead", parentId = "", auth = true,
   const widgets = new Map();
   let selectedTools = ["read", "bash", "external_evidence"];
   let startupError;
-  let effort = "high";
+  let effort = thinking;
   let idle = true;
   let shutdowns = 0;
   let sends = 0;
@@ -41,8 +41,9 @@ function fixture({ workerId = "lead", role = "lead", parentId = "", auth = true,
   if (!existsSync(sessionFile)) writeFileSync(sessionFile, JSON.stringify({ ...header, id: sessionId }) + "\n");
   const ctx = {
     cwd: directory, mode: "tui", hasUI: true, get signal() { return runSignal; },
-    model: { provider: "fixture", id: "no-network" },
-    modelRegistry: { hasConfiguredAuth: () => auth, getProviderAuthStatus: () => ({ configured: auth }) },
+    model: { provider: "fixture", id: "no-network", reasoning: true },
+    modelRegistry: { find: (provider, id) => ({ provider, id, reasoning: true }),
+      hasConfiguredAuth: () => auth, getProviderAuthStatus: () => ({ configured: auth }) },
     sessionManager: { getSessionFile: () => sessionFile, getSessionId: () => sessionId },
     isIdle: () => idle, hasPendingMessages: () => false,
     abort: () => abortController?.abort(), shutdown: () => { shutdowns++; },
@@ -104,9 +105,6 @@ try {
   assert.ok(current);
   assert.equal(isOriginalProcessLive({ pid: process.pid, pidBirth: current.birth }), true);
   assert.equal(isOriginalProcessLive({ pid: process.pid, pidBirth: "different-birth" }), false);
-  assert.equal(thinking("judgment"), "high");
-  assert.equal(thinking("review"), "medium");
-  assert.equal(thinking("explore"), "low");
   assert.throws(() => tabPane({ result: { root_pane: pane() } }, "other"), /workspace/);
   assert.deepEqual(tabPane({ result: { root_pane: pane() } }, "w1"), pane());
   assert.equal(planLines({ plan: [{ step: "  Verbatim\nstep.  ", status: "in_progress" }] })[0], "[>]   Verbatim\nstep.  ");
@@ -124,7 +122,7 @@ try {
   const leadPlan = readFileSync(join(state, "plans", "lead.json"), "utf8");
   assert.equal(JSON.parse(leadPlan).plan[0].step, "  exact step  ");
 
-  const reviewer = fixture({ workerId: "reviewer", role: "review", parentId: "lead", failReport: true });
+  const reviewer = fixture({ workerId: "reviewer", role: "review", thinking: "medium", parentId: "lead", failReport: true });
   const review = await reviewer.start();
   assert.equal(reviewer.effort, "medium");
   for (const name of ["bash", "edit", "write", "update_plan", "spawn_agent"]) assert.ok(reviewer.activeTools.includes(name));
@@ -142,6 +140,7 @@ try {
   await reviewer.stop();
   assert.equal(existsSync(review.socketPath), false, "release-agent failure still removes socket");
 
+  root.ctx.modelRegistry.hasConfiguredAuth = () => true;
   const modelOwner = fixture({ workerId: "model-owner", role: "implement", parentId: "lead" });
   const originalModelOwner = await modelOwner.start();
   assert.deepEqual(originalModelOwner.model, { provider: "fixture", id: "no-network" });
@@ -165,19 +164,19 @@ try {
 
   const claimed = fixture({ workerId: "claimed", parentId: "lead", role: "implement", launchId: "wrong-token" });
   const launchClaim = claimLaunch(state, { launchId: "launch-token", workerId: "claimed", previousGeneration: null,
-    piSessionPath: claimed.sessionFile, model: { provider: "fixture", id: "no-network" }, callerId: "lead",
+    piSessionPath: claimed.sessionFile, model: { provider: "fixture", id: "no-network" }, thinking: "medium", callerId: "lead",
     callerGeneration: lead.generation, pid: lead.pid, pidBirth: lead.pidBirth });
   process.env.DS_HERDR_LAUNCH_ID = "wrong-token";
   await assert.rejects(claimed.start(), /launch claim/, "child refuses an unrelated launch token");
   assert.ok(existsSync(join(launchClaim.path, "claim.json")), "child never releases caller's claim");
-  const matchingClaimed = fixture({ workerId: "claimed", parentId: "lead", role: "implement", launchId: "launch-token" });
+  const matchingClaimed = fixture({ workerId: "claimed", parentId: "lead", role: "implement", thinking: "medium", launchId: "launch-token" });
   process.env.DS_HERDR_LAUNCH_ID = "launch-token";
   const claimedIdentity = await matchingClaimed.start();
   assert.equal((await selfRequest(claimedIdentity, { kind: "status" })).identity.model.id, "no-network");
   launchClaim.release();
   assert.equal(existsSync(launchClaim.path), false, "launcher can release exact claim after matching live identity");
   await matchingClaimed.stop();
-  const reloadedClaimed = fixture({ workerId: "claimed", parentId: "lead", role: "implement", launchId: "launch-token" });
+  const reloadedClaimed = fixture({ workerId: "claimed", parentId: "lead", role: "implement", thinking: "medium", launchId: "launch-token" });
   const reloadedIdentity = await reloadedClaimed.start("reload");
   assert.equal(reloadedIdentity.piSessionId, claimedIdentity.piSessionId, "worker reload keeps assigned conversation");
   assert.notEqual(reloadedIdentity.generation, claimedIdentity.generation);
@@ -201,7 +200,7 @@ try {
   await fault.start();
   const controller = new AbortController();
   fault.setAbort(controller);
-  await assert.rejects(fault.tools.get("spawn_agent").execute("spawn", { role: "implement", task: "complete brief" }, controller.signal, undefined, fault.ctx), /exact newly-created pane closed/);
+  await assert.rejects(fault.tools.get("spawn_agent").execute("spawn", { role: "implement", thinking: "medium", task: "complete brief" }, controller.signal, undefined, fault.ctx), /exact newly-created pane closed/);
   assert.ok(fault.commands.some(args => args[2] === "tab" && args[3] === "create" && args.includes("--workspace") && args.includes("w1")));
   assert.ok(fault.commands.some(args => args[2] === "pane" && args[3] === "close" && args[4] === "w1:new"));
   assert.ok(!fault.commands.some(args => args.includes("split")));
@@ -213,13 +212,13 @@ try {
   const startupFault = fixture({ workerId: "startup-fault", parentId: "lead", role: "judgment" });
   await startupFault.start();
   assert.equal(startupFault.effort, "high");
-  await assert.rejects(startupFault.tools.get("spawn_agent").execute("spawn-fail", { role: "implement", task: "complete brief" }, undefined, undefined, startupFault.ctx), /fixture startup failure.*exact newly-created pane closed/);
+  await assert.rejects(startupFault.tools.get("spawn_agent").execute("spawn-fail", { role: "implement", thinking: "medium", task: "complete brief" }, undefined, undefined, startupFault.ctx), /fixture startup failure.*exact newly-created pane closed/);
   assert.ok(startupFault.commands.some(args => args[2] === "pane" && args[3] === "close" && args[4] === "w1:new"));
   await startupFault.stop();
 
   const lost = fixture({ workerId: "lost-receipt", parentId: "lead", role: "review", launchFault: "unknown-create" });
   await lost.start();
-  await assert.rejects(lost.tools.get("spawn_agent").execute("spawn-lost", { role: "implement", task: "complete brief" }, undefined, undefined, lost.ctx), /uncertain: no exact created pane receipt.*Durable receipt/);
+  await assert.rejects(lost.tools.get("spawn_agent").execute("spawn-lost", { role: "implement", thinking: "medium", task: "complete brief" }, undefined, undefined, lost.ctx), /uncertain: no exact created pane receipt.*Durable receipt/);
   assert.ok(!lost.commands.some(args => args[2] === "pane" && args[3] === "close"), "uncertain creation never sweeps panes");
   await lost.stop();
 

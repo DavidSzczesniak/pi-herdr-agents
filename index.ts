@@ -6,8 +6,8 @@ import { randomUUID } from "node:crypto";
 import { appendFileSync, chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { extensionPath, herdrCommand, privateDirectory, startupConfig, type StartupConfig } from "./startup.ts";
-import { atomicWrite, errorText, IdentitySchema, parse, readRecord, RequestSchema, request, SafeId, socketAlive, TaskSchema, type Identity, type Request, type Result, type Task } from "./protocol.ts";
-import { claimLaunch, LaunchClaimSchema, isOriginalProcessLive, PaneResponse, PlanRecordSchema, PlanSchema, planLines, processIdentity, roleBrief, tabPane, thinking, verifySession, type Pane } from "./runtime.ts";
+import { atomicWrite, errorText, ModelSchema, ThinkingSchema, parse, readIdentityRecord, readRecord, RequestSchema, request, SafeId, socketAlive, TaskSchema, type Identity, type Request, type Result, type Selection, type Task } from "./protocol.ts";
+import { claimLaunch, LaunchClaimSchema, isOriginalProcessLive, PaneResponse, PlanRecordSchema, PlanSchema, planLines, processIdentity, recordedThinking, roleBrief, selectWorker, tabPane, verifySession, type Pane } from "./runtime.ts";
 
 const toolNames = ["spawn_agent", "list_agents", "wait_agent", "followup_task", "interrupt_agent", "update_plan"];
 const normalTools = ["read", "grep", "find", "ls", "bash", "edit", "write", ...toolNames];
@@ -73,7 +73,7 @@ function createRuntime(pi: ExtensionAPI, config: StartupConfig) {
     if (!identity || shuttingDown) throw new Error("Worker unavailable");
     return identity;
   }
-  function readIdentity(id: string): Identity { return readRecord(IdentitySchema, identityPath(id)); }
+  function readIdentity(id: string): Identity { return readIdentityRecord(identityPath(id)); }
   function isDescendant(targetId: string, callerId: string): boolean {
     const seen = new Set<string>();
     let next: string | null = targetId;
@@ -108,7 +108,7 @@ function createRuntime(pi: ExtensionAPI, config: StartupConfig) {
     return pending;
   }
   function publicTask(task: Task): Task {
-    const result = { ...task, task: "" };
+    const result = { ...task, task: "", selection: task.selection ?? null };
     if (result.kind === "settled") {
       while (Buffer.byteLength(JSON.stringify(result)) > 45000) result.finalText = result.finalText.slice(0, Math.floor(result.finalText.length * 0.8));
     }
@@ -150,7 +150,7 @@ function createRuntime(pi: ExtensionAPI, config: StartupConfig) {
   }
   function waitForTask(task: Task, timeoutMs: number, socket: Socket): Promise<Result> {
     if (task.kind !== "active") return Promise.resolve(publicTask(task));
-    if (task.phase === "ambiguous") return Promise.resolve({ kind: "ambiguous", workerId, generation, submissionId: task.submissionId,
+    if (task.phase === "ambiguous") return Promise.resolve({ kind: "ambiguous", workerId, generation, submissionId: task.submissionId, selection: null,
       reason: "No correlated agent_start observed. Needs operator reset_pending and confirmed process exit; never replay." });
     return new Promise((resolve) => {
       const callbacks = waiters.get(task.submissionId) ?? new Set();
@@ -181,7 +181,7 @@ function createRuntime(pi: ExtensionAPI, config: StartupConfig) {
       if (existsSync(taskPath(message.submissionId))) throw new Error("Duplicate submission ID; not executed");
       if (active || !context?.isIdle() || context.hasPendingMessages()) throw new Error("Worker busy; concurrent submit rejected");
       const reservation: Extract<Task, { kind: "active" }> = { kind: "active", phase: "pending", nonce: randomUUID(), workerId, generation,
-        piSessionId: own.piSessionId, submissionId: message.submissionId, task: message.task, startedAt: new Date().toISOString() };
+        piSessionId: own.piSessionId, submissionId: message.submissionId, task: message.task, startedAt: new Date().toISOString(), selection: null };
       active = reservation;
       assistants = [];
       boundaryOutcome = undefined;
@@ -203,10 +203,10 @@ function createRuntime(pi: ExtensionAPI, config: StartupConfig) {
       finally { clearTimeout(timer); accepted = undefined; }
       const saved = readRecord(TaskSchema, taskPath(message.submissionId));
       if (saved.kind !== "active") return publicTask(saved);
-      if (saved.phase === "started") return { kind: "accepted", workerId, generation, submissionId: message.submissionId, evidence: "agent_start" };
+      if (saved.phase === "started") return { kind: "accepted", workerId, generation, submissionId: message.submissionId, evidence: "agent_start", selection: saved.selection ?? null };
       active = { ...saved, phase: "ambiguous" };
       atomicWrite(taskPath(message.submissionId), active);
-      return { kind: "ambiguous", workerId, generation, submissionId: message.submissionId,
+      return { kind: "ambiguous", workerId, generation, submissionId: message.submissionId, selection: null,
         reason: "Durable pending submission; no correlated start within 5 seconds. May still start. Never replay; inspect then operator reset_pending if needed." };
     }
     const task = readRecord(TaskSchema, taskPath(message.submissionId));
@@ -297,12 +297,14 @@ function createRuntime(pi: ExtensionAPI, config: StartupConfig) {
       if (claim.launchId !== launchId || claim.workerId !== workerId || claim.piSessionPath !== sessionPath ||
         claim.previousGeneration !== config.restartGeneration ||
         claim.model.provider !== model?.provider || claim.model.id !== model?.id) throw new Error("Native launch claim or selected model mismatch");
+      if (claim.thinking !== pi.getThinkingLevel()) throw new Error("Native launch thinking mismatch");
     }
     if (previous) {
       if ((!config.automatic && !workerReload && config.restartGeneration !== previous.generation) || previous.parentId !== parentId || previous.role !== role ||
         previous.herdrSession !== herdrSession || previous.workspaceId !== workspaceId || previous.cwd !== cwd ||
         previous.piSessionId !== ctx.sessionManager.getSessionId() || previous.piSessionPath !== sessionPath ||
-        (!config.automatic && (previous.model?.provider !== model?.provider || previous.model?.id !== model?.id)))
+        (!config.automatic && (previous.model?.provider !== model?.provider || previous.model?.id !== model?.id ||
+          (previous.thinking !== null && previous.thinking !== pi.getThinkingLevel()))))
         throw new Error("Identity exists; explicit matching restart generation and original Pi session required");
       const claim = join(stateDir, "locks", `restart-${previous.generation}`);
       mkdirSync(claim);
@@ -324,21 +326,20 @@ function createRuntime(pi: ExtensionAPI, config: StartupConfig) {
         mkdirSync(lockPath);
         writeFileSync(join(lockPath, "generation"), generation, { mode: 0o600 });
         identity = { workerId, parentId, role, herdrSession, workspaceId, paneId, terminalId: pane.terminal_id, generation, socketPath,
-          pid: process.pid, pidBirth: birth.birth, piSessionId: ctx.sessionManager.getSessionId(), piSessionPath: sessionPath, cwd, available: true, model };
+          pid: process.pid, pidBirth: birth.birth, piSessionId: ctx.sessionManager.getSessionId(), piSessionPath: sessionPath, cwd, available: true, model, thinking: pi.getThinkingLevel() };
         atomicWrite(identityPath(workerId), identity);
       } finally { rmSync(claim, { recursive: true, force: true }); }
     } else {
       mkdirSync(lockPath);
       writeFileSync(join(lockPath, "generation"), generation, { mode: 0o600 });
       identity = { workerId, parentId, role, herdrSession, workspaceId, paneId, terminalId: pane.terminal_id, generation, socketPath,
-        pid: process.pid, pidBirth: birth.birth, piSessionId: ctx.sessionManager.getSessionId(), piSessionPath: sessionPath, cwd, available: true, model };
+        pid: process.pid, pidBirth: birth.birth, piSessionId: ctx.sessionManager.getSessionId(), piSessionPath: sessionPath, cwd, available: true, model, thinking: pi.getThinkingLevel() };
       atomicWrite(identityPath(workerId), identity);
     }
     server = createServer(serve);
     await new Promise<void>((resolve, reject) => { server?.once("error", reject); server?.listen(socketPath, resolve); });
     chmodSync(socketPath, 0o600);
     atomicWrite(identityPath(workerId), identity);
-    if (role !== "lead") pi.setThinkingLevel(thinking(role));
     const planPath = join(stateDir, "plans", `${workerId}.json`);
     if (existsSync(planPath)) {
       const plan = readRecord(PlanRecordSchema, planPath);
@@ -349,9 +350,17 @@ function createRuntime(pi: ExtensionAPI, config: StartupConfig) {
   }
   pi.on("model_select", (event) => {
     if (!identity || shuttingDown) return;
-    identity = { ...identity, model: { provider: event.model.provider, id: event.model.id } };
+    identity = { ...identity, model: { provider: event.model.provider, id: event.model.id }, thinking: pi.getThinkingLevel() };
     atomicWrite(identityPath(workerId), identity);
     audit("model_select", { model: identity.model, source: event.source });
+  });
+  pi.on("thinking_level_select", (_event, ctx) => {
+    if (!identity || shuttingDown) return;
+    // Pi sets the new model before emitting a model-change clamp event.
+    identity = { ...identity, model: ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : null,
+      thinking: pi.getThinkingLevel() };
+    atomicWrite(identityPath(workerId), identity);
+    audit("thinking_level_select", { model: identity.model, thinking: identity.thinking });
   });
   const guardWorkerConversation = () => {
     if (role !== "lead") return { cancel: true };
@@ -379,7 +388,10 @@ function createRuntime(pi: ExtensionAPI, config: StartupConfig) {
     context = ctx;
     if (!identity || shuttingDown) return;
     if (active && startNonce === active.nonce) {
-      active = { ...active, phase: "started" };
+      active = { ...active, phase: "started", selection: active.phase === "started" ? active.selection ?? null : {
+        boundary: "agent_start", model: ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : null,
+        thinking: pi.getThinkingLevel(),
+      } };
       atomicWrite(taskPath(active.submissionId), active);
       accepted?.();
       runSignal = ctx.signal;
@@ -480,10 +492,15 @@ function createRuntime(pi: ExtensionAPI, config: StartupConfig) {
     atomicWrite(receiptPath, { ...receipt, kind: "submitting" });
     try {
       const result = await call(target, { kind: "submit", submissionId, task }, signal);
-      atomicWrite(receiptPath, { ...receipt, result });
-      return result;
+      if (result.kind === "status" || result.workerId !== target.workerId || result.generation !== target.generation || result.submissionId !== submissionId)
+        throw new Error("Submission receipt correlation mismatch");
+      const selection = result.kind !== "ambiguous" && "selection" in result ? result.selection ?? null : null;
+      const reported = { ...result, selection, identity: { ...target, model: selection?.model ?? null, thinking: selection?.thinking ?? null } };
+      atomicWrite(receiptPath, { ...receipt, result: reported });
+      return reported;
     } catch (error) {
-      const result = { ...receipt, kind: "ambiguous" as const, reason: `${errorText(error)}; inspect ${receiptPath}; never replay` };
+      const result = { ...receipt, kind: "ambiguous" as const, reason: `${errorText(error)}; inspect ${receiptPath}; never replay`,
+        selection: null, identity: { ...target, model: null, thinking: null } };
       atomicWrite(receiptPath, result);
       if (signal?.aborted) throw new Error(JSON.stringify(result));
       return result;
@@ -496,31 +513,37 @@ function createRuntime(pi: ExtensionAPI, config: StartupConfig) {
     return pending;
   }
   async function launchNative(spec: { childId: string; parent: string | null; childRole: Identity["role"]; childCwd: string;
-    sessionPath: string; task: string; previous?: Identity }, ctx: ExtensionContext, signal?: AbortSignal) {
+    sessionPath: string; task: string } & ({ kind: "fresh"; selection: Selection } | { kind: "resume"; previous: Identity }), ctx: ExtensionContext, signal?: AbortSignal) {
     current();
     signal?.throwIfAborted();
-    const model = spec.previous ? spec.previous.model : ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : null;
-    if (!model) throw new Error("No authoritative model for launch");
+    const previous = spec.kind === "resume" ? spec.previous : null;
+    const selection = spec.kind === "fresh" ? spec.selection : selectWorker(ctx, {
+      model: spec.previous.model, thinking: recordedThinking(spec.previous),
+    });
+    const { model, thinking } = selection;
     const launchId = randomUUID();
     const receiptPath = join(stateDir, "operations", `launch-${launchId}.json`);
     const base = { launchId, workerId: spec.childId, parentId: spec.parent, callerId: workerId, callerGeneration: generation,
-      sessionPath: spec.sessionPath, previousGeneration: spec.previous?.generation ?? null, workspaceId, herdrSession };
+      sessionPath: spec.sessionPath, previousGeneration: previous?.generation ?? null, workspaceId, herdrSession };
     const own = current();
-    const claim = claimLaunch(stateDir, { launchId, workerId: spec.childId, previousGeneration: spec.previous?.generation ?? null,
-      piSessionPath: spec.sessionPath, model, callerId: workerId, callerGeneration: generation, pid: own.pid, pidBirth: own.pidBirth });
+    const claim = claimLaunch(stateDir, { launchId, workerId: spec.childId, previousGeneration: previous?.generation ?? null,
+      piSessionPath: spec.sessionPath, ...selection, callerId: workerId, callerGeneration: generation, pid: own.pid, pidBirth: own.pidBirth });
     let pane: Pane | undefined;
     let nativeStartAttempted = false;
     let identityConfirmed = false;
     let cleanupProven = true;
-    const save = (data: unknown) => atomicWrite(receiptPath, { ...base, claimPath: claim.path, model, pane: pane ?? null, data });
+    const save = (data: unknown) => atomicWrite(receiptPath, { ...base, claimPath: claim.path, ...selection, pane: pane ?? null, data });
     try {
       save({ kind: "creating" });
-      if (spec.previous) await proveDead(spec.previous);
-      if (!spec.previous) writeFileSync(spec.sessionPath, "", { flag: "wx", mode: 0o600 });
+      if (previous) {
+        await proveDead(previous);
+        if (recordedThinking(previous) !== thinking) throw new Error("Recorded thinking changed under launch claim; continuation refused");
+      }
+      if (!previous) writeFileSync(spec.sessionPath, "", { flag: "wx", mode: 0o600 });
       const env = { ...config.childEnvironment, HERDR_SOCKET_PATH: config.herdrSocket, HERDR_SESSION_NAME: herdrSession,
         DS_HERDR_SOCKET_DIR: socketDir, DS_HERDR_STATE_DIR: stateDir, DS_HERDR_SESSION: herdrSession, DS_HERDR_WORKSPACE_ID: workspaceId,
         DS_HERDR_WORKER_ID: spec.childId, DS_HERDR_PARENT_ID: spec.parent ?? "", DS_HERDR_ROLE: spec.childRole,
-        DS_HERDR_WORKSPACE: spec.childCwd, DS_HERDR_RESTART_GENERATION: spec.previous?.generation ?? "", DS_HERDR_LAUNCH_ID: launchId };
+        DS_HERDR_WORKSPACE: spec.childCwd, DS_HERDR_RESTART_GENERATION: previous?.generation ?? "", DS_HERDR_LAUNCH_ID: launchId };
       // Finish bounded creation even on caller abort so its exact receipt remains available for cleanup.
       cleanupProven = false;
       const created = await herdr(["tab", "create", "--workspace", workspaceId, "--cwd", spec.childCwd, "--label", `${spec.childRole}-${launchId.slice(0, 8)}`,
@@ -534,18 +557,17 @@ function createRuntime(pi: ExtensionAPI, config: StartupConfig) {
       await herdr(["agent", "start", `${spec.childId}-${launchId.slice(0, 8)}`, "--kind", "pi", "--pane", pane.pane_id, "--timeout", "25000", "--",
         "--no-extensions", "-e", extensionPath, "--session", spec.sessionPath,
         "--model", `${model.provider}/${model.id}`,
-        "--thinking", thinking(spec.childRole), "--tools", normalTools.join(","), "--append-system-prompt", roleBrief(spec.childRole)]);
+        "--thinking", thinking, "--tools", normalTools.join(","), "--append-system-prompt", roleBrief(spec.childRole)]);
       signal?.throwIfAborted();
-      const target = owned(spec.childId);
+      const target = await live(owned(spec.childId), signal);
       if (target.paneId !== pane.pane_id || target.terminalId !== pane.terminal_id || target.piSessionPath !== spec.sessionPath ||
-        target.model?.provider !== model.provider || target.model.id !== model.id ||
-        (spec.previous && (target.generation === spec.previous.generation || target.piSessionId !== spec.previous.piSessionId))) throw new Error("Started worker identity or model mismatch");
-      await live(target, signal);
+        target.model?.provider !== model.provider || target.model.id !== model.id || target.thinking !== thinking ||
+        (previous && (target.generation === previous.generation || target.piSessionId !== previous.piSessionId))) throw new Error("Started worker identity, model or thinking mismatch");
       identityConfirmed = true;
       const result = await submitTask(target, spec.task, signal);
       if (result.kind === "unavailable") throw new Error(result.reason);
       signal?.throwIfAborted();
-      save({ kind: "submitted", identity: target, result });
+      save({ kind: "submitted", identity: result.identity, result });
       return result;
     } catch (error) {
       let cleanup = cleanupProven ? "no pane/process creation attempted" : "uncertain: no exact created pane receipt; inspect operation and private workspace";
@@ -598,12 +620,14 @@ function createRuntime(pi: ExtensionAPI, config: StartupConfig) {
     },
   });
   pi.registerTool({
-    name: "spawn_agent", label: "Spawn agent", description: "Start a fresh native Pi child in its own visible tab. Supply the complete brief with role, contract, writable paths, exclusions, verification, edit permission and report shape. No inherited parent history. All roles have normal tools. Record workerId and submissionId; ambiguous is not completion.",
+    name: "spawn_agent", label: "Spawn agent", description: "Start a fresh native Pi child in its own visible tab. Supply the complete brief with role, contract, writable paths, exclusions, verification, edit permission and report shape. No inherited parent history. All roles have normal tools. Model is optional and inherits the caller's model when omitted. Supply thinking explicitly on every spawn; role does not set its level. Unsupported thinking is rejected before allocation. Receipt identity reports model and thinking observed at the first correlated agent_start, or null when unknown. Record workerId and submissionId; ambiguous is not completion.",
     parameters: Type.Object({ task: Type.String({ minLength: 1, maxLength: 200000 }), role: StringEnum(["implement", "explore", "review", "judgment"] as const),
-      fork_turns: Type.Optional(StringEnum(["none"])), cwd: Type.Optional(Type.String()) }),
+      fork_turns: Type.Optional(StringEnum(["none"])), cwd: Type.Optional(Type.String()),
+      model: Type.Optional(ModelSchema), thinking: ThinkingSchema }),
     async execute(_id, params, signal, _update, ctx) {
+      const selection = selectWorker(ctx, { model: params.model ?? ctx.model ?? null, thinking: params.thinking });
       const childId = `w${randomUUID().replaceAll("-", "").slice(0, 20)}`;
-      return toolResult(await launch({ childId, parent: workerId, childRole: params.role, childCwd: resolve(ctx.cwd, params.cwd ?? ctx.cwd),
+      return toolResult(await launch({ kind: "fresh", selection, childId, parent: workerId, childRole: params.role, childCwd: resolve(ctx.cwd, params.cwd ?? ctx.cwd),
         sessionPath: join(stateDir, "sessions", `${childId}.jsonl`), task: params.task }, ctx, signal));
     },
   });
@@ -633,13 +657,16 @@ function createRuntime(pi: ExtensionAPI, config: StartupConfig) {
     },
   });
   pi.registerTool({
-    name: "followup_task", label: "Follow-up task", description: "Submit only a new task to the original descendant's Pi conversation. Revive a proven dead worker in a new tab with the same worker ID/session UUID and new runtime generation. Never replay interrupted work. Live busy or unreachable writers are refused. Record the new submissionId.",
+    name: "followup_task", label: "Follow-up task", description: "Submit only a new task to the original descendant's Pi conversation. Revive a proven dead worker in a new tab with the same worker ID/session UUID and new runtime generation. Never replay interrupted work. Retains the worker's native model and thinking. Receipt identity reports selection observed at the first correlated agent_start, or null when unknown. Live busy or unreachable writers are refused. Record the new submissionId.",
     parameters: Type.Object({ agent_id: idSchema, task: Type.String({ minLength: 1, maxLength: 200000 }) }),
     async execute(_id, params, signal, _update, ctx) {
       const target = owned(params.agent_id);
-      if (isOriginalProcessLive(target)) return toolResult(await submitTask(target, params.task, signal));
+      if (isOriginalProcessLive(target)) {
+        const effective = await live(target, signal);
+        return toolResult(await submitTask(effective, params.task, signal));
+      }
       await proveDead(target);
-      return toolResult(await launch({ childId: target.workerId, parent: target.parentId, childRole: target.role, childCwd: target.cwd,
+      return toolResult(await launch({ kind: "resume", childId: target.workerId, parent: target.parentId, childRole: target.role, childCwd: target.cwd,
         sessionPath: target.piSessionPath, task: params.task, previous: target }, ctx, signal));
     },
   });

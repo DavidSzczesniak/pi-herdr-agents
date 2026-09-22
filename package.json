@@ -14,7 +14,8 @@
     "adapter-check": "node --experimental-strip-types adapter-check.mjs",
     "launch-race-check": "node --experimental-strip-types launch-race-check.mjs",
     "startup-check": "node --experimental-strip-types startup-check.mjs",
-    "test": "npm run check && npm run transport-check && npm run adapter-check && npm run launch-race-check && npm run startup-check"
+    "selection-check": "node --experimental-strip-types selection-check.mjs",
+    "test": "npm run check && npm run transport-check && npm run adapter-check && npm run launch-race-check && npm run startup-check && npm run selection-check"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
