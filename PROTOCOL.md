@@ -141,14 +141,14 @@ Workers cancel switch, fork, and tree-navigation events to keep their assigned c
 
 The installed package autoloads through its `pi.extensions` manifest, which names only `index.ts`. Extension construction captures configuration without creating background resources. Activation happens only in `session_start` when `ctx.mode === "tui"`, `HERDR_ENV=1`, and Pi has a persistent session path. Other modes and ephemeral sessions create no adapter resources, tools, host-binding instructions, or session guards.
 
-An ordinary lead needs native `HERDR_SOCKET_PATH` and `HERDR_PANE_ID`. Startup validates its exact pane and `HERDR_WORKSPACE_ID` when present. `HERDR_SESSION_NAME` is optional. Herdr can omit it even for a named server, so the socket remains authoritative. Missing or invalid Herdr metadata disables the adapter with a TUI notification. Ordinary Pi remains usable and its selected tools are unchanged.
+An ordinary lead needs native `HERDR_SOCKET_PATH` and `HERDR_PANE_ID`. Startup validates its exact pane and `HERDR_WORKSPACE_ID` when present. The server name is optional. Herdr 0.9 sets it in `HERDR_SESSION`, and Herdr 0.8 used `HERDR_SESSION_NAME`. The adapter reads `HERDR_SESSION` first. Herdr omits the name for the default server, so the socket remains authoritative. Missing or invalid Herdr metadata disables the adapter with a TUI notification. Ordinary Pi remains usable and its selected tools are unchanged.
 
-Configuration is per extension instance. The adapter never modifies `process.env`. Every Herdr invocation uses argv-safe `env -u HERDR_SESSION_NAME HERDR_SOCKET_PATH=<captured-path> herdr ...`. It does not pass `--session`, which could redirect the request away from the pane's actual socket. This handles both default and named servers without guessing their names or discovering a focused session.
+Configuration is per extension instance. The adapter never modifies `process.env`. Every Herdr invocation uses argv-safe `env -u HERDR_SESSION -u HERDR_SESSION_NAME HERDR_SOCKET_PATH=<captured-path> herdr ...`. Herdr 0.9 routes by `HERDR_SESSION` when no socket path is set, so removing both keeps routing independent of Herdr's precedence rules. It does not pass `--session`, which could redirect the request away from the pane's actual socket. This handles both default and named servers without guessing their names or discovering a focused session.
 
 The adapter supplies internal child variables through `tab create --env`:
 
 - `DS_HERDR_STATE_DIR` and `DS_HERDR_SOCKET_DIR`, the shared private durable and socket directories.
-- `DS_HERDR_SESSION`, the captured server name, empty when native `HERDR_SESSION_NAME` is unset.
+- `DS_HERDR_SESSION`, the captured server name, empty for the default server. The adapter also sets `HERDR_SESSION` and `HERDR_SESSION_NAME` to this value.
 - `DS_HERDR_WORKER_ID`, `DS_HERDR_ROLE`, and `DS_HERDR_PARENT_ID`.
 - `DS_HERDR_WORKSPACE`, the absolute child cwd, and `DS_HERDR_WORKSPACE_ID`.
 - `DS_HERDR_RESTART_GENERATION`, empty for a fresh child.

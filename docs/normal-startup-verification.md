@@ -55,4 +55,4 @@ The first native spawn exposed a macOS-only failure. `herdr agent start` typed t
 
 After that change, a native Review worker completed a spawn, a follow-up, and retirement. Its session recorded the role brief once, as the `addendum` section, across both turns. The Linux native run above predates this change. On Linux, the brief previously reached Pi through `--append-system-prompt`, which renders as the same addendum section.
 
-Herdr 0.9.1 sets `HERDR_SESSION` instead of `HERDR_SESSION_NAME`. Routing still targets the exact captured socket because `HERDR_SOCKET_PATH` takes precedence over both variables.
+Herdr 0.9.1 sets `HERDR_SESSION` instead of `HERDR_SESSION_NAME`, so the adapter recorded an empty server name for named servers. Routing still targeted the exact captured socket because `HERDR_SOCKET_PATH` takes precedence over both variables. The adapter now reads `HERDR_SESSION`, falls back to `HERDR_SESSION_NAME`, and removes both from every Herdr invocation.

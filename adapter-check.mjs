@@ -21,7 +21,7 @@ const header = { type: "session", version: 3, id: "session-lead", timestamp: new
 function fixture({ workerId = "lead", role = "lead", thinking = "high", parentId = "", auth = true, mode = "started", restart = "", sessionId = `session-${workerId}`, failReport = false, launchFault = "", launchId = "" } = {}) {
   Object.assign(process.env, { DS_HERDR_STATE_DIR: state, DS_HERDR_SESSION: "slice", DS_HERDR_WORKSPACE: directory,
     DS_HERDR_WORKER_ID: workerId, DS_HERDR_ROLE: role, DS_HERDR_PARENT_ID: parentId, DS_HERDR_RESTART_GENERATION: restart,
-    HERDR_ENV: "1", HERDR_SESSION_NAME: "slice", HERDR_SOCKET_PATH: "/fixture/herdr.sock", HERDR_WORKSPACE_ID: "w1", HERDR_PANE_ID: `w1:p-${workerId}` });
+    HERDR_ENV: "1", HERDR_SESSION: "slice", HERDR_SOCKET_PATH: "/fixture/herdr.sock", HERDR_WORKSPACE_ID: "w1", HERDR_PANE_ID: `w1:p-${workerId}` });
   delete process.env.DS_HERDR_WORKSPACE_ID;
   process.env.DS_HERDR_LAUNCH_ID = launchId;
   const hooks = new Map();

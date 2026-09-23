@@ -33,7 +33,7 @@ let nextChildModel;
 let nextChildThinking;
 function fixture({ id = "lead", parent = "", role = "lead", model = reasoning, thinking = "high", auth = true,
   sessionFile = join(root, `${id}.jsonl`), sessionId = `session-${id}`, launchId = "", restart = "" } = {}) {
-  Object.assign(process.env, { HERDR_ENV: "1", HERDR_SOCKET_PATH: "/fixture/selection.sock", HERDR_SESSION_NAME: "", HERDR_PANE_ID: id,
+  Object.assign(process.env, { HERDR_ENV: "1", HERDR_SOCKET_PATH: "/fixture/selection.sock", HERDR_SESSION: "", HERDR_PANE_ID: id,
     HERDR_WORKSPACE_ID: "w1", DS_HERDR_STATE_DIR: root, DS_HERDR_WORKER_ID: id, DS_HERDR_PARENT_ID: parent,
     DS_HERDR_ROLE: role, DS_HERDR_SESSION: "", DS_HERDR_WORKSPACE: root, DS_HERDR_LAUNCH_ID: launchId,
     DS_HERDR_RESTART_GENERATION: restart });

@@ -35,8 +35,8 @@ function fixture({ id = "session-a", mode = "tui", persistent = true, env = {}, 
     async exec(command, args) {
       commands.push({ command, args });
       assert.equal(command, "env");
-      assert.deepEqual(args.slice(0, 4), ["-u", "HERDR_SESSION_NAME", `HERDR_SOCKET_PATH=${environment.HERDR_SOCKET_PATH}`, "herdr"]);
-      const op = args.slice(4);
+      assert.deepEqual(args.slice(0, 6), ["-u", "HERDR_SESSION", "-u", "HERDR_SESSION_NAME", `HERDR_SOCKET_PATH=${environment.HERDR_SOCKET_PATH}`, "herdr"]);
+      const op = args.slice(6);
       if (fail === true || (fail === "report" && op[1] === "report-agent")) return { code: 1, killed: false, stderr: "fixture startup fault", stdout: "" };
       if (op[0] === "agent") return { code: 1, killed: false, stderr: "fixture child failure", stdout: "" };
       const pane = { pane_id: op[2], workspace_id: "w1", terminal_id: "terminal-1", tab_id: "w1:t1" };
@@ -94,7 +94,7 @@ try {
   await inert(fixture({ persistent: false }));
   assert.equal(existsSync(stateRoot), false, "inert startup performs no runtime writes");
   const a = fixture();
-  const b = fixture({ id: "session-b", env: { HERDR_SOCKET_PATH: "/exact/named.sock", HERDR_SESSION_NAME: "named" } });
+  const b = fixture({ id: "session-b", env: { HERDR_SOCKET_PATH: "/exact/named.sock", HERDR_SESSION: "named" } });
   await a.start(); await b.start();
   assert.equal(a.tools.size, 7);
   assert.ok(a.tools.has("retire_agent"), "ordinary autoload discovers retirement without changing root tool selection");
@@ -105,6 +105,8 @@ try {
   assert.ok(a.config.stateDir.length > 200);
   assert.deepEqual(readdirSync(project), [], "runtime state never enters project");
   assert.equal(a.config.herdrSession, "", "default server needs no invented session name");
+  assert.equal(b.config.herdrSession, "named");
+  assert.equal(fixture({ id: "session-legacy", env: { HERDR_SESSION_NAME: "legacy" } }).config.herdrSession, "legacy", "Herdr 0.8 session name still read");
   const endpointScoped = fixture({ env: { HERDR_SOCKET_PATH: "/another/default.sock" } });
   assert.notEqual(endpointScoped.config.stateDir, a.config.stateDir);
   for (const event of ["session_before_switch", "session_before_fork", "session_before_tree"])
@@ -153,11 +155,11 @@ try {
     callerId: "lead", callerGeneration: recovered.identity().generation });
   assert.equal(status.kind, "status");
   await assert.rejects(recovered.tools.get("spawn_agent").execute("child", { role: "implement", thinking: "medium", task: "new task" }, undefined, undefined, recovered.ctx), /fixture child failure/);
-  const created = recovered.commands.find(({ args }) => args[4] === "tab").args;
+  const created = recovered.commands.find(({ args }) => args[6] === "tab").args;
   assert.ok(created.includes(`PI_CODING_AGENT_DIR=${join(root, "pi-config")}`));
   assert.ok(created.includes(`DS_HERDR_SOCKET_DIR=${recovered.config.socketDir}`));
   assert.ok(created.includes("HERDR_SOCKET_PATH=/exact/default.sock"));
-  const started = recovered.commands.find(({ args }) => args[4] === "agent").args;
+  const started = recovered.commands.find(({ args }) => args[6] === "agent").args;
   assert.equal(started[started.indexOf("-e") + 1], extensionPath);
   assert.equal(extensionPath, fileURLToPath(new URL("./index.ts", import.meta.url)));
   assert.ok(!started.some(arg => arg.includes("/opt/adapter")));
@@ -166,13 +168,13 @@ try {
   const deep = fixture({ id: "deep-state", env: { XDG_STATE_HOME: join(root, "a".repeat(200), "b".repeat(200), "c".repeat(200)) } });
   await deep.start();
   await assert.rejects(deep.tools.get("spawn_agent").execute("child", { role: "implement", thinking: "medium", task: "t" }, undefined, undefined, deep.ctx), /launch command too long/);
-  assert.ok(!deep.commands.some(({ args }) => args[4] === "tab"), "overlong launch refused before tab creation");
+  assert.ok(!deep.commands.some(({ args }) => args[6] === "tab"), "overlong launch refused before tab creation");
   assert.deepEqual(readdirSync(join(deep.config.stateDir, "locks")).filter(name => name.startsWith("launch-")), [], "overlong launch leaves no claim");
   await deep.stop();
   const defaultConfig = fixture({ id: "default-config", env: { HOME: root, PI_CODING_AGENT_DIR: undefined } });
   await defaultConfig.start();
   await assert.rejects(defaultConfig.tools.get("spawn_agent").execute("default-child", { role: "implement", thinking: "medium", task: "new task" }, undefined, undefined, defaultConfig.ctx), /fixture child failure/);
-  const defaultLaunch = defaultConfig.commands.find(({ args }) => args[4] === "tab").args;
+  const defaultLaunch = defaultConfig.commands.find(({ args }) => args[6] === "tab").args;
   assert.ok(defaultLaunch.includes(`PI_CODING_AGENT_DIR=${join(root, ".pi", "agent")}`),
     "unset config uses the lead's effective default, not Herdr server environment");
   const fault = fixture({ id: "fault", fail: true });

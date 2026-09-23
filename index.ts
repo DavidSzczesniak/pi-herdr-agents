@@ -577,7 +577,7 @@ function createRuntime(pi: ExtensionAPI, config: StartupConfig) {
         if (recordedThinking(previous) !== thinking) throw new Error("Recorded thinking changed under launch claim; continuation refused");
       }
       if (!previous) writeFileSync(spec.sessionPath, "", { flag: "wx", mode: 0o600 });
-      const env = { ...config.childEnvironment, HERDR_SOCKET_PATH: config.herdrSocket, HERDR_SESSION_NAME: herdrSession,
+      const env = { ...config.childEnvironment, HERDR_SOCKET_PATH: config.herdrSocket, HERDR_SESSION: herdrSession, HERDR_SESSION_NAME: herdrSession,
         DS_HERDR_SOCKET_DIR: socketDir, DS_HERDR_STATE_DIR: stateDir, DS_HERDR_SESSION: herdrSession, DS_HERDR_WORKSPACE_ID: workspaceId,
         DS_HERDR_WORKER_ID: spec.childId, DS_HERDR_PARENT_ID: spec.parent ?? "", DS_HERDR_ROLE: spec.childRole,
         DS_HERDR_WORKSPACE: spec.childCwd, DS_HERDR_RESTART_GENERATION: previous?.generation ?? "", DS_HERDR_LAUNCH_ID: launchId };

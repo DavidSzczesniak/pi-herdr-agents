@@ -31,7 +31,7 @@ const mode = inChild ? process.argv[4] : "idle";
 const parent = inChild ? process.argv[5] : "";
 const configEnv = { DS_HERDR_STATE_DIR: process.env.RETIRE_STATE || directory, DS_HERDR_SESSION: "fixture", DS_HERDR_WORKSPACE: process.env.RETIRE_STATE || directory,
   DS_HERDR_WORKER_ID: id, DS_HERDR_ROLE: inChild ? "implement" : "lead", DS_HERDR_PARENT_ID: parent,
-  HERDR_ENV: "1", HERDR_SESSION_NAME: "fixture", HERDR_SOCKET_PATH: "/fixture/retirement.sock", HERDR_WORKSPACE_ID: "w", HERDR_PANE_ID: pane(process.env.RETIRE_NEW_PANE ? `${id}-new` : id).pane_id };
+  HERDR_ENV: "1", HERDR_SESSION: "fixture", HERDR_SOCKET_PATH: "/fixture/retirement.sock", HERDR_WORKSPACE_ID: "w", HERDR_PANE_ID: pane(process.env.RETIRE_NEW_PANE ? `${id}-new` : id).pane_id };
 if (inChild) {
   Object.assign(process.env, configEnv);
   delete process.env.DS_HERDR_WORKSPACE_ID;

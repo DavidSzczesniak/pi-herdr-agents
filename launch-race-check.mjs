@@ -22,7 +22,7 @@ if (process.argv[2] === "contender") {
   const pane = id => ({ pane_id: id, terminal_id: `term-${id}`, workspace_id: "w1", tab_id: `tab-${id}` });
   const ownSession = join(state, `${worker}.jsonl`);
   writeFileSync(ownSession, sessionHeader(`session-${worker}`));
-  Object.assign(process.env, { HERDR_ENV: "1", HERDR_SESSION_NAME: "slice", HERDR_SOCKET_PATH: "/fixture/herdr.sock", HERDR_WORKSPACE_ID: "w1", HERDR_PANE_ID: `w1:${worker}`, DS_HERDR_WORKER_ID: worker,
+  Object.assign(process.env, { HERDR_ENV: "1", HERDR_SESSION: "slice", HERDR_SOCKET_PATH: "/fixture/herdr.sock", HERDR_WORKSPACE_ID: "w1", HERDR_PANE_ID: `w1:${worker}`, DS_HERDR_WORKER_ID: worker,
     DS_HERDR_ROLE: worker === "lead" ? "lead" : "implement", DS_HERDR_PARENT_ID: worker === "lead" ? "" : "lead",
     DS_HERDR_STATE_DIR: state, DS_HERDR_SESSION: "slice", DS_HERDR_WORKSPACE: dirname(file), DS_HERDR_RESTART_GENERATION: "" });
   delete process.env.DS_HERDR_WORKSPACE_ID;

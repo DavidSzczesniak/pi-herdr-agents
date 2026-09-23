@@ -28,7 +28,8 @@ export function startupConfig(ctx: ExtensionContext, env: NodeJS.ProcessEnv) {
   if (!env.HERDR_SOCKET_PATH || !env.HERDR_PANE_ID) throw new Error("Missing native Herdr socket or pane identity");
   if (!isAbsolute(env.HERDR_SOCKET_PATH)) throw new Error("Herdr socket must be absolute");
   const herdrSocket = env.HERDR_SOCKET_PATH;
-  const herdrSession = env.HERDR_SESSION_NAME || "";
+  // Herdr 0.9 names the server in HERDR_SESSION; 0.8 used HERDR_SESSION_NAME.
+  const herdrSession = env.HERDR_SESSION || env.HERDR_SESSION_NAME || "";
   const required = (name: string) => {
     const value = env[name];
     if (!value) throw new Error(`Missing ${name}`);
@@ -66,5 +67,5 @@ export type StartupConfig = NonNullable<ReturnType<typeof startupConfig>>;
 
 export function herdrCommand(config: Pick<StartupConfig, "herdrSocket" | "herdrSession">, args: string[]): string[] {
   // Do not pass --session: it can select a different server than the pane's socket.
-  return ["-u", "HERDR_SESSION_NAME", `HERDR_SOCKET_PATH=${config.herdrSocket}`, "herdr", ...args];
+  return ["-u", "HERDR_SESSION", "-u", "HERDR_SESSION_NAME", `HERDR_SOCKET_PATH=${config.herdrSocket}`, "herdr", ...args];
 }
