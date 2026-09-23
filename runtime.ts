@@ -1,3 +1,4 @@
+import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { Type, type Static } from "typebox";
@@ -97,7 +98,25 @@ export function recordedThinking(previous: Identity): Selection["thinking"] {
 export function roleBrief(role: Identity["role"]): string {
   return `Role: ${role}. Own the complete task in your brief and any descendants you spawn. Fresh children receive only their brief, not parent conversation history. Respect the brief's writable paths and edit permission. Use Git, tests, and scratch probes as needed. ${role === "review" || role === "explore" ? "Report findings rather than apply implementation fixes." : "Produce the deliverable requested by the brief."} Keep reports under 800 words with changed paths, checks, evidence paths, and open risks. Record workerId and submissionId; wait on the exact submission. update_plan changes only your own session plan, never the lead's. For a genuine human preference question, stop and report the question for the real user; never invent their answer.`;
 }
+// macOS: boot session UUID plus ps start time (one-second resolution). UTC/C keep the birth string identical across callers.
+let darwinBootId: string | undefined;
+function darwinProcessIdentity(pid: number): { birth: string; state: string } | null {
+  const env = { TZ: "UTC", LC_ALL: "C" };
+  const ps = spawnSync("/bin/ps", ["-o", "lstart=,stat=", "-p", String(pid)], { encoding: "utf8", env, timeout: 5000 });
+  if (ps.error) throw ps.error;
+  if (ps.status !== 0) {
+    // Only the kernel's ESRCH proves absence; ps output alone could hide a live process.
+    try { process.kill(pid, 0); } catch (error) { if (error instanceof Error && "code" in error && error.code === "ESRCH") return null; }
+    throw new Error(`Process status unavailable for PID ${pid}: ${ps.stderr.trim()}`);
+  }
+  const match = /^([A-Z][a-z]{2} [A-Z][a-z]{2} +\d{1,2} \d{2}:\d{2}:\d{2} \d{4}) +([A-Z])\S*$/.exec(ps.stdout.trim());
+  if (!match?.[1] || !match[2]) throw new Error("Invalid macOS process status");
+  darwinBootId ??= execFileSync("/usr/sbin/sysctl", ["-n", "kern.bootsessionuuid"], { encoding: "utf8", env, timeout: 5000 }).trim();
+  if (!/^[0-9A-F-]{36}$/.test(darwinBootId)) throw new Error("Invalid macOS boot session UUID");
+  return { birth: `${darwinBootId}:${match[1].replace(/ +/g, " ")}`, state: match[2] };
+}
 export function processIdentity(pid: number): { birth: string; state: string } | null {
+  if (process.platform === "darwin") return darwinProcessIdentity(pid);
   try {
     const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
     const fields = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/);

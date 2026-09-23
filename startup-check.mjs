@@ -2,13 +2,13 @@
 import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, existsSync, rmSync, readdirSync } from "node:fs";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import adapter from "./index.ts";
 import { startupConfig, extensionPath, privateDirectory } from "./startup.ts";
 import { atomicWrite, request } from "./protocol.ts";
 
-const root = mkdtempSync(join(tmpdir(), "pha-"));
+// Root doubles as XDG_RUNTIME_DIR. macOS tmpdir() is too long for the 103-byte socket limit.
+const root = mkdtempSync("/tmp/pha-");
 const stateRoot = join(root, "long-durable-state-" + "x".repeat(140));
 const project = join(root, "project");
 mkdirSync(project);
@@ -162,6 +162,9 @@ try {
   assert.equal(extensionPath, fileURLToPath(new URL("./index.ts", import.meta.url)));
   assert.ok(!started.some(arg => arg.includes("/opt/adapter")));
   assert.equal(started[started.indexOf("--model") + 1], "fixture/no-network");
+  // Herdr may type this into a shell still in canonical mode; macOS truncates canonical input at 1024 bytes.
+  const typed = ["pi", ...started.slice(started.indexOf("--") + 1)].map(arg => `'${arg}'`).join(" ");
+  assert.ok(Buffer.byteLength(typed) < 1024, `launch command fits macOS canonical input: ${Buffer.byteLength(typed)} bytes`);
   const defaultConfig = fixture({ id: "default-config", env: { HOME: root, PI_CODING_AGENT_DIR: undefined } });
   await defaultConfig.start();
   await assert.rejects(defaultConfig.tools.get("spawn_agent").execute("default-child", { role: "implement", thinking: "medium", task: "new task" }, undefined, undefined, defaultConfig.ctx), /fixture child failure/);

@@ -367,13 +367,13 @@ try {
   // Real SDK session events, model clamping, and reload. No prompt or provider request.
   const agentDir = join(root, "sdk-config");
   const settingsManager = SettingsManager.inMemory();
-  const errors = [];
+  const errors = [], renderedPrompts = [];
   const loader = new DefaultResourceLoader({ cwd: root, agentDir, settingsManager, noExtensions: true,
     noSkills: true, noPromptTemplates: true, noThemes: true, agentsFilesOverride: () => ({ agentsFiles: [] }),
     extensionFactories: [pi => adapter({ ...pi, exec: async (_command, args) => {
       const op = args.slice(args.indexOf("herdr") + 1);
       return { code: 0, killed: false, stderr: "", stdout: op[1] === "get" ? JSON.stringify({ result: { pane: pane(op[2]) } }) : "" };
-    } })] });
+    } }), pi => pi.on("before_agent_start", event => { renderedPrompts.push(event.systemPrompt); })] });
   Object.assign(process.env, { DS_HERDR_WORKER_ID: "sdk-worker", DS_HERDR_PARENT_ID: "lead", DS_HERDR_ROLE: "review",
     HERDR_PANE_ID: "sdk-worker", DS_HERDR_LAUNCH_ID: "", DS_HERDR_RESTART_GENERATION: "" });
   await loader.reload();
@@ -386,6 +386,9 @@ try {
     await session.bindExtensions({ mode: "tui", onError: error => errors.push(error) });
     assert.deepEqual(errors, []);
     assert.equal(readIdentity("sdk-worker").thinking, "high", "native SDK startup retains selected effort");
+    // A SYSTEM.md custom prompt drops Pi's prompt guidelines; the role brief must still render.
+    await session.extensionRunner.emitBeforeAgentStart("probe", undefined, { cwd: root, customPrompt: "CUSTOM PROMPT" });
+    assert.match(renderedPrompts.at(-1), /^CUSTOM PROMPT[\s\S]*Role: review\. /, "role brief survives a custom system prompt");
     session.setThinkingLevel("low");
     assert.equal(readIdentity("sdk-worker").thinking, "low", "native thinking event persists before any status poll or await");
     await session.setModel(plain);

@@ -312,7 +312,7 @@ function createRuntime(pi: ExtensionAPI, config: StartupConfig) {
       if (parent.herdrSession !== herdrSession || parent.workspaceId !== workspaceId) throw new Error("Parent identity mismatch");
     }
     const birth = processIdentity(process.pid);
-    if (!birth) throw new Error("Own Linux process identity unavailable");
+    if (!birth) throw new Error("Own process identity unavailable");
     const model = ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : null;
     const previous = existsSync(identityPath(workerId)) ? readIdentity(workerId) : undefined;
     const workerReload = reason === "reload" && role !== "lead" && previous && previous.pid === process.pid &&
@@ -406,6 +406,9 @@ function createRuntime(pi: ExtensionAPI, config: StartupConfig) {
   pi.on("before_agent_start", (event) => {
     if (!identity || shuttingDown) return;
     if (active && event.prompt === `[ds-task ${active.nonce}]\n${active.task}`) startNonce = active.nonce;
+    // Not a launch argument: Herdr can type the launch command before the new shell leaves canonical mode, and macOS truncates canonical input at 1024 bytes.
+    // The addendum renders even with a SYSTEM.md custom prompt, unlike prompt guidelines.
+    if (identity.role !== "lead") event.systemPromptOptions.appendSystemPrompt = [event.systemPromptOptions.appendSystemPrompt, roleBrief(identity.role)].filter(Boolean).join("\n\n");
     event.systemPromptOptions.promptGuidelines.push("Host binding: ds-mode's Codex lead/worker references mean the corresponding native Pi roles here. Use matching update_plan, spawn_agent, wait_agent, list_agents, followup_task and interrupt_agent tools. Use read, grep, find and bash for Read/Grep/Glob/Shell. Preserve all skill phases, triggers, ownership and proof requirements. A genuine human question requires a real user answer; stop and report it if no interactive question tool is available.");
   });
   pi.on("tool_call", () => {
@@ -588,7 +591,7 @@ function createRuntime(pi: ExtensionAPI, config: StartupConfig) {
       await herdr(["agent", "start", `${spec.childId}-${launchId.slice(0, 8)}`, "--kind", "pi", "--pane", pane.pane_id, "--timeout", "25000", "--",
         "--no-extensions", "-e", extensionPath, "--session", spec.sessionPath,
         "--model", `${model.provider}/${model.id}`,
-        "--thinking", thinking, "--tools", normalTools.join(","), "--append-system-prompt", roleBrief(spec.childRole)]);
+        "--thinking", thinking, "--tools", normalTools.join(",")]);
       signal?.throwIfAborted();
       const target = await live(owned(spec.childId), signal);
       if (target.paneId !== pane.pane_id || target.terminalId !== pane.terminal_id || target.piSessionPath !== spec.sessionPath ||

@@ -8,7 +8,7 @@ Normal startup is available for supervised dogfooding. Focused native checks and
 
 Once installed, ordinary `pi` in a Herdr pane activates the adapter automatically. The lead needs no `DS_HERDR_*` exports, explicit extension flag, source mount, or private launcher. Pi outside Herdr, print mode, JSON mode, RPC, ordinary SDK use, and `--no-session` stay inert. Activation requires `ctx.mode === "tui"` and a persistent native session. RPC's `hasUI` flag is not an activation signal.
 
-The integration targets Pi 0.87.0, Herdr 0.8.0 protocol 19, and Node 24.18.0 on Linux. Development dependencies are pinned. Broad peer declarations follow Pi's package convention and do not claim compatibility with other versions.
+The integration targets Linux and macOS. It was verified with Pi 0.87.0, Herdr 0.8.0 protocol 19, and Node 24.18.0 on Linux, and with Pi 0.87.1, Herdr 0.9.1 protocol 22, and Node 24.20.0 on macOS. Development dependencies are pinned. Broad peer declarations follow Pi's package convention and do not claim compatibility with other versions.
 
 ## Install or remove the package
 
@@ -93,11 +93,11 @@ npm ci --ignore-scripts --no-audit --no-fund
 npm test
 ```
 
-Transport checks use real Unix sockets. Adapter and startup checks use real files, sockets, and Linux process identities but stub TUI events and Herdr commands. Startup checks also exercise real Pi package discovery and headless SDK binding. The launch-race check uses two real processes with a stubbed native session-open boundary. Selection checks use Pi's installed catalog, capability helpers, and SDK model/thinking events and empty-history reload, with Herdr controls and provider turns stubbed. The retirement check uses separate real processes and Unix sockets with stubbed Pi and Herdr controls. It covers original-conversation cold continuation and retained historical results without a provider turn. These checks launch neither Herdr nor models. Native lifecycle verification requires a disposable Herdr server and ordinary package autoload.
+Transport checks use real Unix sockets. Adapter and startup checks use real files, sockets, and process identities but stub TUI events and Herdr commands. Startup checks also exercise real Pi package discovery and headless SDK binding. The launch-race check uses two real processes with a stubbed native session-open boundary. Selection checks use Pi's installed catalog, capability helpers, and SDK model/thinking events and empty-history reload, with Herdr controls and provider turns stubbed. The retirement check uses separate real processes and Unix sockets with stubbed Pi and Herdr controls. It covers original-conversation cold continuation and retained historical results without a provider turn. These checks launch neither Herdr nor models. Native lifecycle verification requires a disposable Herdr server and ordinary package autoload.
 
 ## Limits and evidence
 
-The adapter does not protect against malicious peers sharing its UID. Whole-Herdr-server crash recovery and automatic reconciliation of uncertain launch claims are unsupported. Structured `AskQuestion` is not implemented. Workers must report genuine human questions and wait for a real answer.
+On macOS, process identity has one-second start-time resolution, and a child launch command must stay under 1024 bytes. See [the protocol](PROTOCOL.md) for both limits. The adapter does not protect against malicious peers sharing its UID. Whole-Herdr-server crash recovery and automatic reconciliation of uncertain launch claims are unsupported. Structured `AskQuestion` is not implemented. Workers must report genuine human questions and wait for a real answer.
 
 The historical hardening checks passed independent runtime review. One ds-mode bug-fix journey produced a correct fix and passed 32 external checks, but its workflow assessment was partial because the lead skipped prescribed skill steps.
 

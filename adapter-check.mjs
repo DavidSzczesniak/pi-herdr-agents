@@ -1,4 +1,4 @@
-// Pi and Herdr behavior is stubbed here. Files, Unix sockets, and Linux process identity are real.
+// Pi and Herdr behavior is stubbed here. Files, Unix sockets, and process identity are real.
 import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, existsSync, rmSync } from "node:fs";
 import { join } from "node:path";
@@ -238,6 +238,14 @@ try {
   await exited;
   const previous = { ...lead, pid: processProbe.pid, pidBirth: probeBirth.birth, available: false };
   assert.equal(isOriginalProcessLive(previous), false, "real child PID/birth death proof");
+  // Node reaps its own children, so a non-reaping perl parent holds the zombie.
+  const holder = spawn("perl", ["-e", "$| = 1; my $p = fork // die; exit 0 unless $p; print \"$p\\n\"; sleep 30"], { stdio: ["ignore", "pipe", "inherit"] });
+  const zombie = Number(String((await once(holder.stdout, "data"))[0]));
+  for (let n = 0; n < 100 && processIdentity(zombie)?.state !== "Z"; n++) await new Promise(resolve => setTimeout(resolve, 20));
+  const zombieIdentity = processIdentity(zombie);
+  assert.equal(zombieIdentity?.state, "Z");
+  assert.equal(isOriginalProcessLive({ pid: zombie, pidBirth: zombieIdentity.birth }), false, "zombie is not live");
+  holder.kill("SIGKILL");
   atomicWrite(join(state, "workers", "lead.json"), previous);
   const oldTask = { kind: "active", phase: "started", nonce: "nonce", workerId: "lead", generation: previous.generation,
     piSessionId: previous.piSessionId, submissionId: "interrupted-old", task: "old task", startedAt: new Date().toISOString() };
@@ -257,7 +265,7 @@ try {
   assert.equal(revived.sends, 1);
   await revived.settle();
   await revived.stop();
-  process.stdout.write("PASS adapter contracts with explicitly stubbed Pi/Herdr events; real UDS/files/proc. No native lifecycle or topology claim.\n");
+  process.stdout.write("PASS adapter contracts with explicitly stubbed Pi/Herdr events; real UDS/files/process identity. No native lifecycle or topology claim.\n");
 } finally {
   if (processProbe && processProbe.exitCode === null && processProbe.signalCode === null) processProbe.kill("SIGKILL");
   for (const fixture of fixtures.reverse()) { try { await fixture.stop(); } catch {} }
