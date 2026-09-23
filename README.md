@@ -10,22 +10,38 @@ Once installed, ordinary `pi` in a Herdr pane activates the adapter automaticall
 
 The integration targets Pi 0.87.0, Herdr 0.8.0 protocol 19, and Node 24.18.0 on Linux. Development dependencies are pinned. Broad peer declarations follow Pi's package convention and do not claim compatibility with other versions.
 
-## Install or remove the local package
+## Install or remove the package
 
-After review and native verification, install the checkout with:
+From inside the cloned repository, run:
 
 ```sh
-pi install /absolute/path/to/pi-herdr-agents
+pi install .
 ```
 
-Pi records the local path without copying it. Keep that directory available. The package manifest loads only `index.ts`, never test fixtures. Start ordinary `pi` in a Herdr pane after installation. The active tools include the adapter tools unless your tool allowlist or exclusions disable them. Run `/herdr-agents` to inspect adapter identity, state path, and enabled tools.
+Pi registers the checkout in your personal settings without copying it. Keep the checkout available. You do not need to run the command from outside the repository or supply an absolute path.
+
+Alternatively, install directly from Git without cloning manually:
+
+```sh
+pi install git:github.com/DavidSzczesniak/pi-herdr-agents
+```
+
+Pi manages the checkout for a Git installation. Choose one installation method.
+
+The package manifest loads only `index.ts`, never test fixtures. Restart Pi or use `/reload` after installation. Start ordinary `pi` in a Herdr pane to use the extension. The active tools include the adapter tools unless your tool allowlist or exclusions disable them. Run `/herdr-agents` to inspect adapter identity, state path, and enabled tools.
 
 Remove or disable the previous delegation package before loading this one to avoid competing delegation tools. Use `pi list` to find its exact source, then `pi remove <source>`. This repository does not perform that migration.
 
-To remove this adapter:
+To remove a local installation, run this from the same checkout:
 
 ```sh
-pi remove /absolute/path/to/pi-herdr-agents
+pi remove .
+```
+
+For a Git installation, run:
+
+```sh
+pi remove git:github.com/DavidSzczesniak/pi-herdr-agents
 ```
 
 Restart Pi or use `/reload` after changing packages. Removal does not close workers or delete their state. Finish or explicitly stop owned workers before removal. Leave Herdr's managed `herdr-agent-state.ts` integration installed. This adapter uses its own report source and does not edit that file.
