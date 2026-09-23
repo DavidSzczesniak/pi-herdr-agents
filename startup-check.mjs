@@ -96,7 +96,8 @@ try {
   const a = fixture();
   const b = fixture({ id: "session-b", env: { HERDR_SOCKET_PATH: "/exact/named.sock", HERDR_SESSION_NAME: "named" } });
   await a.start(); await b.start();
-  assert.equal(a.tools.size, 6);
+  assert.equal(a.tools.size, 7);
+  assert.ok(a.tools.has("retire_agent"), "ordinary autoload discovers retirement without changing root tool selection");
   assert.equal(a.changes, 0, "root preserves user-selected tools");
   assert.notEqual(a.config.stateDir, b.config.stateDir);
   assert.notEqual(a.identity().socketPath, b.identity().socketPath);
@@ -146,7 +147,7 @@ try {
   atomicWrite(join(restored.config.stateDir, "workers", "lead.json"), { ...saved, available: true, pidBirth: "dead-generation" });
   const recovered = fixture();
   await recovered.emit("session_start", { reason: "resume" });
-  assert.equal(recovered.tools.size, 6);
+  assert.equal(recovered.tools.size, 7);
   assert.notEqual(recovered.identity().generation, saved.generation);
   const status = await request(recovered.identity().socketPath, { kind: "status", generation: recovered.identity().generation,
     callerId: "lead", callerGeneration: recovered.identity().generation });

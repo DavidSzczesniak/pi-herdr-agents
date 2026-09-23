@@ -1,19 +1,40 @@
-import { mkdirSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { Type, type Static } from "typebox";
 import { getSupportedThinkingLevels, StringEnum } from "@earendil-works/pi-ai";
 import { buildSessionContext, parseSessionEntries, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { atomicWrite, SelectionSchema, ThinkingSchema, parse, readRecord, SafeId, type Identity, type Selection } from "./protocol.ts";
+import { atomicWrite, SelectionSchema, ThinkingSchema, parse, readIdentityRecord, readRecord, SafeId, type Identity, type Selection } from "./protocol.ts";
 
 export const LaunchClaimSchema = Type.Object({
   launchId: SafeId, workerId: SafeId, previousGeneration: Type.Union([SafeId, Type.Null()]),
   piSessionPath: Type.String(), ...SelectionSchema.properties, callerId: SafeId, callerGeneration: SafeId,
   pid: Type.Integer({ minimum: 1 }), pidBirth: Type.String({ minLength: 1 }),
 });
+export function retirementFence(stateDir: string, workerId: string): string {
+  return join(stateDir, "locks", `retire-${parse(SafeId, workerId)}`);
+}
+export function assertNoRetirement(stateDir: string, workerId: string): void {
+  const visited = new Set<string>();
+  let next: string | null = workerId;
+  while (next) {
+    if (visited.has(next)) throw new Error("Worker parent cycle");
+    visited.add(next);
+    if (existsSync(retirementFence(stateDir, next))) throw new Error(`Retirement unresolved for ${next}; launch refused`);
+    const path = join(stateDir, "workers", `${parse(SafeId, next)}.json`);
+    next = existsSync(path) ? readIdentityRecord(path).parentId : null;
+  }
+}
 export function claimLaunch(stateDir: string, claim: Static<typeof LaunchClaimSchema>) {
+  assertNoRetirement(stateDir, claim.workerId);
   const path = join(stateDir, "locks", `launch-${parse(SafeId, claim.workerId)}`);
   mkdirSync(path);
-  atomicWrite(join(path, "claim.json"), claim);
+  try {
+    assertNoRetirement(stateDir, claim.workerId);
+    atomicWrite(join(path, "claim.json"), claim);
+  } catch (error) {
+    rmSync(path, { recursive: true });
+    throw error;
+  }
   return {
     path,
     release() {

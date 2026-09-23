@@ -31,13 +31,14 @@ Under that directory:
 | `tasks/<workerId>/<submissionId>.json` | Exact task, generation, Pi UUID, state, and result |
 | `sessions/<workerId>.jsonl` | Child's native Pi conversation |
 | `plans/<workerId>.json` | Plan with owning worker ID and Pi UUID |
-| `operations/*.json` | Launch and outbound submission receipts, including uncertain failures |
+| `operations/*.json` | Launch and outbound submission receipts, plus generation-keyed retirement evidence, including incomplete outcomes |
 | `audit/<workerId>.ndjson` | Events across generations |
 | `artifacts/<workerId>-<submissionId>.md` | Full settled assistant text |
 | `locks/<workerId>/generation` | Exclusive runtime claim |
 | `locks/<workerId>.detached.json` | Generation whose clean shutdown persisted unavailability and finished socket/lock cleanup |
 | `locks/restart-<oldGeneration>` | Temporary child-startup admission claim |
 | `locks/launch-<workerId>/claim.json` | Cross-process pre-launch fence with launch token, previous generation, model, thinking, session path, and caller process identity |
+| `locks/retire-<workerId>` | Retirement fence. `claim.json` binds worker ID, generation, and Pi conversation. `inflight/owner.json` records the caller PID, birth, and lease token. The fence remains on incomplete outcomes. |
 
 Sockets live separately at `<runtimeRoot>/piha-<uid>/<state-directory-hash>/<generation>.sock`. `runtimeRoot` is `XDG_RUNTIME_DIR`, or `/tmp` when unset. Socket paths must fit 103 bytes. Children inherit the exact socket directory. Directories must belong to the current UID, have no group/other permission bits, and not be symlinks. Runtime state paths can be long without lengthening sockets.
 
@@ -53,6 +54,7 @@ Each example omits the common caller and target generation fields.
 {"kind":"wait","submissionId":"EXACT-ID","timeoutMs":120000}
 {"kind":"interrupt","submissionId":"EXACT-ID","timeoutMs":120000}
 {"kind":"reset_pending","submissionId":"EXACT-ID"}
+{"kind":"retire"}
 ```
 
 `submit` persists a reservation before sending. Duplicate IDs are refused across generations. A busy worker refuses concurrent submissions. A transport error after dispatch can leave acceptance unknown. Outbound tool submissions retain their chosen ID in `operations/`; no automatic replay occurs.
@@ -71,6 +73,7 @@ Responses are `{"ok":true,"result":RESULT}` or `{"ok":false,"error":"reason"}`.
 | `accepted` | Correlated native `agent_start` observed; `evidence` is `agent_start` |
 | `ambiguous` | Durable unresolved submission, not completion; it may still start |
 | `reset_requested` | Native shutdown requested, not proof of process death |
+| `retire_requested` | Target stopped admitting work and requested native shutdown; not a retired outcome |
 | `timeout` | Exact-task wait expired, leaving task active |
 | `settled` | Native settlement with idle and outcome evidence |
 | `unavailable` | Explicit rejection, process loss, shutdown, or insufficient outcome evidence |
@@ -99,6 +102,14 @@ Public task records replace the brief with an empty string. Settled responses ca
 ## Shutdown and recovery
 
 Pending reset marks the exact task unavailable, blocks new work, requests abort, and then requests native shutdown after allowing the receipt to flush. The adapter does not fabricate `interrupted`. A failed shutdown leaves a live process that `followup_task` refuses to replace.
+
+### Explicit retirement
+
+The model tool `retire_agent({agent_id})` accepts one descendant, never itself or an ancestor. It refuses active reservations, native non-idle or queued input, outstanding child launches, and live or unresolved descendants. It does not abort work. A `status` response includes `queued` and `launching` observations; the target rechecks these conditions in the `retire` request handler and stops admission before requesting `ctx.shutdown()`. The caller does not need model or provider authentication to retire.
+
+The caller holds `locks/retire-<workerId>` while it waits at most 120 seconds for original PID/birth and socket death. The launch claim checks retirement fences on the target and ancestors, both before and after claim creation. The caller scans descendant identities, unresolved tasks, panes, and launch claims before shutdown and again after death. Pending retirement prevents a cold follow-up from opening the old session. `operations/retire-<workerId>-<generation>.json` records retiring, incomplete, or finished evidence. A caller abort, failed shutdown, uncertain death, moved pane, replacement occupant, or failed close returns `state: "incomplete"` with `evidencePath`; acknowledgment alone never reports success. A repeat against an incomplete generation retries only verification and cleanup, not a task. A repeat after a finished generation first removes any stranded matching fence under an exclusive lease; it refuses a live conflicting lease. Only a result with true shutdown, death, and pane evidence can be stored as `finished`. Caller session shutdown waits for outbound retirement to finish or record an incomplete result before it detaches.
+
+After process and socket death, the caller lists panes across the captured Herdr server, not only the saved workspace. It checks both the saved pane ID and terminal ID, then checks the workspace, tab, single-pane count, and process group before closing the exact pane. Cleanup requires affirmative evidence that the foreground group and sole foreground process are the saved pane's shell. A missing, empty, or conflicting foreground observation refuses closure. The caller checks the pane and occupant again before closure, then verifies server-wide pane absence. A proven absent pane also completes retirement. A moved pane or uncertain identity remains incomplete. Cancellation after death and before close leaves the pane untouched. If cancellation or a failed response occurs during close, the caller checks for actual absence, saves that observation in the incomplete record, and permits a later verification-only retry. Native conversation files, settled tasks, selections, plans, and artifacts stay intact. Completed retirement releases the fence so the original worker ID and Pi UUID can cold-resume in a new generation through `followup_task`. No automatic retirement occurs.
 
 Cold continuation proves all of the following:
 
@@ -147,6 +158,6 @@ Children also receive the captured Herdr socket/name and an absolute `PI_CODING_
 
 Child creation uses `tab create --workspace <id> --cwd <cwd> --no-focus`. Native arguments include `--no-extensions -e <installed-index-path> --session <path> --model <provider>/<id> --thinking <level>`. The extension path derives from `import.meta.url`, not the working directory. Children load only this extension, with normal built-in and delegation tools. Spawn requires `role`, `thinking`, and `task` and accepts optional `model: {provider, id}`. Omitted model inherits the immediate caller's native selection. Missing or invalid thinking fails schema validation. The supplied level must occur in Pi's `getSupportedThinkingLevels` for the exact registry model and is passed unchanged. The runtime has no role-to-level mapping or omitted-thinking fallback. Registry and configured-auth snapshot checks run before allocation. These checks do not prove remote credentials valid or copy process-only credentials/provider extensions into the child. The native child must still match the launch claim. The lead retains its selected tools and thinking. Pi's dynamic registration respects lead tool allowlists and exclusions.
 
-`/herdr-agents` reports the current worker/session, durable state path, and enabled adapter tools. `update_plan` uses only its current session identity. `AskQuestion` has no implementation. The brief requires a real human answer or explicit stop-and-report.
+`/herdr-agents` reports the current worker/session, durable state path, and enabled adapter tools, including `retire_agent` when selected. `update_plan` uses only its current session identity. `AskQuestion` has no implementation. The brief requires a real human answer or explicit stop-and-report.
 
 Reports use source `ds-slice` and Pi session metadata. Herdr's managed native integration remains separate. Reports support presentation and readiness only, never task settlement. Whole-server restart recovery and automatic reconciliation of uncertain launch claims are outside this contract.

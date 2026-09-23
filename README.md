@@ -1,6 +1,6 @@
 # Pi Herdr agents
 
-A Pi extension that hosts delegated Pi workers in Herdr tabs. It provides `spawn_agent`, `list_agents`, `wait_agent`, `followup_task`, `interrupt_agent`, and `update_plan`.
+A Pi extension that hosts delegated Pi workers in Herdr tabs. It provides `spawn_agent`, `list_agents`, `wait_agent`, `followup_task`, `interrupt_agent`, `retire_agent`, and `update_plan`.
 
 ## Current status
 
@@ -56,6 +56,8 @@ Pre-change worker records remain readable with `thinking: null` until observed b
 
 Child launches explicitly inherit the caller's effective Pi config directory, including the default when no override is set, and selected non-secret Pi startup settings. They load only this extension. Skills, context files, settings, and file-based authentication use normal Pi discovery. Other extensions and credentials supplied only to the lead process are not copied into children.
 
+`retire_agent({agent_id})` explicitly retires one idle descendant. Retire leaf workers before parents. It refuses active or queued work, unresolved launches, and live or unresolved descendants. Native shutdown acknowledgment is not success: the operation proves the original process and socket dead, checks the exact workspace, terminal, tab, and occupant, then closes only the owned pane or verifies its absence. Incomplete outcomes retain a durable fence and evidence path for safe cleanup retries. Retirement does not delete the native conversation, task results, model, thinking, plans, or artifacts. `followup_task` cold-resumes a completed retirement as the same worker and Pi conversation with a new generation and only a new submission. There is no automatic retirement.
+
 A task receipt requires a correlated native start event. Bounded waits do not cancel work. Interruption and cold continuation retain exact task, worker, process, model, and conversation identities. Ambiguous submissions are never automatically replayed. There are no adapter turn ceilings.
 
 ## Session lifecycle and recovery
@@ -75,7 +77,7 @@ npm ci --ignore-scripts --no-audit --no-fund
 npm test
 ```
 
-Transport checks use real Unix sockets. Adapter and startup checks use real files, sockets, and Linux process identities but stub TUI events and Herdr commands. Startup checks also exercise real Pi package discovery and headless SDK binding. The launch-race check uses two real processes with a stubbed native session-open boundary. Selection checks use Pi's installed catalog, capability helpers, and SDK model/thinking events and empty-history reload, with Herdr controls and provider turns stubbed. These checks launch neither Herdr nor models. Native lifecycle verification requires a disposable Herdr server and ordinary package autoload.
+Transport checks use real Unix sockets. Adapter and startup checks use real files, sockets, and Linux process identities but stub TUI events and Herdr commands. Startup checks also exercise real Pi package discovery and headless SDK binding. The launch-race check uses two real processes with a stubbed native session-open boundary. Selection checks use Pi's installed catalog, capability helpers, and SDK model/thinking events and empty-history reload, with Herdr controls and provider turns stubbed. The retirement check uses separate real processes and Unix sockets with stubbed Pi and Herdr controls. It covers original-conversation cold continuation and retained historical results without a provider turn. These checks launch neither Herdr nor models. Native lifecycle verification requires a disposable Herdr server and ordinary package autoload.
 
 ## Limits and evidence
 

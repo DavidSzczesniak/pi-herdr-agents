@@ -1,15 +1,28 @@
 import { getAgentDir, type ExtensionAPI, type ExtensionContext, type SessionStartEvent } from "@earendil-works/pi-coding-agent";
 import { StringEnum, type AssistantMessage } from "@earendil-works/pi-ai";
-import { Type } from "typebox";
+import { Type, type Static } from "typebox";
 import { createServer, type Server, type Socket } from "node:net";
 import { randomUUID } from "node:crypto";
 import { appendFileSync, chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { extensionPath, herdrCommand, privateDirectory, startupConfig, type StartupConfig } from "./startup.ts";
 import { atomicWrite, errorText, ModelSchema, ThinkingSchema, parse, readIdentityRecord, readRecord, RequestSchema, request, SafeId, socketAlive, TaskSchema, type Identity, type Request, type Result, type Selection, type Task } from "./protocol.ts";
-import { claimLaunch, LaunchClaimSchema, isOriginalProcessLive, PaneResponse, PlanRecordSchema, PlanSchema, planLines, processIdentity, recordedThinking, roleBrief, selectWorker, tabPane, verifySession, type Pane } from "./runtime.ts";
+import { assertNoRetirement, claimLaunch, LaunchClaimSchema, isOriginalProcessLive, PaneResponse, PlanRecordSchema, PlanSchema, planLines, processIdentity, recordedThinking, retirementFence, roleBrief, selectWorker, tabPane, verifySession, type Pane } from "./runtime.ts";
 
-const toolNames = ["spawn_agent", "list_agents", "wait_agent", "followup_task", "interrupt_agent", "update_plan"];
+const toolNames = ["spawn_agent", "list_agents", "wait_agent", "followup_task", "interrupt_agent", "retire_agent", "update_plan"];
+const retirementResultFields = { kind: Type.Literal("retirement"), workerId: SafeId, generation: SafeId,
+  reason: Type.String(), evidencePath: Type.String() };
+const RetiredResultSchema = Type.Object({ ...retirementResultFields, state: Type.Literal("retired"),
+  shutdownRequested: Type.Literal(true), deathVerified: Type.Literal(true), paneClosed: Type.Literal(true) });
+const IncompleteResultSchema = Type.Object({ ...retirementResultFields, state: Type.Literal("incomplete"),
+  shutdownRequested: Type.Boolean(), deathVerified: Type.Boolean(), paneClosed: Type.Boolean() });
+const RetirementSchema = Type.Union([
+  Type.Object({ kind: Type.Literal("retiring"), identity: Type.Object({ workerId: SafeId, generation: SafeId,
+    paneId: Type.String(), terminalId: Type.String(), workspaceId: Type.String(), piSessionId: Type.String(), piSessionPath: Type.String(),
+    pid: Type.Integer(), pidBirth: Type.String(), socketPath: Type.String() }), tabId: Type.String(), shutdownRequested: Type.Boolean() }),
+  Type.Object({ kind: Type.Literal("finished"), result: RetiredResultSchema }),
+  Type.Object({ kind: Type.Literal("incomplete"), result: IncompleteResultSchema, tabId: Type.String() }),
+]);
 const normalTools = ["read", "grep", "find", "ls", "bash", "edit", "write", ...toolNames];
 const idSchema = Type.String({ pattern: "^[a-zA-Z0-9_-]{1,64}$" });
 const targetFields = { agent_id: idSchema, submission_id: idSchema };
@@ -55,10 +68,12 @@ function createRuntime(pi: ExtensionAPI, config: StartupConfig) {
   let startNonce: string | undefined;
   let accepted: (() => void) | undefined;
   let shuttingDown = false;
+  let retiring = false;
   let shutdownCleaned = false;
   let sequence = Date.now();
   let reportQueue = Promise.resolve();
   const launches = new Set<Promise<unknown>>();
+  const retirements = new Set<Promise<unknown>>();
   const detachedPath = join(stateDir, "locks", `${workerId}.detached.json`);
   const connections = new Set<Socket>();
   const waiters = new Map<string, Set<(result: Task) => void>>();
@@ -176,10 +191,20 @@ function createRuntime(pi: ExtensionAPI, config: StartupConfig) {
     if (!caller.available || caller.generation !== message.callerGeneration || caller.herdrSession !== herdrSession) throw new Error("Stale caller generation");
     if (message.callerId !== workerId && !isDescendant(workerId, message.callerId)) throw new Error("Caller does not own target");
     audit("socket_request", { kind: message.kind, callerId: message.callerId, submissionId: "submissionId" in message ? message.submissionId : null });
-    if (message.kind === "status") return { kind: "status", identity: own, active: active ? publicTask(active) : null, idle: context?.isIdle() ?? false };
+    if (message.kind === "status") return { kind: "status", identity: own, active: active ? publicTask(active) : null, idle: context?.isIdle() ?? false, queued: context?.hasPendingMessages() ?? true, launching: launches.size > 0 };
+    if (message.kind === "retire") {
+      if (retiring) return { kind: "retire_requested", workerId, generation };
+      if (active || !context?.isIdle() || context.hasPendingMessages() || launches.size)
+        throw new Error("Retirement refused: active, queued, or launching worker");
+      retiring = true;
+      audit("retire_requested", { callerId: message.callerId });
+      // The response must leave the socket before Pi can close it.
+      setTimeout(() => context?.shutdown(), 50);
+      return { kind: "retire_requested", workerId, generation };
+    }
     if (message.kind === "submit") {
       if (existsSync(taskPath(message.submissionId))) throw new Error("Duplicate submission ID; not executed");
-      if (active || !context?.isIdle() || context.hasPendingMessages()) throw new Error("Worker busy; concurrent submit rejected");
+      if (retiring || active || !context?.isIdle() || context.hasPendingMessages()) throw new Error("Worker busy or retiring; concurrent submit rejected");
       const reservation: Extract<Task, { kind: "active" }> = { kind: "active", phase: "pending", nonce: randomUUID(), workerId, generation,
         piSessionId: own.piSessionId, submissionId: message.submissionId, task: message.task, startedAt: new Date().toISOString(), selection: null };
       active = reservation;
@@ -277,6 +302,7 @@ function createRuntime(pi: ExtensionAPI, config: StartupConfig) {
       writeFileSync(bindingPath, JSON.stringify({ herdrSocket: config.herdrSocket, herdrSession }), { flag: "wx", mode: 0o600 });
     }
     for (const name of ["workers", "tasks", "sessions", "audit", "locks", "artifacts", "plans", "operations"]) privateDirectory(join(stateDir, name));
+    if (parentId) assertNoRetirement(stateDir, workerId);
     privateDirectory(join(stateDir, "tasks", workerId));
     const { pane } = parse(PaneResponse, await herdr(["pane", "get", paneId])).result;
     if (pane.pane_id !== paneId || (workspaceId && pane.workspace_id !== workspaceId)) throw new Error("Explicit private workspace/pane mismatch");
@@ -370,6 +396,7 @@ function createRuntime(pi: ExtensionAPI, config: StartupConfig) {
   pi.on("session_before_tree", guardWorkerConversation);
   pi.on("input", (event) => {
     if (!identity || shuttingDown) return;
+    if (retiring) return { action: "handled" };
     if (!active) return;
     if (event.source !== "extension" || event.text !== `[ds-task ${active.nonce}]\n${active.task}`) return { action: "handled" };
     active = { ...active, phase: "input_observed" };
@@ -439,7 +466,7 @@ function createRuntime(pi: ExtensionAPI, config: StartupConfig) {
     shuttingDown = true;
     if (!identity || shutdownCleaned) return;
     shutdownCleaned = true;
-    await Promise.allSettled(launches);
+    await Promise.allSettled([...launches, ...retirements]);
     let detached = false;
     try {
       if (active) publish({ ...active, kind: "unavailable", reason: "Session shutdown before settlement" });
@@ -492,7 +519,7 @@ function createRuntime(pi: ExtensionAPI, config: StartupConfig) {
     atomicWrite(receiptPath, { ...receipt, kind: "submitting" });
     try {
       const result = await call(target, { kind: "submit", submissionId, task }, signal);
-      if (result.kind === "status" || result.workerId !== target.workerId || result.generation !== target.generation || result.submissionId !== submissionId)
+      if (result.kind === "status" || result.kind === "retire_requested" || result.workerId !== target.workerId || result.generation !== target.generation || result.submissionId !== submissionId)
         throw new Error("Submission receipt correlation mismatch");
       const selection = result.kind !== "ambiguous" && "selection" in result ? result.selection ?? null : null;
       const reported = { ...result, selection, identity: { ...target, model: selection?.model ?? null, thinking: selection?.thinking ?? null } };
@@ -515,6 +542,8 @@ function createRuntime(pi: ExtensionAPI, config: StartupConfig) {
   async function launchNative(spec: { childId: string; parent: string | null; childRole: Identity["role"]; childCwd: string;
     sessionPath: string; task: string } & ({ kind: "fresh"; selection: Selection } | { kind: "resume"; previous: Identity }), ctx: ExtensionContext, signal?: AbortSignal) {
     current();
+    if (retiring) throw new Error("Caller retiring; launch refused");
+    assertNoRetirement(stateDir, spec.parent ?? spec.childId);
     signal?.throwIfAborted();
     const previous = spec.kind === "resume" ? spec.previous : null;
     const selection = spec.kind === "fresh" ? spec.selection : selectWorker(ctx, {
@@ -545,6 +574,7 @@ function createRuntime(pi: ExtensionAPI, config: StartupConfig) {
         DS_HERDR_WORKER_ID: spec.childId, DS_HERDR_PARENT_ID: spec.parent ?? "", DS_HERDR_ROLE: spec.childRole,
         DS_HERDR_WORKSPACE: spec.childCwd, DS_HERDR_RESTART_GENERATION: previous?.generation ?? "", DS_HERDR_LAUNCH_ID: launchId };
       // Finish bounded creation even on caller abort so its exact receipt remains available for cleanup.
+      assertNoRetirement(stateDir, spec.parent ?? spec.childId);
       cleanupProven = false;
       const created = await herdr(["tab", "create", "--workspace", workspaceId, "--cwd", spec.childCwd, "--label", `${spec.childRole}-${launchId.slice(0, 8)}`,
         ...Object.entries(env).flatMap(([key, value]) => ["--env", `${key}=${value}`]), "--no-focus"]);
@@ -552,6 +582,7 @@ function createRuntime(pi: ExtensionAPI, config: StartupConfig) {
       pane = tabPane(created, workspaceId);
       save({ kind: "starting" });
       current();
+      assertNoRetirement(stateDir, spec.parent ?? spec.childId);
       signal?.throwIfAborted();
       nativeStartAttempted = true;
       await herdr(["agent", "start", `${spec.childId}-${launchId.slice(0, 8)}`, "--kind", "pi", "--pane", pane.pane_id, "--timeout", "25000", "--",
@@ -596,6 +627,269 @@ function createRuntime(pi: ExtensionAPI, config: StartupConfig) {
     } finally {
       if (identityConfirmed || cleanupProven) claim.release();
     }
+  }
+  const paneListSchema = Type.Object({ result: Type.Object({ panes: Type.Array(Type.Object({
+    pane_id: Type.String(), workspace_id: Type.String(), terminal_id: Type.String(), tab_id: Type.String(),
+  })) }) });
+  const paneProcessSchema = Type.Object({ result: Type.Object({ process_info: Type.Object({
+    pane_id: Type.String(), shell_pid: Type.Optional(Type.Union([Type.Integer(), Type.Null()])),
+    foreground_process_group_id: Type.Optional(Type.Union([Type.Integer(), Type.Null()])),
+    foreground_processes: Type.Optional(Type.Array(Type.Object({ pid: Type.Integer(), name: Type.String() }))),
+  }) }) });
+  function foregroundShell(info: { pane_id: string; shell_pid?: number | null; foreground_process_group_id?: number | null;
+    foreground_processes?: { pid: number }[] }, paneId: string): boolean {
+    return info.pane_id === paneId && info.shell_pid !== null && info.shell_pid !== undefined && info.shell_pid > 0 &&
+      info.foreground_process_group_id === info.shell_pid && info.foreground_processes?.length === 1 &&
+      info.foreground_processes[0]?.pid === info.shell_pid;
+  }
+  const tabInfoSchema = Type.Object({ result: Type.Object({ tab: Type.Object({
+    tab_id: Type.String(), workspace_id: Type.String(), pane_count: Type.Integer(),
+  }) }) });
+  const retirementPath = (target: Identity) => join(stateDir, "operations", `retire-${target.workerId}-${target.generation}.json`);
+  const fenceIdentitySchema = Type.Object({ workerId: SafeId, generation: SafeId, piSessionId: Type.String(), piSessionPath: Type.String() });
+  const leaseSchema = Type.Object({ ...fenceIdentitySchema.properties, pid: Type.Integer(), pidBirth: Type.String(), token: SafeId });
+  function verifyRetirementFence(target: Identity, fence: string) {
+    const claim = join(fence, "claim.json");
+    if (!existsSync(claim)) return; // Legacy fence: the matching finished record is authoritative.
+    const saved = readRecord(fenceIdentitySchema, claim);
+    if (saved.workerId !== target.workerId || saved.generation !== target.generation ||
+      saved.piSessionId !== target.piSessionId || saved.piSessionPath !== target.piSessionPath)
+      throw new Error("Retirement fence belongs to a different conversation or generation");
+  }
+  function takeRetirementLease(target: Identity, fence: string) {
+    const inFlight = join(fence, "inflight");
+    try { mkdirSync(inFlight); }
+    catch (error) {
+      if (!(error instanceof Error && "code" in error && error.code === "EEXIST")) throw error;
+      const reclaim = join(fence, "reclaim");
+      mkdirSync(reclaim); // Only one caller may examine or replace a dead lease.
+      try {
+        const old = readRecord(leaseSchema, join(inFlight, "owner.json"));
+        if (old.workerId !== target.workerId || old.generation !== target.generation ||
+          old.piSessionId !== target.piSessionId || old.piSessionPath !== target.piSessionPath ||
+          isOriginalProcessLive(old)) throw new Error("Retirement cleanup already active or lease identity uncertain");
+        rmSync(inFlight, { recursive: true });
+        mkdirSync(inFlight);
+      } finally { rmSync(reclaim, { recursive: true }); }
+    }
+    const own = current();
+    const lease = { workerId: target.workerId, generation: target.generation, piSessionId: target.piSessionId,
+      piSessionPath: target.piSessionPath, pid: own.pid, pidBirth: own.pidBirth, token: randomUUID() };
+    atomicWrite(join(inFlight, "owner.json"), lease);
+    return () => {
+      if (!existsSync(inFlight)) return;
+      const saved = readRecord(leaseSchema, join(inFlight, "owner.json"));
+      if (saved.token !== lease.token || saved.generation !== lease.generation) throw new Error("Retirement lease changed; release refused");
+      rmSync(inFlight, { recursive: true });
+    };
+  }
+  function finishRetirement(target: Identity, path: string, fence: string) {
+    const saved = readRecord(RetirementSchema, path);
+    if (saved.kind !== "finished" || saved.result.workerId !== target.workerId ||
+      saved.result.generation !== target.generation || saved.result.evidencePath !== path)
+      throw new Error("Finished retirement evidence does not match current generation");
+    if (!existsSync(fence)) return saved.result;
+    verifyRetirementFence(target, fence);
+    const release = takeRetirementLease(target, fence);
+    try {
+      if (readIdentity(target.workerId).generation !== target.generation || !isDescendant(target.workerId, workerId) ||
+        readRecord(RetirementSchema, path).kind !== "finished") throw new Error("Retirement changed during finalization");
+      rmSync(fence, { recursive: true });
+    } finally { release(); }
+    return saved.result;
+  }
+  async function paneForRetirement(target: Identity, signal?: AbortSignal): Promise<Pane | undefined> {
+    // The saved workspace alone cannot establish absence: Herdr can move a pane across workspaces.
+    const panes = parse(paneListSchema, await herdr(["pane", "list"], signal)).result.panes;
+    signal?.throwIfAborted();
+    const matches = panes.filter(p => p.pane_id === target.paneId || p.terminal_id === target.terminalId);
+    if (matches.length > 1) throw new Error("Ambiguous pane or terminal identity; cleanup refused");
+    const found = matches[0];
+    if (!found) return undefined;
+    if (found.pane_id !== target.paneId || found.workspace_id !== target.workspaceId ||
+      found.terminal_id !== target.terminalId) throw new Error("Pane moved or terminal replaced; cleanup refused");
+    return found;
+  }
+  async function checkDescendants(target: Identity): Promise<void> {
+    const workers = readdirSync(join(stateDir, "workers")).filter(name => name.endsWith(".json"));
+    for (const file of workers) {
+      const child = readIdentity(file.slice(0, -5));
+      if (child.workerId === target.workerId || !isDescendant(child.workerId, target.workerId)) continue;
+      if (isOriginalProcessLive(child) || await socketAlive(child.socketPath))
+        throw new Error(`Descendant ${child.workerId} live or unresolved; retire leaves first`);
+      if (existsSync(join(stateDir, "locks", `launch-${child.workerId}`)) || existsSync(retirementFence(stateDir, child.workerId)) ||
+        await paneForRetirement(child))
+        throw new Error(`Descendant ${child.workerId} has an unresolved process, pane, or operation`);
+      for (const name of readdirSync(join(stateDir, "tasks", child.workerId))) {
+        if (!name.endsWith(".json")) continue;
+        if (readRecord(TaskSchema, join(stateDir, "tasks", child.workerId, name)).kind === "active")
+          throw new Error(`Descendant ${child.workerId} has an unresolved submission`);
+      }
+    }
+    // A child tab can be in creation before its workers/ record exists.
+    for (const file of readdirSync(join(stateDir, "locks"))) {
+      if (!file.startsWith("launch-")) continue;
+      const path = join(stateDir, "locks", file, "claim.json");
+      if (!existsSync(path)) throw new Error("Unresolved launch claim without identity; retirement refused");
+      const claim = readRecord(LaunchClaimSchema, path);
+      if (claim.workerId === target.workerId || (existsSync(identityPath(claim.workerId)) && isDescendant(claim.workerId, target.workerId)))
+        throw new Error("In-flight descendant launch; retirement refused");
+      if (claim.callerId === target.workerId || isDescendant(claim.callerId, target.workerId))
+        throw new Error("In-flight descendant launch; retirement refused");
+    }
+  }
+  async function retireAgent(target: Identity, signal?: AbortSignal) {
+    const path = retirementPath(target);
+    const fence = retirementFence(stateDir, target.workerId);
+    if (existsSync(path)) {
+      const completed = readRecord(RetirementSchema, path);
+      if (completed.kind === "finished") return finishRetirement(target, path, fence);
+      if (!existsSync(fence)) throw new Error("Retirement evidence without fence; operator inspection required");
+    }
+    const retry = existsSync(fence);
+    if (retry && !existsSync(path)) throw new Error("Retirement fence without exact generation evidence; operator inspection required");
+    const existing = retry ? readRecord(RetirementSchema, path) : undefined;
+    if (existing?.kind === "finished") return finishRetirement(target, path, fence);
+    if (retry && existing?.kind === "incomplete" && existing.result.generation !== target.generation)
+      throw new Error("Retirement generation mismatch");
+    if (retry && existing?.kind === "retiring" && (existing.identity.generation !== target.generation ||
+      existing.identity.pid !== target.pid || existing.identity.pidBirth !== target.pidBirth ||
+      existing.identity.piSessionPath !== target.piSessionPath || existing.identity.socketPath !== target.socketPath))
+      throw new Error("Retirement recorded identity mismatch");
+    if (!retry) {
+      signal?.throwIfAborted();
+      const status = await request(target.socketPath, { kind: "status", callerId: workerId,
+        callerGeneration: current().generation, generation: target.generation }, signal);
+      if (status.kind !== "status" || status.active || !status.idle || status.queued !== false || status.launching !== false)
+        throw new Error("Retirement refused: active or uncertain worker");
+      current(); // Shutdown during preflight must not leave an empty retirement fence.
+      if (readIdentity(target.workerId).generation !== target.generation) throw new Error("Retirement generation changed");
+      mkdirSync(fence);
+      atomicWrite(join(fence, "claim.json"), { workerId: target.workerId, generation: target.generation,
+        piSessionId: target.piSessionId, piSessionPath: target.piSessionPath });
+    }
+    verifyRetirementFence(target, fence);
+    // A second caller may retry an incomplete operation, but never concurrently.
+    const release = takeRetirementLease(target, fence);
+    let tabId = existing?.kind === "incomplete" || existing?.kind === "retiring" ? existing.tabId : "";
+    let shutdownRequested = existing?.kind === "incomplete" ? existing.result.shutdownRequested :
+      existing?.kind === "retiring" ? existing.shutdownRequested : false;
+    let deathVerified = false;
+    let paneClosed = false;
+    let reserved = retry;
+    try {
+      if (readIdentity(target.workerId).generation !== target.generation || !isDescendant(target.workerId, workerId))
+        throw new Error("Retirement identity or ownership changed");
+      if (!retry) {
+        await checkDescendants(target);
+        signal?.throwIfAborted();
+        if (existsSync(join(stateDir, "locks", `launch-${target.workerId}`))) throw new Error("In-flight target launch");
+        const pane = await paneForRetirement(target, signal);
+        if (!pane) throw new Error("Owned pane absent before shutdown; retirement refused");
+        tabId = pane.tab_id;
+        await live(target, signal);
+        const state = await request(target.socketPath, { kind: "status", callerId: workerId,
+          callerGeneration: current().generation, generation: target.generation }, signal);
+        if (state.kind !== "status" || state.active || !state.idle || state.queued !== false || state.launching !== false) throw new Error("Retirement refused: active or uncertain worker");
+        if ((await paneForRetirement(target, signal))?.tab_id !== tabId) throw new Error("Owned pane changed before shutdown");
+        // The target checks its own native idle and admission state without model/auth preflight.
+        signal?.throwIfAborted();
+        if (readIdentity(target.workerId).generation !== target.generation) throw new Error("Generation changed before request");
+        atomicWrite(path, { kind: "retiring", identity: target, tabId, shutdownRequested: false });
+        reserved = true;
+        const response = await request(target.socketPath, { kind: "retire", callerId: workerId,
+          callerGeneration: current().generation, generation: target.generation }, signal);
+        if (response.kind !== "retire_requested" || response.workerId !== target.workerId || response.generation !== target.generation)
+          throw new Error("Native retirement acknowledgment mismatch");
+        shutdownRequested = true;
+        atomicWrite(path, { kind: "retiring", identity: target, tabId, shutdownRequested });
+      } else if (!shutdownRequested) {
+        if (isOriginalProcessLive(target)) {
+          // An aborted caller can lose the acknowledgment. Repeating retire is idempotent on the target.
+          const response = await request(target.socketPath, { kind: "retire", callerId: workerId,
+            callerGeneration: current().generation, generation: target.generation }, signal);
+          if (response.kind !== "retire_requested" || response.workerId !== target.workerId || response.generation !== target.generation)
+            throw new Error("Native retirement acknowledgment mismatch");
+          shutdownRequested = true;
+        } else {
+          const events = readFileSync(join(stateDir, "audit", `${target.workerId}.ndjson`), "utf8").trim().split("\n");
+          shutdownRequested = events.some(line => {
+            const event = parse(Type.Object({ generation: SafeId, event: Type.String() }), JSON.parse(line));
+            return event.generation === target.generation && event.event === "retire_requested";
+          });
+          if (!shutdownRequested) throw new Error("Native shutdown request unproven; external process loss is not retirement");
+        }
+      }
+      const deadline = Date.now() + 120000;
+      while (isOriginalProcessLive(target) && Date.now() < deadline) {
+        signal?.throwIfAborted();
+        await new Promise(resolve => setTimeout(resolve, 250));
+      }
+      signal?.throwIfAborted();
+      await proveDead(target);
+      deathVerified = true;
+      await checkDescendants(target);
+      signal?.throwIfAborted();
+      if (readIdentity(target.workerId).generation !== target.generation) throw new Error("Generation changed during retirement");
+      const pane = await paneForRetirement(target, signal);
+      if (pane) {
+        if (pane.tab_id !== tabId) throw new Error("Pane moved to a different tab; cleanup refused");
+        const tab = parse(tabInfoSchema, await herdr(["tab", "get", tabId], signal)).result.tab;
+        signal?.throwIfAborted();
+        if (tab.tab_id !== tabId || tab.workspace_id !== target.workspaceId || tab.pane_count !== 1)
+          throw new Error("Tab identity or pane count changed; cleanup refused");
+        const info = parse(paneProcessSchema, await herdr(["pane", "process-info", "--pane", pane.pane_id], signal)).result.process_info;
+        signal?.throwIfAborted();
+        if (!foregroundShell(info, pane.pane_id)) throw new Error("Foreground shell unconfirmed; pane cleanup refused");
+        // Recheck after process-info, immediately before destructive control.
+        const exact = await paneForRetirement(target, signal);
+        const finalInfo = parse(paneProcessSchema, await herdr(["pane", "process-info", "--pane", pane.pane_id], signal)).result.process_info;
+        signal?.throwIfAborted();
+        if (!exact || exact.tab_id !== tabId || !foregroundShell(finalInfo, pane.pane_id) ||
+          finalInfo.shell_pid !== info.shell_pid || isOriginalProcessLive(target) || await socketAlive(target.socketPath))
+          throw new Error("Pane or process identity changed before close");
+        signal?.throwIfAborted();
+        if (readIdentity(target.workerId).generation !== target.generation) throw new Error("Generation changed before pane close");
+        let closeError: unknown;
+        try { await herdr(["pane", "close", pane.pane_id]); }
+        catch (error) { closeError = error; }
+        // Even a failed or cancelled command can close the pane. Observe its outcome before returning incomplete.
+        paneClosed = !(await paneForRetirement(target));
+        signal?.throwIfAborted();
+        if (closeError) throw closeError;
+        if (!paneClosed) throw new Error("Pane closure not confirmed");
+      } else {
+        paneClosed = true;
+      }
+      signal?.throwIfAborted();
+      if (readIdentity(target.workerId).generation !== target.generation) throw new Error("Generation changed before completion");
+      if (!shutdownRequested || !deathVerified) throw new Error("Retirement proof incomplete");
+      const result = { kind: "retirement", workerId: target.workerId, generation: target.generation,
+        state: "retired", shutdownRequested: true, deathVerified: true, paneClosed: true,
+        reason: "Native process and socket dead; exact pane closed or absent",
+        evidencePath: path } satisfies Static<typeof RetiredResultSchema>;
+      atomicWrite(path, { kind: "finished", result });
+      rmSync(fence, { recursive: true });
+      return result;
+    } catch (error) {
+      if (existsSync(path) && readRecord(RetirementSchema, path).kind === "finished")
+        throw new Error(`Retirement proof saved but fence cleanup failed: ${errorText(error)}; retry ${path}`);
+      if (!reserved) {
+        rmSync(fence, { recursive: true });
+        throw error;
+      }
+      const result = { kind: "retirement" as const, workerId: target.workerId, generation: target.generation,
+        state: "incomplete" as const, shutdownRequested, deathVerified, paneClosed,
+        reason: `${errorText(error)}; inspect ${path}; retry retire_agent for exact-generation cleanup`, evidencePath: path };
+      atomicWrite(path, { kind: "incomplete", result, tabId });
+      return result;
+    } finally { release(); }
+  }
+  function trackedRetirement(target: Identity, signal?: AbortSignal) {
+    const pending = retireAgent(target, signal);
+    retirements.add(pending);
+    void pending.finally(() => retirements.delete(pending)).catch(() => {});
+    return pending;
   }
   function toolResult(value: unknown) {
     const text = JSON.stringify(value);
@@ -661,6 +955,7 @@ function createRuntime(pi: ExtensionAPI, config: StartupConfig) {
     parameters: Type.Object({ agent_id: idSchema, task: Type.String({ minLength: 1, maxLength: 200000 }) }),
     async execute(_id, params, signal, _update, ctx) {
       const target = owned(params.agent_id);
+      if (existsSync(retirementFence(stateDir, target.workerId))) throw new Error("Retirement unresolved; follow-up refused");
       if (isOriginalProcessLive(target)) {
         const effective = await live(target, signal);
         return toolResult(await submitTask(effective, params.task, signal));
@@ -669,6 +964,11 @@ function createRuntime(pi: ExtensionAPI, config: StartupConfig) {
       return toolResult(await launch({ kind: "resume", childId: target.workerId, parent: target.parentId, childRole: target.role, childCwd: target.cwd,
         sessionPath: target.piSessionPath, task: params.task, previous: target }, ctx, signal));
     },
+  });
+  pi.registerTool({
+    name: "retire_agent", label: "Retire agent", description: "Retire one idle descendant after native shutdown and original process/socket death proof, then close only its exact owned pane. Refuses active work, unresolved launches, and live or uncertain descendants. An incomplete outcome retains a durable fence; retry the same agent_id for safe cleanup. Completed results and native conversation survive for cold follow-up.",
+    parameters: Type.Object({ agent_id: idSchema }),
+    async execute(_id, params, signal) { return toolResult(await trackedRetirement(owned(params.agent_id), signal)); },
   });
   pi.registerTool({
     name: "interrupt_agent", label: "Interrupt agent", description: "Abort one exact descendant task and wait up to 120 seconds. For ambiguous preflight, request native shutdown and prove original process death instead; result is unavailable, not fabricated interruption. If death remains unconfirmed, followup refuses revival. Never replay the old task.",

@@ -54,13 +54,15 @@ export const RequestSchema = Type.Union([
   Type.Object({ ...requestBase, ...waitFields, kind: Type.Literal("wait") }),
   Type.Object({ ...requestBase, ...waitFields, kind: Type.Literal("interrupt") }),
   Type.Object({ ...requestBase, kind: Type.Literal("reset_pending"), submissionId: SafeId }),
+  Type.Object({ ...requestBase, kind: Type.Literal("retire") }),
 ]);
 export type Request = Static<typeof RequestSchema>;
 export const ResultSchema = Type.Union([
-  Type.Object({ kind: Type.Literal("status"), identity: StoredIdentitySchema, active: Type.Union([TaskSchema, Type.Null()]), idle: Type.Boolean() }),
+  Type.Object({ kind: Type.Literal("status"), identity: StoredIdentitySchema, active: Type.Union([TaskSchema, Type.Null()]), idle: Type.Boolean(), queued: Type.Optional(Type.Boolean()), launching: Type.Optional(Type.Boolean()) }),
   Type.Object({ kind: Type.Literal("accepted"), ...correlation, ...taskSelection, evidence: Type.Literal("agent_start") }),
   Type.Object({ kind: Type.Literal("ambiguous"), ...correlation, ...taskSelection, reason: Type.String() }),
   Type.Object({ kind: Type.Literal("reset_requested"), ...correlation, reason: Type.String() }),
+  Type.Object({ kind: Type.Literal("retire_requested"), workerId: SafeId, generation: SafeId }),
   Type.Object({ kind: Type.Literal("timeout"), ...correlation, active: Type.Literal(true) }),
   TaskSchema,
 ]);
