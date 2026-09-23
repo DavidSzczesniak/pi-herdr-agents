@@ -553,6 +553,11 @@ function createRuntime(pi: ExtensionAPI, config: StartupConfig) {
       model: spec.previous.model, thinking: recordedThinking(spec.previous),
     });
     const { model, thinking } = selection;
+    const piArgs = ["--no-extensions", "-e", extensionPath, "--session", spec.sessionPath, "--model", `${model.provider}/${model.id}`,
+      "--thinking", thinking, "--tools", normalTools.join(",")];
+    // Herdr can type this before the new shell leaves canonical mode, and macOS truncates canonical input at 1024 bytes.
+    const typedBytes = Buffer.byteLength(["pi", ...piArgs].map(arg => `'${arg.replaceAll("'", "'\\''")}'`).join(" "));
+    if (typedBytes >= 1024) throw new Error(`Child launch command too long (${typedBytes} of 1023 bytes); shorten the extension install path or XDG_STATE_HOME`);
     const launchId = randomUUID();
     const receiptPath = join(stateDir, "operations", `launch-${launchId}.json`);
     const base = { launchId, workerId: spec.childId, parentId: spec.parent, callerId: workerId, callerGeneration: generation,
@@ -588,10 +593,7 @@ function createRuntime(pi: ExtensionAPI, config: StartupConfig) {
       assertNoRetirement(stateDir, spec.parent ?? spec.childId);
       signal?.throwIfAborted();
       nativeStartAttempted = true;
-      await herdr(["agent", "start", `${spec.childId}-${launchId.slice(0, 8)}`, "--kind", "pi", "--pane", pane.pane_id, "--timeout", "25000", "--",
-        "--no-extensions", "-e", extensionPath, "--session", spec.sessionPath,
-        "--model", `${model.provider}/${model.id}`,
-        "--thinking", thinking, "--tools", normalTools.join(",")]);
+      await herdr(["agent", "start", `${spec.childId}-${launchId.slice(0, 8)}`, "--kind", "pi", "--pane", pane.pane_id, "--timeout", "25000", "--", ...piArgs]);
       signal?.throwIfAborted();
       const target = await live(owned(spec.childId), signal);
       if (target.paneId !== pane.pane_id || target.terminalId !== pane.terminal_id || target.piSessionPath !== spec.sessionPath ||

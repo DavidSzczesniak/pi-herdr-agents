@@ -162,9 +162,13 @@ try {
   assert.equal(extensionPath, fileURLToPath(new URL("./index.ts", import.meta.url)));
   assert.ok(!started.some(arg => arg.includes("/opt/adapter")));
   assert.equal(started[started.indexOf("--model") + 1], "fixture/no-network");
-  // Herdr may type this into a shell still in canonical mode; macOS truncates canonical input at 1024 bytes.
-  const typed = ["pi", ...started.slice(started.indexOf("--") + 1)].map(arg => `'${arg}'`).join(" ");
-  assert.ok(Buffer.byteLength(typed) < 1024, `launch command fits macOS canonical input: ${Buffer.byteLength(typed)} bytes`);
+  // Herdr may type the launch command into a shell still in canonical mode; macOS truncates canonical input at 1024 bytes.
+  const deep = fixture({ id: "deep-state", env: { XDG_STATE_HOME: join(root, "a".repeat(200), "b".repeat(200), "c".repeat(200)) } });
+  await deep.start();
+  await assert.rejects(deep.tools.get("spawn_agent").execute("child", { role: "implement", thinking: "medium", task: "t" }, undefined, undefined, deep.ctx), /launch command too long/);
+  assert.ok(!deep.commands.some(({ args }) => args[4] === "tab"), "overlong launch refused before tab creation");
+  assert.deepEqual(readdirSync(join(deep.config.stateDir, "locks")).filter(name => name.startsWith("launch-")), [], "overlong launch leaves no claim");
+  await deep.stop();
   const defaultConfig = fixture({ id: "default-config", env: { HOME: root, PI_CODING_AGENT_DIR: undefined } });
   await defaultConfig.start();
   await assert.rejects(defaultConfig.tools.get("spawn_agent").execute("default-child", { role: "implement", thinking: "medium", task: "new task" }, undefined, undefined, defaultConfig.ctx), /fixture child failure/);
