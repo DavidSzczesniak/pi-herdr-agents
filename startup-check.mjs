@@ -165,7 +165,8 @@ try {
   assert.ok(!started.some(arg => arg.includes("/opt/adapter")));
   assert.equal(started[started.indexOf("--model") + 1], "fixture/no-network");
   // Herdr may type the launch command into a shell still in canonical mode; macOS truncates canonical input at 1024 bytes.
-  const deep = fixture({ id: "deep-state", env: { XDG_STATE_HOME: join(root, "a".repeat(200), "b".repeat(200), "c".repeat(200)) } });
+  // Four 200-byte segments exceed the limit whatever the checkout path; each stays under the 255-byte name limit.
+  const deep = fixture({ id: "deep-state", env: { XDG_STATE_HOME: join(root, "a".repeat(200), "b".repeat(200), "c".repeat(200), "d".repeat(200)) } });
   await deep.start();
   await assert.rejects(deep.tools.get("spawn_agent").execute("child", { role: "implement", thinking: "medium", task: "t" }, undefined, undefined, deep.ctx), /launch command too long/);
   assert.ok(!deep.commands.some(({ args }) => args[6] === "tab"), "overlong launch refused before tab creation");
