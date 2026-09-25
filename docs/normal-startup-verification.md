@@ -56,3 +56,20 @@ The first native spawn exposed a macOS-only failure. `herdr agent start` typed t
 After that change, a native Review worker completed a spawn, a follow-up, and retirement. Its session recorded the role brief once, as the `addendum` section, across both turns. The Linux native run above predates this change. On Linux, the brief previously reached Pi through `--append-system-prompt`, which renders as the same addendum section.
 
 Herdr 0.9.1 sets `HERDR_SESSION` instead of `HERDR_SESSION_NAME`, so the adapter recorded an empty server name for named servers. Routing still targeted the exact captured socket because `HERDR_SOCKET_PATH` takes precedence over both variables. The adapter now reads `HERDR_SESSION`, falls back to `HERDR_SESSION_NAME`, and removes both from every Herdr invocation.
+
+## Claude Code workers
+
+Verified on 2026-09-25 with Pi 0.87.1, Herdr 0.8.2, Claude Code 2.1.280, and Node 24.21.0 on Linux.
+
+- **Module checks.** `npm test` passed, including `claude-check` and the adapter check's tool-level Claude cases.
+- **Direct native runs.** These used the Claude module with real Herdr and real Claude Code in a disposable workspace:
+  - A worker accepted its task within 1 second.
+  - It read a ds-mode principle skill by absolute path outside its working directory, which confirms that bypass permission mode covers the read.
+  - It ran `git` through Bash, settled `completed` with the expected text and a transcript path, and retired by closing its exact pane.
+  - A launch in an untrusted repository failed at once with the trust instruction and closed its pane. The dialog was never answered.
+- **Pi end-to-end runs.** A real Pi lead in a Herdr pane called `spawn_agent` with `runtime: "claude"`:
+  - The worker was accepted, and `wait_agent` settled `completed` with the exact requested text.
+  - `list_agents` showed the worker, `followup_task` was refused as one-shot, and `retire_agent` closed the pane.
+  - The first attempt failed before the hook became a plain `sh` script. Inside Pi, `process.execPath` is Pi's own binary, so the hook exited with status 2 and Claude discarded the prompt.
+- **Process loss.** A worker's pane process was the exec'd `claude` itself, according to `pane process-info`, so no shell remained. Killing it mid-task with SIGKILL removed the pane from Herdr's server-wide list, and `wait_agent` settled at once as `unavailable`, with the reason "Claude pane closed without a result".
+- **Not covered natively.** The runs did not exercise quota exhaustion, a `StopFailure` from the provider, or macOS.

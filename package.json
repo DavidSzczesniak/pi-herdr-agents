@@ -3,20 +3,23 @@
   "private": true,
   "type": "module",
   "pi": {
-    "extensions": ["./index.ts"]
+    "extensions": [
+      "./index.ts"
+    ]
   },
   "engines": {
     "node": ">=24.18.0"
   },
   "scripts": {
-    "check": "tsc --noEmit --module esnext --moduleResolution bundler --target es2022 --strict --skipLibCheck --allowImportingTsExtensions index.ts protocol.ts runtime.ts pending-fixture.ts transport-check.ts",
+    "check": "tsc --noEmit --module esnext --moduleResolution bundler --target es2022 --strict --skipLibCheck --allowImportingTsExtensions index.ts protocol.ts runtime.ts pending-fixture.ts transport-check.ts claude.ts",
     "transport-check": "node --experimental-strip-types transport-check.ts",
     "adapter-check": "node --experimental-strip-types adapter-check.mjs",
     "launch-race-check": "node --experimental-strip-types launch-race-check.mjs",
     "startup-check": "node --experimental-strip-types startup-check.mjs",
     "selection-check": "node --experimental-strip-types selection-check.mjs",
     "retirement-check": "node --experimental-strip-types retirement-check.mjs",
-    "test": "npm run check && npm run transport-check && npm run adapter-check && npm run launch-race-check && npm run startup-check && npm run selection-check && npm run retirement-check"
+    "test": "npm run check && npm run transport-check && npm run adapter-check && npm run launch-race-check && npm run startup-check && npm run selection-check && npm run retirement-check && npm run claude-check",
+    "claude-check": "node --experimental-strip-types claude-check.mjs"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",

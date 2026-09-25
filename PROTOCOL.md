@@ -137,6 +137,57 @@ Normal root resumption takes the model selected by Pi, including explicit user m
 
 Workers cancel switch, fork, and tree-navigation events to keep their assigned conversation history. A worker reload can bypass its now-released initial launch claim only after a clean detach by the same PID/birth, with matching session, model, and recorded thinking when known. It receives a new runtime generation and never replays an active task. A failed owned-child startup may request native shutdown.
 
+## Claude Code workers
+
+Claude workers cannot run this extension or serve a socket, so the caller owns all their state under `claude/<workerId>/` in its state directory:
+
+| Path | Content |
+|---|---|
+| `launch.json` | Launch receipt: `creating`, `created` (with the raw tab response), `started`, or `failed` (with error and cleanup) |
+| `worker.json` | Worker ID (`c` prefix), parent, role, `runtime: "claude"`, model, effort, cwd, workspace, tab, pane, terminal, launch ID, `open` or `closed`, and the single task |
+| `brief.md` | The complete brief |
+| `settings.json` | The adapter's hooks, passed with `--settings` |
+| `launch.sh` | The exec line Herdr runs |
+| `hooks/<Event>-<epoch>-<pid>.json` | One immutable file per hook invocation, written by `claude-hook.sh`. It is a plain `sh` script, so hooks need no interpreter path. |
+| `lock` | Per-worker transition lock |
+
+**Launch.**
+- The quoted `exec '<dir>/launch.sh'` line must stay under 1024 bytes. Otherwise the launch is refused before any tab exists.
+- The receipt is written before `tab create`. Creation finishes even when the caller aborts, so the exact pane is known for cleanup.
+- The script unsets `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, and `CLAUDE_CODE_OAUTH_TOKEN`. It also unsets the `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`, and `CLAUDE_CODE_USE_FOUNDRY` provider selectors, so the session uses the Claude login. It then runs:
+
+  ```text
+  claude --setting-sources '' --settings <settings> --strict-mcp-config
+    --disallowed-tools Agent,Task,AskUserQuestion --append-system-prompt <role brief>
+    --add-dir <dir> --permission-mode bypassPermissions --model <m> --effort <e>
+    -- <brief>
+  ```
+- `--` ends option parsing, so a brief that starts with `-` stays task text.
+- A brief over 120,000 bytes is replaced by a pointer to `brief.md`, because Linux caps one argument at 128 KiB.
+
+**Acceptance.**
+- The first `UserPromptSubmit` record must arrive within 60 seconds. It records the Claude session ID and transcript path.
+- While waiting, the adapter reads the pane's visible screen every five seconds, and a trust dialog fails the launch immediately.
+- Any launch failure closes the exact created pane and records the task unavailable. An unknown tab-creation outcome stays explicitly uncertain in the receipt.
+
+**Settlement.**
+- Results come from hook evidence correlated by the accepted session ID, not by file order. The first `Stop` gives `completed` with `last_assistant_message`, `StopFailure` gives `error`, and `SessionEnd` gives `unavailable`. Later turns never replace the first result.
+- The launch execs Claude as the pane's only process, so the pane's terminal lives exactly as long as Claude does. Pane and terminal identity therefore stand in for process identity.
+- Absence comes from a server-wide `pane list`, never a failed lookup. Herdr gives a moved pane a new ID, so the adapter matches by pane ID or terminal ID. A moved or replaced pane is "changed", which is neither absent nor closable.
+- A pane found absent with no terminal evidence settles `unavailable`, or `interrupted` when an interrupt intent is recorded. Settlement uses the evidence present when the pane is found absent. The pane disappears only after its `claude` process has ended, so hook evidence finishing later is not considered. Waits reconcile pane presence at their start and every ten seconds.
+- Transitions run under the per-worker lock and never replace a settled result. A result that arrives during an interrupt's close wins over `interrupted`.
+- Session shutdown aborts sleeping Claude waits and stops admitting new tool calls. It lets tracked launches, interrupts, and retirements record their outcomes, then detaches. After detachment, every transition refuses, so a stale runtime never writes.
+- Error reasons are capped at 4,000 characters.
+- The full final text goes to `artifacts/<workerId>-<submissionId>.md`, and responses cap it as Pi results do. A wait timeout leaves the task active.
+
+**Closing.**
+- Interrupt and retirement close only the exact pane with `pane close`, and only while a server-wide `pane list` shows the recorded pane, terminal, workspace, and tab. They then verify through the same listing that the pane is absent.
+- An interrupt records its intent before closing. A pane found absent with that intent, and no terminal evidence, settles `interrupted`, whether the interrupter is still running or died between closing and recording.
+- An absent pane counts as closed. Retirement refuses an active task.
+- Launches, interrupts, and retirements are tracked with Pi launches and retirements, so session shutdown waits for them.
+- A Pi descendant's retirement refuses while it owns a Claude child that is open or active, or whose launch did not fail cleanly. A failed launch with uncertain cleanup, such as a lost tab-creation response, keeps blocking until an operator reconciles it.
+- There are no follow-ups, nested workers, or cold continuation.
+
 ## Environment and native launch
 
 The installed package autoloads through its `pi.extensions` manifest, which names only `index.ts`. Extension construction captures configuration without creating background resources. Activation happens only in `session_start` when `ctx.mode === "tui"`, `HERDR_ENV=1`, and Pi has a persistent session path. Other modes and ephemeral sessions create no adapter resources, tools, host-binding instructions, or session guards.

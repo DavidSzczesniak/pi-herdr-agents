@@ -1,6 +1,6 @@
 # Pi Herdr agents
 
-A Pi extension that hosts delegated Pi workers in Herdr tabs. It provides `spawn_agent`, `list_agents`, `wait_agent`, `followup_task`, `interrupt_agent`, `retire_agent`, and `update_plan`.
+A Pi extension that hosts delegated Pi workers in Herdr tabs. It can also host one-shot Claude Code workers. It provides `spawn_agent`, `list_agents`, `wait_agent`, `followup_task`, `interrupt_agent`, `retire_agent`, and `update_plan`.
 
 ## Current status
 
@@ -76,6 +76,32 @@ Child launches explicitly inherit the caller's effective Pi config directory, in
 
 A task receipt requires a correlated native start event. Bounded waits do not cancel work. Interruption and cold continuation retain exact task, worker, process, model, and conversation identities. Ambiguous submissions are never automatically replayed. There are no adapter turn ceilings.
 
+### Claude Code workers
+
+`spawn_agent` with `runtime: "claude"` starts a one-shot Claude Code leaf worker instead of a Pi child. Use it for work that should run on a different model family, such as independent review, under the user's own Claude Code login. Claude Code must be installed and signed in. Its executable resolves from the lead's `PATH`, or from an absolute `PI_HERDR_CLAUDE_BIN`.
+
+- **Session.** The worker is ordinary interactive `claude` in its own tab.
+  - The session is isolated:
+    - `--setting-sources ''` skips user, project, and local settings files, so personal hooks, permission rules, and plugins do not load.
+    - `--strict-mcp-config` excludes MCP servers.
+    - CLAUDE.md context and user skills still load, as Pi children load context files and skills.
+  - API-key variables are unset so the session uses the Claude login.
+  - The worker has normal tools with `--permission-mode bypassPermissions`, the counterpart of Pi workers' normal tools. A read-only review is an assignment. Claude's own `Agent`, `Task`, and `AskUserQuestion` tools are disabled, and the worker gets the same "no human watches, stop and report" brief as Pi children.
+- **Model and effort.** `model.id` names a Claude model, defaulting to `claude-opus-5-5`. `thinking` is Claude's effort: `low`, `medium`, `high`, `xhigh`, or `max`. Other levels are rejected before launch.
+- **Evidence.** Adapter hooks record it:
+  - `UserPromptSubmit` is acceptance.
+  - The first `Stop` of that session completes with its final message.
+  - `StopFailure` is an error.
+  - `SessionEnd` without a result, or a pane that disappears without a result, is unavailable, unless an interrupt closed it, which makes it interrupted.
+- **Tools.** `wait_agent`, `list_agents`, `interrupt_agent`, and `retire_agent` work on the worker.
+  - `interrupt_agent` and `retire_agent` close only the worker's exact pane, never other panes in its tab.
+  - A result that arrived before an interrupt's close is kept.
+  - Retirement refuses active work.
+  - Results, artifacts, and the Claude transcript path stay recorded.
+  - A Pi worker with an open or active Claude child cannot be retired until the child is retired.
+- **Limits.** Claude workers cannot spawn workers or take follow-ups. `followup_task` is refused, so spawn a fresh worker with a complete brief.
+- **Trust.** Claude Code keys folder trust to the repository. The adapter never answers the trust dialog. It fails the launch at once, with an instruction to open `claude` in that repository once and trust it.
+
 ## Session lifecycle and recovery
 
 The lead can use `/new`, `/resume`, `/fork`, `/clone`, `/tree`, and `/reload`. Pi's documented shutdown/start lifecycle detaches the old runtime and binds the replacement to its native conversation. Descendants remain in their tabs. Returning to the same session restores its descendants and latest session-owned plan. A fork gets a new adapter state directory. Plans and descendants are session-wide, not branch-local, so `/tree` does not rewind them.
@@ -93,7 +119,7 @@ npm ci --ignore-scripts --no-audit --no-fund
 npm test
 ```
 
-Transport checks use real Unix sockets. Adapter and startup checks use real files, sockets, and process identities but stub TUI events and Herdr commands. Startup checks also exercise real Pi package discovery and headless SDK binding. The launch-race check uses two real processes with a stubbed native session-open boundary. Selection checks use Pi's installed catalog, capability helpers, and SDK model/thinking events and empty-history reload, with Herdr controls and provider turns stubbed. The retirement check uses separate real processes and Unix sockets with stubbed Pi and Herdr controls. It covers original-conversation cold continuation and retained historical results without a provider turn. These checks launch neither Herdr nor models. Native lifecycle verification requires a disposable Herdr server and ordinary package autoload.
+Transport checks use real Unix sockets. Adapter and startup checks use real files, sockets, and process identities but stub TUI events and Herdr commands. The Claude check runs the real launch script, settings, and hook against a fake `claude` executable with Herdr stubbed. Startup checks also exercise real Pi package discovery and headless SDK binding. The launch-race check uses two real processes with a stubbed native session-open boundary. Selection checks use Pi's installed catalog, capability helpers, and SDK model/thinking events and empty-history reload, with Herdr controls and provider turns stubbed. The retirement check uses separate real processes and Unix sockets with stubbed Pi and Herdr controls. It covers original-conversation cold continuation and retained historical results without a provider turn. These checks launch neither Herdr nor models. Native lifecycle verification requires a disposable Herdr server and ordinary package autoload.
 
 ## Limits and evidence
 

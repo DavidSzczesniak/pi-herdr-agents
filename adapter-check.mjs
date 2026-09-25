@@ -70,6 +70,7 @@ function fixture({ workerId = "lead", role = "lead", thinking = "high", parentId
         return { code: 0, killed: false, stderr: "", stdout: JSON.stringify({ result: { root_pane: spawned } }) };
       }
       if (op[0] === "agent" && op[1] === "start") return { code: 1, killed: false, stderr: "fixture startup failure", stdout: "" };
+      if (op[0] === "pane" && op[1] === "list") return { code: 0, killed: false, stderr: "", stdout: JSON.stringify({ result: { panes: ["w1:cowned", "w1:cstranger", "w1:cwaiting"].map(id => pane(id)) } }) };
       if (op[0] === "pane" && op[1] === "get") return { code: 0, killed: false, stderr: "", stdout: JSON.stringify({ result: { pane: op[2] === "w1:new" ? spawned : pane(op[2]) } }) };
       if (failReport && op[1] === "release-agent") throw new Error("fixture report failure");
       return { code: 0, killed: false, stderr: "", stdout: "" };
@@ -264,7 +265,41 @@ try {
   assert.equal((await selfRequest(newLead, { kind: "status" })).active.submissionId, "new", "historical wait does not mask or settle current task");
   assert.equal(revived.sends, 1);
   await revived.settle();
+  // Claude workers route through the same tools; ownership, one-shot follow-up, and effort validation hold at the tool layer.
+  const plantClaude = (id, parentId, stop) => {
+    const dir = join(state, "claude", id);
+    mkdirSync(join(dir, "hooks"), { recursive: true, mode: 0o700 });
+    writeFileSync(join(dir, "hooks", "UserPromptSubmit-1-1.json"), JSON.stringify({ session_id: "cs", transcript_path: "/tmp/claude.jsonl" }));
+    if (stop) writeFileSync(join(dir, "hooks", "Stop-2-2.json"), JSON.stringify({ session_id: "cs", last_assistant_message: stop }));
+    atomicWrite(join(dir, "worker.json"), { workerId: id, parentId, role: "review", runtime: "claude", model: "claude-opus-5-5", effort: "high",
+      cwd: directory, workspaceId: "w1", tabId: `tab-w1:${id}`, paneId: `w1:${id}`, terminalId: `term-w1:${id}`, launchId: "claude-launch",
+      state: "open", task: { submissionId: `sub-${id}`, kind: "active", outcome: null, finalText: "", artifactPath: null, reason: null,
+        claudeSessionId: "cs", transcriptPath: "/tmp/claude.jsonl", startedAt: new Date().toISOString() } });
+  };
+  plantClaude("cowned", "lead", "planted review");
+  plantClaude("cstranger", "stranger", "not yours");
+  const tool = async (name, params) => JSON.parse((await revived.tools.get(name).execute(name, params, undefined, undefined, revived.ctx)).content[0].text);
+  const claudeResult = await tool("wait_agent", { agent_id: "cowned", submission_id: "sub-cowned", timeout_ms: 120000 });
+  assert.equal(claudeResult.runtime, "claude");
+  assert.equal(claudeResult.outcome, "completed");
+  assert.equal(claudeResult.finalText, "planted review");
+  const listed = await tool("list_agents", {});
+  assert.ok(listed.some((row) => row.kind === "claude_status" && row.workerId === "cowned"));
+  assert.ok(!listed.some((row) => row.workerId === "cstranger"), "another parent's Claude worker is not listed");
+  await assert.rejects(tool("wait_agent", { agent_id: "cstranger", submission_id: "sub-cstranger", timeout_ms: 120000 }), /not this caller's descendant/);
+  await assert.rejects(tool("followup_task", { agent_id: "cowned", task: "second" }), /one-shot/);
+  assert.equal((await tool("interrupt_agent", { agent_id: "cowned", submission_id: "sub-cowned" })).outcome, "completed", "settled work is never re-labelled");
+  await assert.rejects(tool("spawn_agent", { runtime: "claude", role: "review", thinking: "minimal", task: "x" }), /Invalid|Expected|must/i);
+  // Shutdown stops a sleeping Claude wait before the runtime detaches, and the record is not written afterwards.
+  plantClaude("cwaiting", "lead");
+  const waitingPath = join(state, "claude", "cwaiting", "worker.json");
+  const waiting = tool("wait_agent", { agent_id: "cwaiting", submission_id: "sub-cwaiting", timeout_ms: 120000 });
+  await new Promise((resolve) => setTimeout(resolve, 1500));
+  const before = readFileSync(waitingPath, "utf8");
   await revived.stop();
+  await assert.rejects(waiting, /abort|unavailable/i);
+  await new Promise((resolve) => setTimeout(resolve, 1500));
+  assert.equal(readFileSync(waitingPath, "utf8"), before, "no Claude write after detachment");
   process.stdout.write("PASS adapter contracts with explicitly stubbed Pi/Herdr events; real UDS/files/process identity. No native lifecycle or topology claim.\n");
 } finally {
   if (processProbe && processProbe.exitCode === null && processProbe.signalCode === null) processProbe.kill("SIGKILL");
