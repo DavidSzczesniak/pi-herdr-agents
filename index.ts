@@ -409,7 +409,6 @@ function createRuntime(pi: ExtensionAPI, config: StartupConfig) {
     // Not a launch argument: Herdr can type the launch command before the new shell leaves canonical mode, and macOS truncates canonical input at 1024 bytes.
     // The addendum renders even with a SYSTEM.md custom prompt, unlike prompt guidelines.
     if (identity.role !== "lead") event.systemPromptOptions.appendSystemPrompt = [event.systemPromptOptions.appendSystemPrompt, roleBrief(identity.role)].filter(Boolean).join("\n\n");
-    event.systemPromptOptions.promptGuidelines.push("Host binding: ds-mode's Codex lead/worker references mean the corresponding native Pi roles here. Use matching update_plan, spawn_agent, wait_agent, list_agents, followup_task and interrupt_agent tools. Use read, grep, find and bash for Read/Grep/Glob/Shell. Preserve all skill phases, triggers, ownership and proof requirements. A genuine human question requires a real user answer; stop and report it if no interactive question tool is available.");
   });
   pi.on("tool_call", () => {
     if (shuttingDown && role !== "lead") return { block: true, reason: "Runtime shutting down" };
@@ -919,7 +918,7 @@ function createRuntime(pi: ExtensionAPI, config: StartupConfig) {
     },
   });
   pi.registerTool({
-    name: "spawn_agent", label: "Spawn agent", description: "Start a fresh native Pi child in its own visible tab. Supply the complete brief with role, contract, writable paths, exclusions, verification, edit permission and report shape. No inherited parent history. All roles have normal tools. Model is optional and inherits the caller's model when omitted. Supply thinking explicitly on every spawn; role does not set its level. Unsupported thinking is rejected before allocation. Receipt identity reports model and thinking observed at the first correlated agent_start, or null when unknown. Record workerId and submissionId; ambiguous is not completion.",
+    name: "spawn_agent", label: "Spawn agent", description: "Start a fresh native Pi child in its own visible tab. Supply a brief that stands on its own. No inherited parent history. All roles have normal tools. Model is optional and inherits the caller's model when omitted. Supply thinking explicitly on every spawn; role does not set its level. Unsupported thinking is rejected before allocation. Receipt identity reports model and thinking observed at the first correlated agent_start, or null when unknown. Record workerId and submissionId; ambiguous is not completion.",
     parameters: Type.Object({ task: Type.String({ minLength: 1, maxLength: 200000 }), role: StringEnum(["implement", "explore", "review", "judgment"] as const),
       fork_turns: Type.Optional(StringEnum(["none"])), cwd: Type.Optional(Type.String()),
       model: Type.Optional(ModelSchema), thinking: ThinkingSchema }),

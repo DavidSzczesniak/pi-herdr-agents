@@ -96,7 +96,7 @@ export function recordedThinking(previous: Identity): Selection["thinking"] {
   return parse(ThinkingSchema, restored.thinkingLevel);
 }
 export function roleBrief(role: Identity["role"]): string {
-  return `Role: ${role}. Own the complete task in your brief and any descendants you spawn. Fresh children receive only their brief, not parent conversation history. Respect the brief's writable paths and edit permission. Use Git, tests, and scratch probes as needed. ${role === "review" || role === "explore" ? "Report findings rather than apply implementation fixes." : "Produce the deliverable requested by the brief."} Keep reports under 800 words with changed paths, checks, evidence paths, and open risks. Record workerId and submissionId; wait on the exact submission. update_plan changes only your own session plan, never the lead's. For a genuine human preference question, stop and report the question for the real user; never invent their answer.`;
+  return `Role: ${role}. An agent started you; your final message is your report to it. No human watches this session. If you need a human decision, stop and report the question.`;
 }
 // macOS: boot session UUID plus ps start time (one-second resolution). UTC/C keep the birth string identical across callers.
 let darwinBootId: string | undefined;

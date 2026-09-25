@@ -97,7 +97,7 @@ Transport checks use real Unix sockets. Adapter and startup checks use real file
 
 ## Limits and evidence
 
-On macOS, process identity has one-second start-time resolution, and the adapter refuses a child launch command of 1024 bytes or more. See [the protocol](PROTOCOL.md) for both limits. The adapter does not protect against malicious peers sharing its UID. Whole-Herdr-server crash recovery and automatic reconciliation of uncertain launch claims are unsupported. Structured `AskQuestion` is not implemented. Workers must report genuine human questions and wait for a real answer.
+On macOS, process identity has one-second start-time resolution, and the adapter refuses a child launch command of 1024 bytes or more. See [the protocol](PROTOCOL.md) for both limits. The adapter does not protect against malicious peers sharing its UID. Whole-Herdr-server crash recovery and automatic reconciliation of uncertain launch claims are unsupported. Structured `AskQuestion` is not implemented. Workers stop and report genuine human questions instead of answering them.
 
 The historical hardening checks passed independent runtime review. One ds-mode bug-fix journey produced a correct fix and passed 32 external checks, but its workflow assessment was partial because the lead skipped prescribed skill steps.
 

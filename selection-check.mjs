@@ -388,7 +388,7 @@ try {
     assert.equal(readIdentity("sdk-worker").thinking, "high", "native SDK startup retains selected effort");
     // A SYSTEM.md custom prompt drops Pi's prompt guidelines; the role brief must still render.
     await session.extensionRunner.emitBeforeAgentStart("probe", undefined, { cwd: root, customPrompt: "CUSTOM PROMPT" });
-    assert.match(renderedPrompts.at(-1), /^CUSTOM PROMPT[\s\S]*Role: review\. /, "role brief survives a custom system prompt");
+    assert.match(renderedPrompts.at(-1), /^CUSTOM PROMPT[\s\S]*Role: review\. An agent started you/, "role brief survives a custom system prompt");
     session.setThinkingLevel("low");
     assert.equal(readIdentity("sdk-worker").thinking, "low", "native thinking event persists before any status poll or await");
     await session.setModel(plain);
