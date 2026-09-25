@@ -59,6 +59,7 @@ export function startupConfig(ctx: ExtensionContext, env: NodeJS.ProcessEnv) {
     paneId: env.HERDR_PANE_ID, workspaceId: env.DS_HERDR_WORKSPACE_ID || env.HERDR_WORKSPACE_ID || "",
     restartGeneration: env.DS_HERDR_RESTART_GENERATION || null, launchId: env.DS_HERDR_LAUNCH_ID || null,
     // Herdr's server environment need not match the calling Pi process.
+    claudeEnvironment: { PATH: env.PATH, PI_HERDR_CLAUDE_BIN: env.PI_HERDR_CLAUDE_BIN },
     childEnvironment: Object.fromEntries(["PI_CODING_AGENT_DIR", "PI_OFFLINE", "PI_SKIP_VERSION_CHECK", "PI_TELEMETRY", "PI_CACHE_RETENTION"]
       .flatMap(key => env[key] === undefined ? [] : [[key, env[key]]])),
   };

@@ -7,6 +7,7 @@ import { appendFileSync, chmodSync, existsSync, mkdirSync, readdirSync, readFile
 import { dirname, join, resolve } from "node:path";
 import { extensionPath, herdrCommand, privateDirectory, startupConfig, type StartupConfig } from "./startup.ts";
 import { atomicWrite, errorText, ModelSchema, ThinkingSchema, parse, readIdentityRecord, readRecord, RequestSchema, request, SafeId, socketAlive, TaskSchema, type Identity, type Request, type Result, type Selection, type Task } from "./protocol.ts";
+import { ClaudeEffort, ClaudeModel, claudeCommand, defaultClaudeModel, interruptClaude, isClaudeWorker, listClaude, readClaudeWorker, retireClaude, spawnClaude, unresolvedClaudeChild, waitClaude, type ClaudeHost, type ClaudeWorker } from "./claude.ts";
 import { assertNoRetirement, claimLaunch, LaunchClaimSchema, isOriginalProcessLive, PaneResponse, PlanRecordSchema, PlanSchema, planLines, processIdentity, recordedThinking, retirementFence, roleBrief, selectWorker, tabPane, verifySession, type Pane } from "./runtime.ts";
 
 const toolNames = ["spawn_agent", "list_agents", "wait_agent", "followup_task", "interrupt_agent", "retire_agent", "update_plan"];
@@ -109,7 +110,7 @@ function createRuntime(pi: ExtensionAPI, config: StartupConfig) {
   async function herdr(args: string[], signal?: AbortSignal): Promise<unknown> {
     const output = await pi.exec("env", herdrCommand(config, args), { timeout: 30000, signal });
     if (output.code !== 0 || output.killed) throw new Error(`Herdr ${args.slice(0, 2).join(" ")}: ${output.stderr || output.stdout}`);
-    if (args[0] === "pane" && ["report-agent", "release-agent", "close"].includes(args[1] ?? "") && !output.stdout.trim()) return undefined;
+    if (args[0] === "pane" && ["report-agent", "release-agent", "close", "run"].includes(args[1] ?? "") && !output.stdout.trim()) return undefined;
     return JSON.parse(output.stdout);
   }
   function report(state: "idle" | "working") {
@@ -466,9 +467,11 @@ function createRuntime(pi: ExtensionAPI, config: StartupConfig) {
   });
   async function cleanup() {
     shuttingDown = true;
+    claudeShutdown.abort();
     if (!identity || shutdownCleaned) return;
     shutdownCleaned = true;
     await Promise.allSettled([...launches, ...retirements]);
+    claudeDetached = true;
     let detached = false;
     try {
       if (active) publish({ ...active, kind: "unavailable", reason: "Session shutdown before settlement" });
@@ -730,6 +733,8 @@ function createRuntime(pi: ExtensionAPI, config: StartupConfig) {
           throw new Error(`Descendant ${child.workerId} has an unresolved submission`);
       }
     }
+    const claudeChild = unresolvedClaudeChild(stateDir, (parentId) => parentId === target.workerId || isDescendant(parentId, target.workerId));
+    if (claudeChild) throw new Error(`Descendant ${claudeChild} has an open Claude pane, active task, or unresolved launch; retire leaves first`);
     // A child tab can be in creation before its workers/ record exists.
     for (const file of readdirSync(join(stateDir, "locks"))) {
       if (!file.startsWith("launch-")) continue;
@@ -895,6 +900,39 @@ function createRuntime(pi: ExtensionAPI, config: StartupConfig) {
     void pending.finally(() => retirements.delete(pending)).catch(() => {});
     return pending;
   }
+  // Aborted at shutdown so sleeping Claude waits stop before this runtime detaches.
+  const claudeShutdown = new AbortController();
+  // Tracked Claude operations may finish recording their outcomes during shutdown; nothing writes after detachment.
+  let claudeDetached = false;
+  const claudeSignal = (signal?: AbortSignal) => signal ? AbortSignal.any([signal, claudeShutdown.signal]) : claudeShutdown.signal;
+  const claudeHost: ClaudeHost = {
+    stateDir, workerId, get workspaceId() { return workspaceId; }, get claudeCommand() { return claudeCommand(config.claudeEnvironment); },
+    admit() { if (claudeDetached || !identity) throw new Error("Worker unavailable"); },
+    herdr: (args, signal) => herdr(args, signal),
+    async readPane(id) {
+      const output = await pi.exec("env", herdrCommand(config, ["pane", "read", id, "--source", "visible", "--lines", "60"]), { timeout: 30000 });
+      if (output.code !== 0) throw new Error(output.stderr || output.stdout);
+      return output.stdout;
+    },
+    audit,
+  };
+  // A Claude worker belongs to this caller when its Pi parent is this caller or a descendant. An unknown parent is not owned.
+  function ownsClaudeParent(parentId: string): boolean {
+    if (parentId === workerId) return true;
+    try { return isDescendant(parentId, workerId); } catch { return false; }
+  }
+  function ownedClaude(id: string): ClaudeWorker {
+    current();
+    const worker = readClaudeWorker(stateDir, id);
+    if (!ownsClaudeParent(worker.parentId)) throw new Error("Target is not this caller's descendant");
+    return worker;
+  }
+  // Shutdown waits for Claude launches and closes like Pi ones, so a detached runtime never keeps writing.
+  function tracked<T>(set: Set<Promise<unknown>>, pending: Promise<T>): Promise<T> {
+    set.add(pending);
+    void pending.finally(() => set.delete(pending)).catch(() => {});
+    return pending;
+  }
   function toolResult(value: unknown) {
     const text = JSON.stringify(value);
     if (Buffer.byteLength(text) > 50000) {
@@ -918,11 +956,19 @@ function createRuntime(pi: ExtensionAPI, config: StartupConfig) {
     },
   });
   pi.registerTool({
-    name: "spawn_agent", label: "Spawn agent", description: "Start a fresh native Pi child in its own visible tab. Supply a brief that stands on its own. No inherited parent history. All roles have normal tools. Model is optional and inherits the caller's model when omitted. Supply thinking explicitly on every spawn; role does not set its level. Unsupported thinking is rejected before allocation. Receipt identity reports model and thinking observed at the first correlated agent_start, or null when unknown. Record workerId and submissionId; ambiguous is not completion.",
+    name: "spawn_agent", label: "Spawn agent", description: "Start a fresh native Pi child in its own visible tab. Supply a brief that stands on its own. No inherited parent history. All roles have normal tools. Model is optional and inherits the caller's model when omitted. Supply thinking explicitly on every spawn; role does not set its level. Unsupported thinking is rejected before allocation. Receipt identity reports model and thinking observed at the first correlated agent_start, or null when unknown. Record workerId and submissionId; ambiguous is not completion. runtime \"claude\" starts a one-shot Claude Code leaf worker on the Claude subscription instead: model.id is a Claude model (default claude-opus-5-5, provider ignored), thinking is its effort (low, medium, high, xhigh or max), it cannot spawn workers or take follow-ups, and a new task needs a fresh worker.",
     parameters: Type.Object({ task: Type.String({ minLength: 1, maxLength: 200000 }), role: StringEnum(["implement", "explore", "review", "judgment"] as const),
       fork_turns: Type.Optional(StringEnum(["none"])), cwd: Type.Optional(Type.String()),
-      model: Type.Optional(ModelSchema), thinking: ThinkingSchema }),
+      model: Type.Optional(ModelSchema), thinking: ThinkingSchema, runtime: Type.Optional(StringEnum(["pi", "claude"] as const)) }),
     async execute(_id, params, signal, _update, ctx) {
+      if (params.runtime === "claude") {
+        current();
+        if (retiring) throw new Error("Caller retiring; launch refused");
+        assertNoRetirement(stateDir, workerId);
+        const effort = parse(ClaudeEffort, params.thinking);
+        const model = parse(ClaudeModel, params.model?.id ?? defaultClaudeModel);
+        return toolResult(await tracked(launches, spawnClaude(claudeHost, { role: params.role, cwd: resolve(ctx.cwd, params.cwd ?? ctx.cwd), task: params.task, model, effort }, signal)));
+      }
       const selection = selectWorker(ctx, { model: params.model ?? ctx.model ?? null, thinking: params.thinking });
       const childId = `w${randomUUID().replaceAll("-", "").slice(0, 20)}`;
       return toolResult(await launch({ kind: "fresh", selection, childId, parent: workerId, childRole: params.role, childCwd: resolve(ctx.cwd, params.cwd ?? ctx.cwd),
@@ -944,6 +990,7 @@ function createRuntime(pi: ExtensionAPI, config: StartupConfig) {
           rows.push(status);
         } catch (error) { rows.push({ kind: "unavailable", identity: target, error: errorText(error) }); }
       }
+      rows.push(...await listClaude(claudeHost, ownsClaudeParent));
       return toolResult(rows);
     },
   });
@@ -951,6 +998,10 @@ function createRuntime(pi: ExtensionAPI, config: StartupConfig) {
     name: "wait_agent", label: "Wait for agent", description: "Wait for one exact submission to settle. Timeout leaves the worker active. Final text capped at 45 KiB with full artifact path; interrupted/error are distinct outcomes.",
     parameters: Type.Object({ ...targetFields, timeout_ms: Type.Integer({ minimum: 120000, maximum: 600000 }) }),
     async execute(_id, params, signal) {
+      if (isClaudeWorker(stateDir, params.agent_id)) {
+        ownedClaude(params.agent_id);
+        return toolResult(await waitClaude(claudeHost, params.agent_id, params.submission_id, params.timeout_ms, claudeSignal(signal)));
+      }
       return toolResult(await call(owned(params.agent_id), { kind: "wait", submissionId: params.submission_id, timeoutMs: params.timeout_ms }, signal));
     },
   });
@@ -958,6 +1009,10 @@ function createRuntime(pi: ExtensionAPI, config: StartupConfig) {
     name: "followup_task", label: "Follow-up task", description: "Submit only a new task to the original descendant's Pi conversation. Revive a proven dead worker in a new tab with the same worker ID/session UUID and new runtime generation. Never replay interrupted work. Retains the worker's native model and thinking. Receipt identity reports selection observed at the first correlated agent_start, or null when unknown. Live busy or unreachable writers are refused. Record the new submissionId.",
     parameters: Type.Object({ agent_id: idSchema, task: Type.String({ minLength: 1, maxLength: 200000 }) }),
     async execute(_id, params, signal, _update, ctx) {
+      if (isClaudeWorker(stateDir, params.agent_id)) {
+        ownedClaude(params.agent_id);
+        throw new Error("Claude workers are one-shot; spawn a fresh Claude worker with a complete brief instead of a follow-up");
+      }
       const target = owned(params.agent_id);
       if (existsSync(retirementFence(stateDir, target.workerId))) throw new Error("Retirement unresolved; follow-up refused");
       if (isOriginalProcessLive(target)) {
@@ -972,12 +1027,22 @@ function createRuntime(pi: ExtensionAPI, config: StartupConfig) {
   pi.registerTool({
     name: "retire_agent", label: "Retire agent", description: "Retire one idle descendant after native shutdown and original process/socket death proof, then close only its exact owned pane. Refuses active work, unresolved launches, and live or uncertain descendants. An incomplete outcome retains a durable fence; retry the same agent_id for safe cleanup. Completed results and native conversation survive for cold follow-up.",
     parameters: Type.Object({ agent_id: idSchema }),
-    async execute(_id, params, signal) { return toolResult(await trackedRetirement(owned(params.agent_id), signal)); },
+    async execute(_id, params, signal) {
+      if (isClaudeWorker(stateDir, params.agent_id)) {
+        ownedClaude(params.agent_id);
+        return toolResult(await tracked(retirements, retireClaude(claudeHost, params.agent_id)));
+      }
+      return toolResult(await trackedRetirement(owned(params.agent_id), signal));
+    },
   });
   pi.registerTool({
     name: "interrupt_agent", label: "Interrupt agent", description: "Abort one exact descendant task and wait up to 120 seconds. For ambiguous preflight, request native shutdown and prove original process death instead; result is unavailable, not fabricated interruption. If death remains unconfirmed, followup refuses revival. Never replay the old task.",
     parameters: Type.Object(targetFields),
     async execute(_id, params, signal) {
+      if (isClaudeWorker(stateDir, params.agent_id)) {
+        ownedClaude(params.agent_id);
+        return toolResult(await tracked(retirements, interruptClaude(claudeHost, params.agent_id, params.submission_id)));
+      }
       const target = owned(params.agent_id);
       const result = await call(target, { kind: "interrupt", submissionId: params.submission_id, timeoutMs: 120000 }, signal);
       if (result.kind !== "reset_requested") return toolResult(result);
