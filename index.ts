@@ -8,7 +8,7 @@ import { dirname, isAbsolute, join, resolve } from "node:path";
 import { extensionPath, herdrCommand, privateDirectory, startupConfig, type StartupConfig } from "./startup.ts";
 import { atomicWrite, errorText, ModelSchema, ThinkingSchema, parse, readIdentityRecord, readRecord, RequestSchema, request, SafeId, socketAlive, TaskSchema, type Identity, type Request, type Result, type Selection, type Task } from "./protocol.ts";
 import { ClaudeEffort, ClaudeModel, claudeCommand, defaultClaudeModel, interruptClaude, isClaudeWorker, listClaude, readClaudeWorker, retireClaude, spawnClaude, unresolvedClaudeChild, waitClaude, type ClaudeHost, type ClaudeWorker } from "./claude.ts";
-import { assertNoRetirement, claimLaunch, LaunchClaimSchema, isOriginalProcessLive, PaneResponse, PlanRecordSchema, PlanSchema, planLines, processIdentity, readStartupFailure, recordedThinking, retirementFence, roleBrief, selectWorker, startupFailurePath, takeClaim, unstartedRetirement, PaneSchema, tabPane, verifySession, workingDirectory, existingDirectory, type Pane } from "./runtime.ts";
+import { assertNoRetirement, claimLaunch, LaunchClaimSchema, isOriginalProcessLive, PaneResponse, PlanRecordSchema, PlanSchema, planLines, processIdentity, readStartupFailure, recordedThinking, retirementFence, roleBrief, selectWorker, waitProgress, startupFailurePath, takeClaim, unstartedRetirement, PaneSchema, tabPane, verifySession, workingDirectory, existingDirectory, type Pane } from "./runtime.ts";
 
 const toolNames = ["spawn_agent", "list_agents", "wait_agent", "followup_task", "interrupt_agent", "retire_agent", "update_plan"];
 const retirementResultFields = { kind: Type.Literal("retirement"), workerId: SafeId, generation: SafeId,
@@ -1044,6 +1044,9 @@ function createRuntime(pi: ExtensionAPI, config: StartupConfig) {
     void pending.finally(() => set.delete(pending)).catch(() => {});
     return pending;
   }
+  function withProgress<T extends { kind: string }>(result: T, agentId: string, submissionId: string, sessionPath: string | null) {
+    return result.kind === "timeout" ? { ...result, ...waitProgress(stateDir, workerId, agentId, submissionId, sessionPath) } : result;
+  }
   function toolResult(value: unknown) {
     const text = JSON.stringify(value);
     if (Buffer.byteLength(text) > 50000) {
@@ -1067,7 +1070,7 @@ function createRuntime(pi: ExtensionAPI, config: StartupConfig) {
     },
   });
   pi.registerTool({
-    name: "spawn_agent", label: "Spawn agent", description: "Start a fresh native Pi child in its own visible tab. Supply a brief that stands on its own. No inherited parent history. All roles have normal tools. Model is optional and inherits the caller's model when omitted. Supply thinking explicitly on every spawn; role does not set its level. Unsupported thinking is rejected before allocation. Receipt identity reports model and thinking observed at the first correlated agent_start, or null when unknown. Record workerId and submissionId; ambiguous is not completion. runtime \"claude\" starts a one-shot Claude Code leaf worker on the Claude subscription instead: model.id is a Claude model (default claude-opus-5-5, provider ignored), thinking is its effort (low, medium, high, xhigh or max), it cannot spawn workers or take follow-ups, and a new task needs a fresh worker.",
+    name: "spawn_agent", label: "Spawn agent", description: "Start a fresh native Pi child in its own visible tab. Supply a brief that stands on its own. No inherited parent history. All roles have normal tools. Model is optional and inherits the caller's model when omitted. Supply thinking explicitly on every spawn; role does not set its level. Unsupported thinking is rejected before allocation. Receipt identity reports model and thinking observed at the first correlated agent_start, or null when unknown. Record workerId and submissionId; ambiguous is not completion. runtime \"claude\" starts a one-shot Claude Code leaf worker on the Claude subscription instead: model.id is a Claude model (default claude-opus-5-5, provider ignored), thinking is its effort (low, medium, high, xhigh or max), it cannot spawn workers or take follow-ups, and a new task needs a fresh worker. Workers load no lead-only extensions and see the Herdr shell's environment, not the lead's process-only variables. Claude workers get no MCP servers, so lookups go through CLIs, and need a cwd Claude already trusts; git worktrees share their repository's trust.",
     parameters: Type.Object({ task: Type.String({ minLength: 1, maxLength: 200000 }), role: StringEnum(["implement", "explore", "review", "judgment"] as const),
       fork_turns: Type.Optional(StringEnum(["none"])), cwd: Type.Optional(Type.String()),
       model: Type.Optional(ModelSchema), thinking: ThinkingSchema, runtime: Type.Optional(StringEnum(["pi", "claude"] as const)) }),
@@ -1106,14 +1109,17 @@ function createRuntime(pi: ExtensionAPI, config: StartupConfig) {
     },
   });
   pi.registerTool({
-    name: "wait_agent", label: "Wait for agent", description: "Wait for one exact submission to settle. Timeout leaves the worker active. Final text capped at 45 KiB with full artifact path; interrupted/error are distinct outcomes.",
+    name: "wait_agent", label: "Wait for agent", description: "Wait for one exact submission to settle. Timeout leaves the worker active and reports sessionBytes and sessionGrowth since your previous timed-out wait; two consecutive timeouts with zero sessionGrowth suggest a stall, but a long tool call also writes nothing, so check the worker's pane before interrupting. ambiguous and unavailable are not completion; never replay them. Final text capped at 45 KiB with full artifact path; interrupted/error are distinct outcomes.",
     parameters: Type.Object({ ...targetFields, timeout_ms: Type.Integer({ minimum: 120000, maximum: 600000 }) }),
     async execute(_id, params, signal) {
       if (isClaudeWorker(stateDir, params.agent_id)) {
         ownedClaude(params.agent_id);
-        return toolResult(await waitClaude(claudeHost, params.agent_id, params.submission_id, params.timeout_ms, claudeSignal(signal)));
+        const result = await waitClaude(claudeHost, params.agent_id, params.submission_id, params.timeout_ms, claudeSignal(signal));
+        return toolResult(withProgress(result, params.agent_id, params.submission_id, readClaudeWorker(stateDir, params.agent_id).task.transcriptPath));
       }
-      return toolResult(await call(owned(params.agent_id), { kind: "wait", submissionId: params.submission_id, timeoutMs: params.timeout_ms }, signal));
+      const target = owned(params.agent_id);
+      const result = await call(target, { kind: "wait", submissionId: params.submission_id, timeoutMs: params.timeout_ms }, signal);
+      return toolResult(withProgress(result, params.agent_id, params.submission_id, target.piSessionPath));
     },
   });
   pi.registerTool({
@@ -1149,7 +1155,7 @@ function createRuntime(pi: ExtensionAPI, config: StartupConfig) {
     },
   });
   pi.registerTool({
-    name: "interrupt_agent", label: "Interrupt agent", description: "Abort one exact descendant task and wait up to 120 seconds. For ambiguous preflight, request native shutdown and prove original process death instead; result is unavailable, not fabricated interruption. If death remains unconfirmed, followup refuses revival. Never replay the old task.",
+    name: "interrupt_agent", label: "Interrupt agent", description: "Abort one exact descendant task and wait up to 120 seconds. For ambiguous preflight, request native shutdown and prove original process death instead; result is unavailable, not fabricated interruption. If death remains unconfirmed, followup refuses revival; do not start a replacement writer in that cwd. Never replay the old task.",
     parameters: Type.Object(targetFields),
     async execute(_id, params, signal) {
       if (isClaudeWorker(stateDir, params.agent_id)) {

@@ -55,6 +55,17 @@ export function takeClaim(stateDir: string, workerId: string, launchId: string, 
   }
   return taken;
 }
+// Session growth between timed-out waits separates a working worker from a stalled one. Saved per caller so it survives a reload.
+const WaitProgressSchema = Type.Object({ sessionBytes: Type.Union([Type.Integer({ minimum: 0 }), Type.Null()]) });
+export function waitProgress(stateDir: string, callerId: string, agentId: string, submissionId: string, sessionPath: string | null) {
+  let sessionBytes: number | null = null;
+  // Only a regular file counts. A Claude hook supplies the transcript path.
+  try { if (sessionPath) { const stat = statSync(sessionPath); if (stat.isFile()) sessionBytes = stat.size; } } catch {}
+  const path = join(stateDir, "operations", `wait-${parse(SafeId, callerId)}-${parse(SafeId, agentId)}-${parse(SafeId, submissionId)}.json`);
+  const previous = existsSync(path) ? readRecord(WaitProgressSchema, path).sessionBytes : null;
+  atomicWrite(path, { sessionBytes });
+  return { sessionBytes, sessionGrowth: previous !== null && sessionBytes !== null ? sessionBytes - previous : null };
+}
 export function retirementFence(stateDir: string, workerId: string): string {
   return join(stateDir, "locks", `retire-${parse(SafeId, workerId)}`);
 }
