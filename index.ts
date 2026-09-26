@@ -8,7 +8,7 @@ import { dirname, isAbsolute, join, resolve } from "node:path";
 import { extensionPath, herdrCommand, privateDirectory, startupConfig, type StartupConfig } from "./startup.ts";
 import { atomicWrite, errorText, ModelSchema, ThinkingSchema, parse, readIdentityRecord, readRecord, RequestSchema, request, SafeId, socketAlive, TaskSchema, type Identity, type Request, type Result, type Selection, type Task } from "./protocol.ts";
 import { ClaudeEffort, ClaudeModel, claudeCommand, defaultClaudeModel, interruptClaude, isClaudeWorker, listClaude, readClaudeWorker, retireClaude, spawnClaude, unresolvedClaudeChild, waitClaude, type ClaudeHost, type ClaudeWorker } from "./claude.ts";
-import { assertNoRetirement, claimLaunch, LaunchClaimSchema, isOriginalProcessLive, PaneResponse, PlanRecordSchema, PlanSchema, planLines, processIdentity, readStartupFailure, recordedThinking, retirementFence, roleBrief, selectWorker, startupFailurePath, PaneSchema, tabPane, verifySession, workingDirectory, existingDirectory, type Pane } from "./runtime.ts";
+import { assertNoRetirement, claimLaunch, LaunchClaimSchema, isOriginalProcessLive, PaneResponse, PlanRecordSchema, PlanSchema, planLines, processIdentity, readStartupFailure, recordedThinking, retirementFence, roleBrief, selectWorker, startupFailurePath, takeClaim, unstartedRetirement, PaneSchema, tabPane, verifySession, workingDirectory, existingDirectory, type Pane } from "./runtime.ts";
 
 const toolNames = ["spawn_agent", "list_agents", "wait_agent", "followup_task", "interrupt_agent", "retire_agent", "update_plan"];
 const retirementResultFields = { kind: Type.Literal("retirement"), workerId: SafeId, generation: SafeId,
@@ -626,7 +626,9 @@ function createRuntime(pi: ExtensionAPI, config: StartupConfig) {
       let rejected = "";
       try { failure = nativeStartAttempted ? readStartupFailure(stateDir, launchId, spec.childId) : undefined; }
       catch (failureError) { rejected = `; startup failure record rejected: ${errorText(failureError)}`; }
-      if (failure) error = new Error(`Worker startup failed: ${failure.error}`);
+      // Keep the launcher's own error unless it is only startNative's signal; the child's reason is added either way.
+      if (failure) error = new Error(errorText(error) === "Worker startup failed" ? `Worker startup failed: ${failure.error}`
+        : `${errorText(error)}; child startup failed: ${failure.error}`);
       let processes: ProcessRecord[] | undefined;
       if (pane) {
         try {
@@ -648,13 +650,13 @@ function createRuntime(pi: ExtensionAPI, config: StartupConfig) {
             }
           }
           // Without an identity, the child's failure record or the pane's processes before the close are the process proof.
-          if (!cleanupProven && (failure || processes)) cleanupProven = await exited([...(failure ? [failure] : []), ...(processes ?? [])], 2000);
+          if (!cleanupProven && (failure || processes?.length)) cleanupProven = await exited([...(failure ? [failure] : []), ...(processes ?? [])], 2000);
           cleanup = cleanupProven ? "exact newly-created pane closed; process cleanup proven"
             : "exact newly-created pane closed; native process identity unconfirmed, launch claim retained";
         } catch (cleanupError) { cleanup = `uncertain: ${errorText(cleanupError)}`; }
       }
       cleanup += rejected;
-      save({ kind: "failed", error: errorText(error), cleanup, processes: processes ?? null });
+      save({ kind: "failed", error: errorText(error), cleanup, processes: processes ?? null, nativeStartAttempted });
       throw new Error(`Launch ${spec.childId} failed: ${errorText(error)}. Cleanup ${cleanup}. Durable receipt ${receiptPath}`);
     } finally {
       if (identityConfirmed || cleanupProven) claim.release();
@@ -664,9 +666,12 @@ function createRuntime(pi: ExtensionAPI, config: StartupConfig) {
   async function paneProcesses(paneId: string): Promise<ProcessRecord[] | undefined> {
     try {
       const info = parse(paneProcessSchema, await herdr(["pane", "process-info", "--pane", paneId])).result.process_info;
-      if (info.pane_id !== paneId || !info.foreground_processes?.length) return undefined;
-      const pids = new Set([...info.foreground_processes.map(p => p.pid), ...(info.shell_pid ? [info.shell_pid] : [])]);
-      return [...pids].flatMap(pid => { const found = processIdentity(pid); return found ? [{ pid, pidBirth: found.birth }] : []; });
+      // The shell is the pane's root process: without its identity the snapshot proves nothing.
+      const shell = info.shell_pid ? processIdentity(info.shell_pid) : null;
+      if (info.pane_id !== paneId || !info.shell_pid || !shell) return undefined;
+      const others = (info.foreground_processes ?? []).map(p => p.pid).filter(pid => pid !== info.shell_pid);
+      return [{ pid: info.shell_pid, pidBirth: shell.birth },
+        ...others.flatMap(pid => { const found = processIdentity(pid); return found ? [{ pid, pidBirth: found.birth }] : []; })];
     } catch { return undefined; }
   }
   async function exited(processes: ProcessRecord[], timeoutMs: number): Promise<boolean> {
@@ -947,12 +952,26 @@ function createRuntime(pi: ExtensionAPI, config: StartupConfig) {
     } finally { release(); }
   }
   const launchReceiptSchema = Type.Object({ launchId: SafeId, workerId: SafeId, pane: Type.Union([PaneSchema, Type.Null()]),
-    data: Type.Object({ kind: Type.String(), processes: Type.Optional(Type.Union([Type.Array(Type.Object({ pid: Type.Integer(), pidBirth: Type.String() })), Type.Null()])) }) });
+    data: Type.Object({ kind: Type.String(), nativeStartAttempted: Type.Optional(Type.Boolean()),
+      processes: Type.Optional(Type.Union([Type.Array(Type.Object({ pid: Type.Integer(), pidBirth: Type.String() })), Type.Null()])) }) });
+  const unstartedEvidenceSchema = Type.Object({ claim: LaunchClaimSchema, result: Type.Object({ kind: Type.Literal("retirement"),
+    workerId: SafeId, launchId: SafeId, state: Type.Literal("retired"), reason: Type.String(), evidencePath: Type.String() }) });
   // A fresh child that exited before registering leaves only its launch claim, which would block its ancestors' retirement.
   async function retireUnstarted(id: string, signal?: AbortSignal) {
     current();
-    const claimDir = join(stateDir, "locks", `launch-${parse(SafeId, id)}`);
-    if (!existsSync(claimDir)) throw new Error("No worker identity or launch claim for this ID");
+    const locks = join(stateDir, "locks");
+    const claimDir = join(locks, `launch-${parse(SafeId, id)}`);
+    if (!existsSync(claimDir)) {
+      // Repeat, or finish a retirement interrupted between taking the claim and recording it.
+      const taken = readdirSync(locks).find(name => name.startsWith(`retired-launch-${id}-`));
+      const claim = taken ? readRecord(LaunchClaimSchema, join(locks, taken, "claim.json")) : undefined;
+      const done = readdirSync(join(stateDir, "operations")).find(name => name.startsWith(`retire-${id}-launch-`));
+      const evidence = done ? readRecord(unstartedEvidenceSchema, join(stateDir, "operations", done)) : undefined;
+      const owner = claim ?? evidence?.claim;
+      if (!owner || owner.workerId !== id || !ownsClaudeParent(owner.callerId)) throw new Error("No worker identity or launch claim for this ID");
+      if (claim && taken) return commitUnstarted(claim, join(locks, taken), "Finished an interrupted retirement of a launch that never registered a worker.");
+      return evidence!.result;
+    }
     const claim = readRecord(LaunchClaimSchema, join(claimDir, "claim.json"));
     if (claim.workerId !== id || claim.previousGeneration !== null) throw new Error("Launch claim is not a fresh launch of this worker");
     if (!ownsClaudeParent(claim.callerId)) throw new Error("Target is not this caller's descendant");
@@ -964,27 +983,25 @@ function createRuntime(pi: ExtensionAPI, config: StartupConfig) {
     if (!launched) throw new Error(`Launch pane unknown; operator inspection required: ${receiptPath}`);
     const failure = readStartupFailure(stateDir, claim.launchId, id);
     const processes = [...(failure ? [failure] : []), ...(receipt.data.processes ?? [])];
-    if (!processes.length) throw new Error(`No recorded process for this launch; operator inspection required: ${receiptPath}`);
+    // Without a start attempt no process ran in the pane, so its absence is enough.
+    if (receipt.data.nativeStartAttempted !== false && !processes.length)
+      throw new Error(`No recorded process for this launch; operator inspection required: ${receiptPath}`);
     if (processes.some(p => isOriginalProcessLive(p))) throw new Error("Launched process still live; retirement refused");
     const panes = parse(paneListSchema, await herdr(["pane", "list"], signal)).result.panes;
-    const open = panes.find(p => p.pane_id === launched.pane_id && p.terminal_id === launched.terminal_id);
-    if (open) throw new Error(`Launch pane ${launched.pane_id} still open; close it or inspect ${receiptPath}`);
+    if (panes.some(p => p.pane_id === launched.pane_id && p.terminal_id === launched.terminal_id))
+      throw new Error(`Launch pane ${launched.pane_id} still open; close it or inspect ${receiptPath}`);
     if (panes.some(p => p.pane_id === launched.pane_id || p.terminal_id === launched.terminal_id))
       throw new Error(`Launch pane ${launched.pane_id} or its terminal is ambiguous in Herdr; operator inspection required: ${receiptPath}`);
     signal?.throwIfAborted();
     if (existsSync(identityPath(id))) throw new Error("Worker registered during retirement; use its identity");
-    // The rename is the single commit point. A concurrent retirer or the launcher's own release finds nothing to take.
-    const taken = join(stateDir, "locks", `retired-launch-${id}-${claim.launchId}`);
-    try { renameSync(claimDir, taken); }
-    catch (error) {
-      if (error instanceof Error && "code" in error && error.code === "ENOENT") throw new Error("Launch claim already released");
-      throw error;
-    }
-    if (readRecord(LaunchClaimSchema, join(taken, "claim.json")).launchId !== claim.launchId) throw new Error(`Launch claim changed; inspect ${taken}`);
-    const evidencePath = join(stateDir, "operations", `retire-${id}-launch-${claim.launchId}.json`);
-    const result = { kind: "retirement", workerId: id, launchId: claim.launchId, state: "retired",
-      reason: "Launch never registered a worker. Its recorded processes are dead, its exact pane is gone, and its launch claim is released.", evidencePath };
-    atomicWrite(evidencePath, { claim, pane: launched, processes, result });
+    const taken = takeClaim(stateDir, id, claim.launchId, "retired");
+    if (!taken) throw new Error("Launch claim already released");
+    return commitUnstarted(claim, taken, "Launch never registered a worker. Its recorded processes are dead, its exact pane is gone, and its launch claim is released.");
+  }
+  function commitUnstarted(claim: Static<typeof LaunchClaimSchema>, taken: string, reason: string) {
+    const evidencePath = unstartedRetirement(stateDir, claim.workerId, claim.launchId);
+    const result = { kind: "retirement" as const, workerId: claim.workerId, launchId: claim.launchId, state: "retired" as const, reason, evidencePath };
+    atomicWrite(evidencePath, { claim, result });
     rmSync(taken, { recursive: true });
     return result;
   }
@@ -1120,7 +1137,7 @@ function createRuntime(pi: ExtensionAPI, config: StartupConfig) {
     },
   });
   pi.registerTool({
-    name: "retire_agent", label: "Retire agent", description: "Retire one idle descendant after native shutdown and original process/socket death proof, then close only its exact owned pane. Refuses active work, unresolved launches, and live or uncertain descendants. An incomplete outcome retains a durable fence; retry the same agent_id for safe cleanup. Completed results and native conversation survive for cold follow-up. A fresh child that never started retires once its launch failed and its exact pane is gone.",
+    name: "retire_agent", label: "Retire agent", description: "Retire one idle descendant after native shutdown and original process/socket death proof, then close only its exact owned pane. Refuses active work, unresolved launches, and live or uncertain descendants. An incomplete outcome retains a durable fence; retry the same agent_id for safe cleanup. Completed results and native conversation survive for cold follow-up. A fresh child that never started retires once its launch failed, its recorded processes are dead, and its exact pane is gone.",
     parameters: Type.Object({ agent_id: idSchema }),
     async execute(_id, params, signal) {
       if (isClaudeWorker(stateDir, params.agent_id)) {

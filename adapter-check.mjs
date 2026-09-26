@@ -8,7 +8,7 @@ import { once } from "node:events";
 import adapter from "./index.ts";
 import { atomicWrite, request } from "./protocol.ts";
 import { socketDirectory } from "./startup.ts";
-import { claimLaunch, isOriginalProcessLive, processIdentity, planLines, tabPane, verifySession } from "./runtime.ts";
+import { claimLaunch, isOriginalProcessLive, processIdentity, planLines, tabPane, takeClaim, verifySession } from "./runtime.ts";
 
 const directory = mkdtempSync(join(tmpdir(), "piha-adapter-"));
 const state = directory;
@@ -17,6 +17,7 @@ const fixtures = [];
 let processProbe;
 const extraPanes = [];
 let panePids = [];
+let closeKills = false;
 const pane = (id = "w1:p1") => ({ pane_id: id, workspace_id: "w1", terminal_id: `term-${id}`, tab_id: `tab-${id}` });
 const header = { type: "session", version: 3, id: "session-lead", timestamp: new Date().toISOString(), cwd: directory };
 
@@ -74,7 +75,7 @@ function fixture({ workerId = "lead", role = "lead", thinking = "high", parentId
         return { code: 0, killed: false, stderr: "", stdout: JSON.stringify({ result: { root_pane: spawned } }) };
       }
       if (op[0] === "pane" && op[1] === "process-info")
-        return { code: 0, killed: false, stderr: "", stdout: JSON.stringify({ result: { process_info: { pane_id: op[3], shell_pid: null,
+        return { code: 0, killed: false, stderr: "", stdout: JSON.stringify({ result: { process_info: { pane_id: op[3], shell_pid: panePids[0] ?? null,
           foreground_process_group_id: panePids[0] ?? null, foreground_processes: panePids.map(pid => ({ pid, name: "pi" })) } } }) };
       if (op[0] === "agent" && op[1] === "start" && launchFault.startsWith("child-exits")) {
         // The child fails its own startup and exits; Herdr would keep waiting for readiness.
@@ -86,6 +87,7 @@ function fixture({ workerId = "lead", role = "lead", thinking = "high", parentId
       if (op[0] === "agent" && op[1] === "start") return { code: 1, killed: false, stderr: "fixture startup failure", stdout: "" };
       if (op[0] === "pane" && op[1] === "list") return { code: 0, killed: false, stderr: "", stdout: JSON.stringify({ result: { panes: [...["w1:cowned", "w1:cstranger", "w1:cwaiting"].map(id => pane(id)), ...extraPanes] } }) };
       if (op[0] === "pane" && op[1] === "get") return { code: 0, killed: false, stderr: "", stdout: JSON.stringify({ result: { pane: op[2] === "w1:new" ? spawned : pane(op[2]) } }) };
+      if (op[0] === "pane" && op[1] === "close" && closeKills) for (const pid of panePids) process.kill(pid, "SIGHUP");
       if (failReport && op[1] === "release-agent") throw new Error("fixture report failure");
       return { code: 0, killed: false, stderr: "", stdout: "" };
     },
@@ -254,6 +256,40 @@ try {
   extraPanes.length = 0;
   assert.equal(JSON.parse((await retireSlow()).content[0].text).state, "retired", "a recorded process proven dead releases the claim");
   assert.ok(!existsSync(join(state, "locks", `launch-${slow}`)));
+  // Closing the pane ends its processes, so the snapshot alone proves cleanup.
+  const hungUp = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+  panePids = [hungUp.pid];
+  closeKills = true;
+  await assert.rejects(startupFault.tools.get("spawn_agent").execute("spawn-hup", { role: "implement", thinking: "medium", task: "complete brief" }, undefined, undefined, startupFault.ctx),
+    /process cleanup proven/);
+  panePids = [];
+  closeKills = false;
+  const hup = startupFault.commands.filter(args => args[2] === "tab" && args[3] === "create").at(-1).find(value => value.startsWith("DS_HERDR_WORKER_ID=")).split("=")[1];
+  assert.ok(!existsSync(join(state, "locks", `launch-${hup}`)), "a snapshot proven dead releases the claim without a failure record");
+  // A retirer that took the claim first leaves the launcher's release nothing to do; a fence removed by anyone else is an error.
+  const raced = claimLaunch(state, { launchId: "raced-launch", workerId: "raced", previousGeneration: null,
+    piSessionPath: join(state, "raced.jsonl"), model: { provider: "fixture", id: "no-network" }, thinking: "medium", callerId: "startup-fault",
+    callerGeneration: "g", pid: process.pid, pidBirth: processIdentity(process.pid).birth });
+  const racedTaken = takeClaim(state, "raced", "raced-launch", "retired");
+  assert.ok(racedTaken);
+  raced.release();
+  rmSync(racedTaken, { recursive: true });
+  const lostFence = claimLaunch(state, { launchId: "lost-launch", workerId: "lost-fence", previousGeneration: null,
+    piSessionPath: join(state, "lost.jsonl"), model: { provider: "fixture", id: "no-network" }, thinking: "medium", callerId: "startup-fault",
+    callerGeneration: "g", pid: process.pid, pidBirth: processIdentity(process.pid).birth });
+  rmSync(lostFence.path, { recursive: true });
+  assert.throws(() => lostFence.release(), /fence was removed/);
+  // A retirement interrupted after taking the claim finishes on retry.
+  const interrupted = claimLaunch(state, { launchId: "interrupted-launch", workerId: "interrupted", previousGeneration: null,
+    piSessionPath: join(state, "interrupted.jsonl"), model: { provider: "fixture", id: "no-network" }, thinking: "medium", callerId: "startup-fault",
+    callerGeneration: "g", pid: process.pid, pidBirth: processIdentity(process.pid).birth });
+  assert.ok(takeClaim(state, "interrupted", "interrupted-launch", "retired"));
+  const finished = JSON.parse((await startupFault.tools.get("retire_agent").execute("retire", { agent_id: "interrupted" }, undefined, undefined, startupFault.ctx)).content[0].text);
+  assert.match(finished.reason, /interrupted retirement/);
+  assert.ok(!existsSync(join(state, "locks", "retired-launch-interrupted-interrupted-launch")));
+  assert.equal(JSON.parse((await startupFault.tools.get("retire_agent").execute("retire", { agent_id: "interrupted" }, undefined, undefined, startupFault.ctx)).content[0].text).evidencePath,
+    finished.evidencePath, "a repeat returns the recorded retirement");
+  void interrupted;
   const crafted = claimLaunch(state, { launchId: "crafted-launch", workerId: "crafted", previousGeneration: null,
     piSessionPath: join(state, "crafted.jsonl"), model: { provider: "fixture", id: "no-network" }, thinking: "medium", callerId: "startup-fault",
     callerGeneration: "g", pid: process.pid, pidBirth: processIdentity(process.pid).birth });
@@ -276,7 +312,7 @@ try {
   assert.equal(unstartedResult.state, "retired");
   assert.equal(existsSync(join(state, "locks", `launch-${unstarted}`)), false, "retiring a never-started child releases its claim");
   assert.ok(existsSync(unstartedResult.evidencePath));
-  await assert.rejects(retireUnstarted(), /No worker identity or launch claim/);
+  assert.equal(JSON.parse((await retireUnstarted()).content[0].text).evidencePath, unstartedResult.evidencePath, "a repeat returns the recorded retirement");
   await startupFault.stop();
 
   const liveExit = fixture({ workerId: "live-exit", parentId: "lead", role: "judgment", launchFault: "child-exits-live" });

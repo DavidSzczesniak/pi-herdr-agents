@@ -1,5 +1,5 @@
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { Type, type Static } from "typebox";
 import { getSupportedThinkingLevels, StringEnum } from "@earendil-works/pi-ai";
@@ -27,13 +27,33 @@ export function readStartupFailure(stateDir: string, launchId: string, workerId:
 // Pi reports its real working directory. On macOS /tmp is a symlink to /private/tmp, so compare canonical paths.
 export function workingDirectory(path: string): string {
   let canonical: string;
-  try { canonical = realpathSync.native(path); } catch { throw new Error(`Worker cwd does not exist: ${path}`); }
+  try { canonical = realpathSync.native(path); }
+  catch (error) {
+    const code = error instanceof Error && "code" in error ? error.code : undefined;
+    throw new Error(code === "ENOENT" ? `Worker cwd does not exist: ${path}` : `Worker cwd unusable (${String(code ?? error)}): ${path}`);
+  }
   if (!statSync(canonical).isDirectory()) throw new Error(`Worker cwd is not a directory: ${path}`);
   return canonical;
 }
 export function existingDirectory(path: string): string {
   workingDirectory(path);
   return path;
+}
+export const unstartedRetirement = (stateDir: string, workerId: string, launchId: string) =>
+  join(stateDir, "operations", `retire-${parse(SafeId, workerId)}-launch-${parse(SafeId, launchId)}.json`);
+// Moves a launch claim aside atomically. Returns undefined when another caller already took it.
+export function takeClaim(stateDir: string, workerId: string, launchId: string, as: "released" | "retired"): string | undefined {
+  const taken = join(stateDir, "locks", `${as}-launch-${parse(SafeId, workerId)}-${parse(SafeId, launchId)}`);
+  try { renameSync(join(stateDir, "locks", `launch-${workerId}`), taken); }
+  catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") return undefined;
+    throw error;
+  }
+  if (readRecord(LaunchClaimSchema, join(taken, "claim.json")).launchId !== launchId) {
+    renameSync(taken, join(stateDir, "locks", `launch-${workerId}`));
+    throw new Error("Launch claim belongs to another launch; restored");
+  }
+  return taken;
 }
 export function retirementFence(stateDir: string, workerId: string): string {
   return join(stateDir, "locks", `retire-${parse(SafeId, workerId)}`);
@@ -63,11 +83,15 @@ export function claimLaunch(stateDir: string, claim: Static<typeof LaunchClaimSc
   return {
     path,
     release() {
-      // A retirer may already have taken a failed launch's claim.
-      if (!existsSync(path)) return;
-      const saved = readRecord(LaunchClaimSchema, join(path, "claim.json"));
-      if (saved.launchId !== claim.launchId) throw new Error("Launch claim changed; release refused");
-      rmSync(path, { recursive: true });
+      // Renaming is the commit point, shared with retirement of a never-started worker.
+      const taken = takeClaim(stateDir, claim.workerId, claim.launchId, "released");
+      if (!taken) {
+        // Only a retirer that took this exact launch's claim may have removed it.
+        if (existsSync(unstartedRetirement(stateDir, claim.workerId, claim.launchId)) ||
+          existsSync(join(stateDir, "locks", `retired-launch-${claim.workerId}-${claim.launchId}`))) return;
+        throw new Error("Launch claim missing; fence was removed outside this launch");
+      }
+      rmSync(taken, { recursive: true });
     },
   };
 }
