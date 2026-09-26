@@ -15,6 +15,8 @@ const state = directory;
 const originalEnv = { ...process.env };
 const fixtures = [];
 let processProbe;
+const extraPanes = [];
+let panePids = [];
 const pane = (id = "w1:p1") => ({ pane_id: id, workspace_id: "w1", terminal_id: `term-${id}`, tab_id: `tab-${id}` });
 const header = { type: "session", version: 3, id: "session-lead", timestamp: new Date().toISOString(), cwd: directory };
 
@@ -36,6 +38,7 @@ function fixture({ workerId = "lead", role = "lead", thinking = "high", parentId
   let sends = 0;
   let runSignal;
   let spawned;
+  let launched;
   let abortController;
   const sessionFile = join(state, `${workerId}.jsonl`);
   if (!existsSync(sessionFile)) writeFileSync(sessionFile, JSON.stringify({ ...header, id: sessionId }) + "\n");
@@ -58,19 +61,30 @@ function fixture({ workerId = "lead", role = "lead", thinking = "high", parentId
     getActiveTools: () => selectedTools, setActiveTools: names => { selectedTools = names; },
     getThinkingLevel: () => effort, setThinkingLevel: level => { effort = level; },
     appendEntry(type, data) { writeFileSync(sessionFile, JSON.stringify({ type: "custom", customType: type, data }) + "\n", { flag: "a" }); },
-    async exec(_command, args) {
+    async exec(_command, args, options) {
       assert.equal(_command, "env");
       assert.ok(args.includes("HERDR_SOCKET_PATH=/fixture/herdr.sock"));
       const op = args.slice(args.indexOf("herdr") + 1);
       commands.push(["--session", "slice", ...op]);
       if (op[0] === "tab" && op[1] === "create") {
         spawned = pane("w1:new");
+        launched = Object.fromEntries(op.filter(value => /^DS_HERDR_(LAUNCH|WORKER)_ID=/.test(value)).map(value => value.split("=")));
         if (launchFault === "unknown-create") return { code: 1, killed: true, stderr: "fixture receipt lost", stdout: "" };
         if (launchFault === "abort-after-create") abortController.abort();
         return { code: 0, killed: false, stderr: "", stdout: JSON.stringify({ result: { root_pane: spawned } }) };
       }
+      if (op[0] === "pane" && op[1] === "process-info")
+        return { code: 0, killed: false, stderr: "", stdout: JSON.stringify({ result: { process_info: { pane_id: op[3], shell_pid: null,
+          foreground_process_group_id: panePids[0] ?? null, foreground_processes: panePids.map(pid => ({ pid, name: "pi" })) } } }) };
+      if (op[0] === "agent" && op[1] === "start" && launchFault.startsWith("child-exits")) {
+        // The child fails its own startup and exits; Herdr would keep waiting for readiness.
+        atomicWrite(join(state, "operations", `startup-failed-${launched.DS_HERDR_LAUNCH_ID}.json`), { launchId: launched.DS_HERDR_LAUNCH_ID,
+          workerId: launched.DS_HERDR_WORKER_ID, error: "fixture cwd mismatch", pid: process.pid,
+          pidBirth: launchFault === "child-exits-live" ? processIdentity(process.pid).birth : "exited-child" });
+        return new Promise(resolve => options.signal.addEventListener("abort", () => resolve({ code: 1, killed: true, stderr: "", stdout: "" })));
+      }
       if (op[0] === "agent" && op[1] === "start") return { code: 1, killed: false, stderr: "fixture startup failure", stdout: "" };
-      if (op[0] === "pane" && op[1] === "list") return { code: 0, killed: false, stderr: "", stdout: JSON.stringify({ result: { panes: ["w1:cowned", "w1:cstranger", "w1:cwaiting"].map(id => pane(id)) } }) };
+      if (op[0] === "pane" && op[1] === "list") return { code: 0, killed: false, stderr: "", stdout: JSON.stringify({ result: { panes: [...["w1:cowned", "w1:cstranger", "w1:cwaiting"].map(id => pane(id)), ...extraPanes] } }) };
       if (op[0] === "pane" && op[1] === "get") return { code: 0, killed: false, stderr: "", stdout: JSON.stringify({ result: { pane: op[2] === "w1:new" ? spawned : pane(op[2]) } }) };
       if (failReport && op[1] === "release-agent") throw new Error("fixture report failure");
       return { code: 0, killed: false, stderr: "", stdout: "" };
@@ -169,6 +183,9 @@ try {
     callerGeneration: lead.generation, pid: lead.pid, pidBirth: lead.pidBirth });
   process.env.DS_HERDR_LAUNCH_ID = "wrong-token";
   await assert.rejects(claimed.start(), /launch claim/, "child refuses an unrelated launch token");
+  const recorded = JSON.parse(readFileSync(join(state, "operations", "startup-failed-wrong-token.json")));
+  assert.match(recorded.error, /launch claim/, "a failed child records why for its launcher");
+  assert.deepEqual([recorded.workerId, recorded.pid], ["claimed", process.pid]);
   assert.ok(existsSync(join(launchClaim.path, "claim.json")), "child never releases caller's claim");
   const matchingClaimed = fixture({ workerId: "claimed", parentId: "lead", role: "implement", thinking: "medium", launchId: "launch-token" });
   process.env.DS_HERDR_LAUNCH_ID = "launch-token";
@@ -215,7 +232,71 @@ try {
   assert.equal(startupFault.effort, "high");
   await assert.rejects(startupFault.tools.get("spawn_agent").execute("spawn-fail", { role: "implement", thinking: "medium", task: "complete brief" }, undefined, undefined, startupFault.ctx), /fixture startup failure.*exact newly-created pane closed/);
   assert.ok(startupFault.commands.some(args => args[2] === "pane" && args[3] === "close" && args[4] === "w1:new"));
+  const unstarted = startupFault.commands.find(args => args[2] === "tab" && args[3] === "create").find(value => value.startsWith("DS_HERDR_WORKER_ID=")).split("=")[1];
+  assert.ok(existsSync(join(state, "locks", `launch-${unstarted}`)), "an unexplained startup failure keeps its claim");
+  const retireUnstarted = () => startupFault.tools.get("retire_agent").execute("retire", { agent_id: unstarted }, undefined, undefined, startupFault.ctx);
+  await assert.rejects(retireUnstarted(), /No recorded process/, "pane absence alone is not process proof");
+  await assert.rejects(root.tools.get("retire_agent").execute("retire", { agent_id: "never-launched" }, undefined, undefined, root.ctx), /No worker identity or launch claim/);
+  // The pane's process outlives the close, so the claim stays until a later retire proves it dead.
+  const paneProbe = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+  panePids = [paneProbe.pid];
+  await assert.rejects(startupFault.tools.get("spawn_agent").execute("spawn-slow", { role: "implement", thinking: "medium", task: "complete brief" }, undefined, undefined, startupFault.ctx),
+    /launch claim retained/);
+  panePids = [];
+  const slow = startupFault.commands.filter(args => args[2] === "tab" && args[3] === "create").at(-1).find(value => value.startsWith("DS_HERDR_WORKER_ID=")).split("=")[1];
+  const retireSlow = () => startupFault.tools.get("retire_agent").execute("retire", { agent_id: slow }, undefined, undefined, startupFault.ctx);
+  await assert.rejects(retireSlow(), /still live/, "a live recorded process blocks retirement");
+  const probeExit = once(paneProbe, "exit");
+  paneProbe.kill("SIGTERM");
+  await probeExit;
+  extraPanes.push({ ...pane("w1:other"), terminal_id: "term-w1:new" });
+  await assert.rejects(retireSlow(), /ambiguous/, "a partial pane match is not ours to close");
+  extraPanes.length = 0;
+  assert.equal(JSON.parse((await retireSlow()).content[0].text).state, "retired", "a recorded process proven dead releases the claim");
+  assert.ok(!existsSync(join(state, "locks", `launch-${slow}`)));
+  const crafted = claimLaunch(state, { launchId: "crafted-launch", workerId: "crafted", previousGeneration: null,
+    piSessionPath: join(state, "crafted.jsonl"), model: { provider: "fixture", id: "no-network" }, thinking: "medium", callerId: "startup-fault",
+    callerGeneration: "g", pid: process.pid, pidBirth: processIdentity(process.pid).birth });
+  atomicWrite(join(state, "operations", "launch-crafted-launch.json"), { launchId: "crafted-launch", workerId: "crafted", pane: pane("w1:crafted"),
+    data: { kind: "starting" } });
+  await assert.rejects(startupFault.tools.get("retire_agent").execute("retire", { agent_id: "crafted" }, undefined, undefined, startupFault.ctx), /Launch not finished/);
+  const outsider = fixture({ workerId: "outsider", parentId: "lead", role: "explore" });
+  await outsider.start();
+  await assert.rejects(outsider.tools.get("retire_agent").execute("retire", { agent_id: "crafted" }, undefined, undefined, outsider.ctx), /not this caller's descendant/);
+  await outsider.stop();
+  crafted.release();
+  // A process recorded for the failed launch lets retire take the claim once the pane is gone.
+  atomicWrite(join(state, "operations", `launch-${JSON.parse(readFileSync(join(state, "locks", `launch-${unstarted}`, "claim.json"))).launchId}.json`),
+    { ...JSON.parse(readFileSync(join(state, "operations", `launch-${JSON.parse(readFileSync(join(state, "locks", `launch-${unstarted}`, "claim.json"))).launchId}.json`))),
+      data: { kind: "failed", processes: [{ pid: process.pid, pidBirth: "exited-shell" }] } });
+  extraPanes.push(pane("w1:new"));
+  await assert.rejects(retireUnstarted(), /still open/, "a never-started child retires only once its pane is gone");
+  extraPanes.length = 0;
+  const unstartedResult = JSON.parse((await retireUnstarted()).content[0].text);
+  assert.equal(unstartedResult.state, "retired");
+  assert.equal(existsSync(join(state, "locks", `launch-${unstarted}`)), false, "retiring a never-started child releases its claim");
+  assert.ok(existsSync(unstartedResult.evidencePath));
+  await assert.rejects(retireUnstarted(), /No worker identity or launch claim/);
   await startupFault.stop();
+
+  const liveExit = fixture({ workerId: "live-exit", parentId: "lead", role: "judgment", launchFault: "child-exits-live" });
+  await liveExit.start();
+  await assert.rejects(liveExit.tools.get("spawn_agent").execute("spawn-live", { role: "implement", thinking: "medium", task: "complete brief" }, undefined, undefined, liveExit.ctx),
+    /Worker startup failed: fixture cwd mismatch.*launch claim retained/);
+  const liveChild = liveExit.commands.find(args => args[2] === "tab" && args[3] === "create").find(value => value.startsWith("DS_HERDR_WORKER_ID=")).split("=")[1];
+  assert.ok(existsSync(join(state, "locks", `launch-${liveChild}`)), "a failure record naming a live process keeps the claim");
+  rmSync(join(state, "locks", `launch-${liveChild}`), { recursive: true });
+  await liveExit.stop();
+
+  const childExit = fixture({ workerId: "exited-child", parentId: "lead", role: "judgment", launchFault: "child-exits" });
+  await childExit.start();
+  const began = Date.now();
+  await assert.rejects(childExit.tools.get("spawn_agent").execute("spawn-exit", { role: "implement", thinking: "medium", task: "complete brief" }, undefined, undefined, childExit.ctx),
+    /Worker startup failed: fixture cwd mismatch.*process cleanup proven/);
+  assert.ok(Date.now() - began < 5000, "the child's failure record ends the readiness wait");
+  const exitedChild = childExit.commands.find(args => args[2] === "tab" && args[3] === "create").find(value => value.startsWith("DS_HERDR_WORKER_ID=")).split("=")[1];
+  assert.equal(existsSync(join(state, "locks", `launch-${exitedChild}`)), false, "a recorded and proven-dead child releases its claim");
+  await childExit.stop();
 
   const lost = fixture({ workerId: "lost-receipt", parentId: "lead", role: "review", launchFault: "unknown-create" });
   await lost.start();

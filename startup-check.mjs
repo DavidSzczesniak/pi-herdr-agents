@@ -1,6 +1,6 @@
 // Real files/sockets/process identities and Pi discovery/headless binding. TUI/Herdr controls are stubbed.
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, existsSync, rmSync, readdirSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, realpathSync, symlinkSync, writeFileSync, existsSync, rmSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import adapter from "./index.ts";
@@ -119,6 +119,17 @@ try {
   } });
   await child.start();
   const childIdentity = child.identity();
+  // macOS /tmp is a symlink to /private/tmp: Pi reports the real path while the launch may name the link.
+  const linked = join(root, "linked-project");
+  symlinkSync(project, linked);
+  const linkedChild = fixture({ id: "linked-session", env: {
+    HERDR_PANE_ID: "w1:p-linked", DS_HERDR_WORKER_ID: "linked", DS_HERDR_PARENT_ID: "lead", DS_HERDR_ROLE: "explore",
+    DS_HERDR_STATE_DIR: a.config.stateDir, DS_HERDR_SOCKET_DIR: a.config.socketDir, DS_HERDR_SESSION: "", DS_HERDR_WORKSPACE: linked,
+  } });
+  await linkedChild.start();
+  assert.deepEqual(linkedChild.notifications, [], "a symlinked workspace is the same directory");
+  assert.equal(linkedChild.identity().cwd, linked);
+  await linkedChild.stop();
   for (const event of ["session_before_switch", "session_before_fork", "session_before_tree"])
     assert.deepEqual(await child.emit(event), [{ cancel: true }], "worker retains assigned conversation history");
   assert.deepEqual(await child.emit("tool_call", { toolName: "bash" }), [undefined], "review role has no shell ban");
@@ -156,6 +167,12 @@ try {
   assert.equal(status.kind, "status");
   await assert.rejects(recovered.tools.get("spawn_agent").execute("child", { role: "implement", thinking: "medium", task: "new task" }, undefined, undefined, recovered.ctx), /fixture child failure/);
   const created = recovered.commands.find(({ args }) => args[6] === "tab").args;
+  await assert.rejects(recovered.tools.get("spawn_agent").execute("linked", { role: "explore", thinking: "medium", task: "t", cwd: linked }, undefined, undefined, recovered.ctx), /fixture child failure/);
+  const linkedTab = recovered.commands.filter(({ args }) => args[6] === "tab").at(-1).args;
+  assert.equal(linkedTab[linkedTab.indexOf("--cwd") + 1], realpathSync(project), "spawn assigns the canonical directory");
+  const tabs = recovered.commands.filter(({ args }) => args[6] === "tab").length;
+  await assert.rejects(recovered.tools.get("spawn_agent").execute("missing", { role: "explore", thinking: "medium", task: "t", cwd: join(root, "missing") }, undefined, undefined, recovered.ctx), /cwd does not exist/);
+  assert.equal(recovered.commands.filter(({ args }) => args[6] === "tab").length, tabs, "a missing cwd is refused before tab creation");
   assert.ok(created.includes(`PI_CODING_AGENT_DIR=${join(root, "pi-config")}`));
   assert.ok(created.includes(`DS_HERDR_SOCKET_DIR=${recovered.config.socketDir}`));
   assert.ok(created.includes("HERDR_SOCKET_PATH=/exact/default.sock"));
@@ -224,7 +241,7 @@ try {
   }
   const unsafe = join(root, "unsafe"); mkdirSync(unsafe, { mode: 0o755 });
   assert.throws(() => privateDirectory(unsafe), /private/);
-  process.stdout.write("PASS automatic startup, inert modes, isolation, short sockets, endpoint routing, portable launch, duplicate refusal, clean reload, dead-root recovery, real Pi package discovery and headless SDK binding. No native Herdr/model calls.\n");
+  process.stdout.write("PASS automatic startup, inert modes, isolation, short sockets, endpoint routing, portable launch, duplicate refusal, symlinked and missing workspaces, clean reload, dead-root recovery, real Pi package discovery and headless SDK binding. No native Herdr/model calls.\n");
 } finally {
   for (const fixture of fixtures.reverse()) await fixture.stop().catch(() => {});
   rmSync(root, { recursive: true, force: true });

@@ -1,5 +1,5 @@
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { Type, type Static } from "typebox";
 import { getSupportedThinkingLevels, StringEnum } from "@earendil-works/pi-ai";
@@ -11,6 +11,30 @@ export const LaunchClaimSchema = Type.Object({
   piSessionPath: Type.String(), ...SelectionSchema.properties, callerId: SafeId, callerGeneration: SafeId,
   pid: Type.Integer({ minimum: 1 }), pidBirth: Type.String({ minLength: 1 }),
 });
+// A child that fails its own startup exits at once. This record lets its launcher stop waiting and report why.
+export const StartupFailureSchema = Type.Object({ launchId: SafeId, workerId: SafeId, error: Type.String(),
+  pid: Type.Integer({ minimum: 1 }), pidBirth: Type.String({ minLength: 1 }) });
+export function startupFailurePath(stateDir: string, launchId: string): string {
+  return join(stateDir, "operations", `startup-failed-${parse(SafeId, launchId)}.json`);
+}
+export function readStartupFailure(stateDir: string, launchId: string, workerId: string): Static<typeof StartupFailureSchema> | undefined {
+  const path = startupFailurePath(stateDir, launchId);
+  if (!existsSync(path)) return undefined;
+  const record = readRecord(StartupFailureSchema, path);
+  if (record.launchId !== launchId || record.workerId !== workerId) throw new Error("Startup failure record belongs to another launch");
+  return record;
+}
+// Pi reports its real working directory. On macOS /tmp is a symlink to /private/tmp, so compare canonical paths.
+export function workingDirectory(path: string): string {
+  let canonical: string;
+  try { canonical = realpathSync.native(path); } catch { throw new Error(`Worker cwd does not exist: ${path}`); }
+  if (!statSync(canonical).isDirectory()) throw new Error(`Worker cwd is not a directory: ${path}`);
+  return canonical;
+}
+export function existingDirectory(path: string): string {
+  workingDirectory(path);
+  return path;
+}
 export function retirementFence(stateDir: string, workerId: string): string {
   return join(stateDir, "locks", `retire-${parse(SafeId, workerId)}`);
 }
@@ -39,6 +63,8 @@ export function claimLaunch(stateDir: string, claim: Static<typeof LaunchClaimSc
   return {
     path,
     release() {
+      // A retirer may already have taken a failed launch's claim.
+      if (!existsSync(path)) return;
       const saved = readRecord(LaunchClaimSchema, join(path, "claim.json"));
       if (saved.launchId !== claim.launchId) throw new Error("Launch claim changed; release refused");
       rmSync(path, { recursive: true });
