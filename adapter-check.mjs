@@ -8,7 +8,7 @@ import { once } from "node:events";
 import adapter from "./index.ts";
 import { atomicWrite, request } from "./protocol.ts";
 import { socketDirectory } from "./startup.ts";
-import { claimLaunch, isOriginalProcessLive, processIdentity, planLines, tabPane, takeClaim, verifySession } from "./runtime.ts";
+import { claimLaunch, isOriginalProcessLive, processIdentity, planLines, tabPane, takeClaim, verifySession, waitProgress } from "./runtime.ts";
 
 const directory = mkdtempSync(join(tmpdir(), "piha-adapter-"));
 const state = directory;
@@ -397,6 +397,19 @@ try {
   plantClaude("cstranger", "stranger", "not yours");
   const tool = async (name, params) => JSON.parse((await revived.tools.get(name).execute(name, params, undefined, undefined, revived.ctx)).content[0].text);
   const claudeResult = await tool("wait_agent", { agent_id: "cowned", submission_id: "sub-cowned", timeout_ms: 120000 });
+  assert.equal(claudeResult.sessionGrowth, undefined, "a settled wait carries no progress fields");
+  assert.match(revived.tools.get("wait_agent").description, /two consecutive timeouts with zero sessionGrowth suggest a stall/);
+  // Progress between timed-out waits, per caller and submission, persisted across runtimes. The Claude transcript is its session file.
+  const transcript = join(state, "claude-progress.jsonl");
+  writeFileSync(transcript, "a".repeat(10));
+  assert.deepEqual(waitProgress(state, "lead", "cprogress", "sub-p", transcript), { sessionBytes: 10, sessionGrowth: null }, "first timeout has no baseline");
+  writeFileSync(transcript, "a".repeat(25));
+  assert.deepEqual(waitProgress(state, "lead", "cprogress", "sub-p", transcript), { sessionBytes: 25, sessionGrowth: 15 });
+  assert.deepEqual(waitProgress(state, "lead", "cprogress", "sub-p", transcript), { sessionBytes: 25, sessionGrowth: 0 }, "no growth is a stall window");
+  assert.deepEqual(waitProgress(state, "owner", "cprogress", "sub-p", transcript), { sessionBytes: 25, sessionGrowth: null }, "each caller keeps its own baseline");
+  assert.deepEqual(waitProgress(state, "lead", "cprogress", "sub-p", null), { sessionBytes: null, sessionGrowth: null }, "unknown transcript reports nulls");
+  assert.deepEqual(waitProgress(state, "lead", "cdir", "sub-d", state), { sessionBytes: null, sessionGrowth: null }, "a directory is not a session file");
+  assert.deepEqual(waitProgress(state, "lead", "cprogress", "sub-p", transcript), { sessionBytes: 25, sessionGrowth: null }, "growth needs two known sizes");
   assert.equal(claudeResult.runtime, "claude");
   assert.equal(claudeResult.outcome, "completed");
   assert.equal(claudeResult.finalText, "planted review");
