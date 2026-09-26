@@ -4,11 +4,11 @@ import { Type, type Static } from "typebox";
 import { createServer, type Server, type Socket } from "node:net";
 import { randomUUID } from "node:crypto";
 import { appendFileSync, chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { extensionPath, herdrCommand, privateDirectory, startupConfig, type StartupConfig } from "./startup.ts";
 import { atomicWrite, errorText, ModelSchema, ThinkingSchema, parse, readIdentityRecord, readRecord, RequestSchema, request, SafeId, socketAlive, TaskSchema, type Identity, type Request, type Result, type Selection, type Task } from "./protocol.ts";
 import { ClaudeEffort, ClaudeModel, claudeCommand, defaultClaudeModel, interruptClaude, isClaudeWorker, listClaude, readClaudeWorker, retireClaude, spawnClaude, unresolvedClaudeChild, waitClaude, type ClaudeHost, type ClaudeWorker } from "./claude.ts";
-import { assertNoRetirement, claimLaunch, LaunchClaimSchema, isOriginalProcessLive, PaneResponse, PlanRecordSchema, PlanSchema, planLines, processIdentity, recordedThinking, retirementFence, roleBrief, selectWorker, tabPane, verifySession, type Pane } from "./runtime.ts";
+import { assertNoRetirement, claimLaunch, LaunchClaimSchema, isOriginalProcessLive, PaneResponse, PlanRecordSchema, PlanSchema, planLines, processIdentity, readStartupFailure, recordedThinking, retirementFence, roleBrief, selectWorker, startupFailurePath, PaneSchema, tabPane, verifySession, workingDirectory, existingDirectory, type Pane } from "./runtime.ts";
 
 const toolNames = ["spawn_agent", "list_agents", "wait_agent", "followup_task", "interrupt_agent", "retire_agent", "update_plan"];
 const retirementResultFields = { kind: Type.Literal("retirement"), workerId: SafeId, generation: SafeId,
@@ -24,6 +24,7 @@ const RetirementSchema = Type.Union([
   Type.Object({ kind: Type.Literal("finished"), result: RetiredResultSchema }),
   Type.Object({ kind: Type.Literal("incomplete"), result: IncompleteResultSchema, tabId: Type.String() }),
 ]);
+type ProcessRecord = { pid: number; pidBirth: string };
 const normalTools = ["read", "grep", "find", "ls", "bash", "edit", "write", ...toolNames];
 const idSchema = Type.String({ pattern: "^[a-zA-Z0-9_-]{1,64}$" });
 const targetFields = { agent_id: idSchema, submission_id: idSchema };
@@ -43,12 +44,24 @@ export default function (pi: ExtensionAPI) {
       await runtime?.cleanup().catch(() => {});
       ctx.ui.notify(`Herdr adapter disabled: ${errorText(error)}`, "error");
       if (env.DS_HERDR_WORKER_ID && env.DS_HERDR_WORKER_ID !== "lead") {
+        recordStartupFailure(env, error);
         ctx.shutdown();
         throw error;
       }
     }
   });
   pi.on("session_shutdown", async () => { await runtime?.cleanup(); });
+}
+
+// Best effort: the launcher still has Herdr's readiness timeout when this record cannot be written.
+function recordStartupFailure(env: NodeJS.ProcessEnv, error: unknown) {
+  try {
+    const { DS_HERDR_STATE_DIR: stateDir, DS_HERDR_LAUNCH_ID: launchId, DS_HERDR_WORKER_ID: workerId } = env;
+    const birth = processIdentity(process.pid);
+    if (!stateDir || !isAbsolute(stateDir) || !launchId || !workerId || !birth) return;
+    atomicWrite(startupFailurePath(stateDir, launchId), { launchId, workerId: parse(SafeId, workerId),
+      error: errorText(error).slice(0, 2000), pid: process.pid, pidBirth: birth.birth });
+  } catch {}
 }
 
 function createRuntime(pi: ExtensionAPI, config: StartupConfig) {
@@ -288,7 +301,7 @@ function createRuntime(pi: ExtensionAPI, config: StartupConfig) {
   }
   async function startup(ctx: ExtensionContext, reason: SessionStartEvent["reason"]) {
     context = ctx;
-    if (resolve(ctx.cwd) !== resolve(cwd)) throw new Error("Worker cwd mismatch");
+    if (!config.automatic && workingDirectory(ctx.cwd) !== workingDirectory(cwd)) throw new Error(`Worker cwd mismatch: Pi runs in ${ctx.cwd}, launch assigned ${cwd}`);
     const sessionPath = ctx.sessionManager.getSessionFile();
     if (!sessionPath) throw new Error("Explicit persistent Pi session required");
     privateDirectory(stateDir);
@@ -595,7 +608,7 @@ function createRuntime(pi: ExtensionAPI, config: StartupConfig) {
       assertNoRetirement(stateDir, spec.parent ?? spec.childId);
       signal?.throwIfAborted();
       nativeStartAttempted = true;
-      await herdr(["agent", "start", `${spec.childId}-${launchId.slice(0, 8)}`, "--kind", "pi", "--pane", pane.pane_id, "--timeout", "25000", "--", ...piArgs]);
+      await startNative(["agent", "start", `${spec.childId}-${launchId.slice(0, 8)}`, "--kind", "pi", "--pane", pane.pane_id, "--timeout", "25000", "--", ...piArgs], launchId, spec.childId);
       signal?.throwIfAborted();
       const target = await live(owned(spec.childId), signal);
       if (target.paneId !== pane.pane_id || target.terminalId !== pane.terminal_id || target.piSessionPath !== spec.sessionPath ||
@@ -609,10 +622,19 @@ function createRuntime(pi: ExtensionAPI, config: StartupConfig) {
       return result;
     } catch (error) {
       let cleanup = cleanupProven ? "no pane/process creation attempted" : "uncertain: no exact created pane receipt; inspect operation and private workspace";
+      let failure: ReturnType<typeof readStartupFailure>;
+      let rejected = "";
+      try { failure = nativeStartAttempted ? readStartupFailure(stateDir, launchId, spec.childId) : undefined; }
+      catch (failureError) { rejected = `; startup failure record rejected: ${errorText(failureError)}`; }
+      if (failure) error = new Error(`Worker startup failed: ${failure.error}`);
+      let processes: ProcessRecord[] | undefined;
       if (pane) {
         try {
           const found = parse(PaneResponse, await herdr(["pane", "get", pane.pane_id])).result.pane;
           if (found.terminal_id !== pane.terminal_id || found.workspace_id !== workspaceId || found.tab_id !== pane.tab_id) throw new Error("Pane identity changed; cleanup refused");
+          // Let a failed child finish its own shutdown so closing the pane cannot cut its session write short.
+          if (failure) await exited([failure], 3000);
+          if (nativeStartAttempted) processes = await paneProcesses(pane.pane_id);
           await herdr(["pane", "close", pane.pane_id]);
           cleanupProven = !nativeStartAttempted;
           if (existsSync(identityPath(spec.childId))) {
@@ -625,15 +647,45 @@ function createRuntime(pi: ExtensionAPI, config: StartupConfig) {
               cleanupProven = true;
             }
           }
+          // Without an identity, the child's failure record or the pane's processes before the close are the process proof.
+          if (!cleanupProven && (failure || processes)) cleanupProven = await exited([...(failure ? [failure] : []), ...(processes ?? [])], 2000);
           cleanup = cleanupProven ? "exact newly-created pane closed; process cleanup proven"
             : "exact newly-created pane closed; native process identity unconfirmed, launch claim retained";
         } catch (cleanupError) { cleanup = `uncertain: ${errorText(cleanupError)}`; }
       }
-      save({ kind: "failed", error: errorText(error), cleanup });
+      cleanup += rejected;
+      save({ kind: "failed", error: errorText(error), cleanup, processes: processes ?? null });
       throw new Error(`Launch ${spec.childId} failed: ${errorText(error)}. Cleanup ${cleanup}. Durable receipt ${receiptPath}`);
     } finally {
       if (identityConfirmed || cleanupProven) claim.release();
     }
+  }
+  // Every process that was in the pane, with its birth, so a later check proves the same process dead.
+  async function paneProcesses(paneId: string): Promise<ProcessRecord[] | undefined> {
+    try {
+      const info = parse(paneProcessSchema, await herdr(["pane", "process-info", "--pane", paneId])).result.process_info;
+      if (info.pane_id !== paneId || !info.foreground_processes?.length) return undefined;
+      const pids = new Set([...info.foreground_processes.map(p => p.pid), ...(info.shell_pid ? [info.shell_pid] : [])]);
+      return [...pids].flatMap(pid => { const found = processIdentity(pid); return found ? [{ pid, pidBirth: found.birth }] : []; });
+    } catch { return undefined; }
+  }
+  async function exited(processes: ProcessRecord[], timeoutMs: number): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    while (processes.some(p => isOriginalProcessLive(p)) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 100));
+    return !processes.some(p => isOriginalProcessLive(p));
+  }
+  // Herdr waits out its readiness timeout for a child that already exited. The child's failure record ends the wait.
+  async function startNative(args: string[], launchId: string, childId: string) {
+    const stop = new AbortController();
+    const failed = (async () => {
+      while (!stop.signal.aborted) {
+        if (readStartupFailure(stateDir, launchId, childId)) return "failed";
+        await new Promise((resolve) => setTimeout(resolve, 200));
+      }
+    })();
+    try {
+      if (await Promise.race([herdr(args, stop.signal).then(() => "ready"), failed]) === "failed") throw new Error("Worker startup failed");
+    } finally { stop.abort(); }
   }
   const paneListSchema = Type.Object({ result: Type.Object({ panes: Type.Array(Type.Object({
     pane_id: Type.String(), workspace_id: Type.String(), terminal_id: Type.String(), tab_id: Type.String(),
@@ -894,6 +946,48 @@ function createRuntime(pi: ExtensionAPI, config: StartupConfig) {
       return result;
     } finally { release(); }
   }
+  const launchReceiptSchema = Type.Object({ launchId: SafeId, workerId: SafeId, pane: Type.Union([PaneSchema, Type.Null()]),
+    data: Type.Object({ kind: Type.String(), processes: Type.Optional(Type.Union([Type.Array(Type.Object({ pid: Type.Integer(), pidBirth: Type.String() })), Type.Null()])) }) });
+  // A fresh child that exited before registering leaves only its launch claim, which would block its ancestors' retirement.
+  async function retireUnstarted(id: string, signal?: AbortSignal) {
+    current();
+    const claimDir = join(stateDir, "locks", `launch-${parse(SafeId, id)}`);
+    if (!existsSync(claimDir)) throw new Error("No worker identity or launch claim for this ID");
+    const claim = readRecord(LaunchClaimSchema, join(claimDir, "claim.json"));
+    if (claim.workerId !== id || claim.previousGeneration !== null) throw new Error("Launch claim is not a fresh launch of this worker");
+    if (!ownsClaudeParent(claim.callerId)) throw new Error("Target is not this caller's descendant");
+    const receiptPath = join(stateDir, "operations", `launch-${claim.launchId}.json`);
+    const receipt = readRecord(launchReceiptSchema, receiptPath);
+    if (receipt.launchId !== claim.launchId || receipt.workerId !== id) throw new Error("Launch receipt mismatch");
+    if (receipt.data.kind !== "failed") throw new Error(`Launch not finished; operator inspection required: ${receiptPath}`);
+    const launched = receipt.pane;
+    if (!launched) throw new Error(`Launch pane unknown; operator inspection required: ${receiptPath}`);
+    const failure = readStartupFailure(stateDir, claim.launchId, id);
+    const processes = [...(failure ? [failure] : []), ...(receipt.data.processes ?? [])];
+    if (!processes.length) throw new Error(`No recorded process for this launch; operator inspection required: ${receiptPath}`);
+    if (processes.some(p => isOriginalProcessLive(p))) throw new Error("Launched process still live; retirement refused");
+    const panes = parse(paneListSchema, await herdr(["pane", "list"], signal)).result.panes;
+    const open = panes.find(p => p.pane_id === launched.pane_id && p.terminal_id === launched.terminal_id);
+    if (open) throw new Error(`Launch pane ${launched.pane_id} still open; close it or inspect ${receiptPath}`);
+    if (panes.some(p => p.pane_id === launched.pane_id || p.terminal_id === launched.terminal_id))
+      throw new Error(`Launch pane ${launched.pane_id} or its terminal is ambiguous in Herdr; operator inspection required: ${receiptPath}`);
+    signal?.throwIfAborted();
+    if (existsSync(identityPath(id))) throw new Error("Worker registered during retirement; use its identity");
+    // The rename is the single commit point. A concurrent retirer or the launcher's own release finds nothing to take.
+    const taken = join(stateDir, "locks", `retired-launch-${id}-${claim.launchId}`);
+    try { renameSync(claimDir, taken); }
+    catch (error) {
+      if (error instanceof Error && "code" in error && error.code === "ENOENT") throw new Error("Launch claim already released");
+      throw error;
+    }
+    if (readRecord(LaunchClaimSchema, join(taken, "claim.json")).launchId !== claim.launchId) throw new Error(`Launch claim changed; inspect ${taken}`);
+    const evidencePath = join(stateDir, "operations", `retire-${id}-launch-${claim.launchId}.json`);
+    const result = { kind: "retirement", workerId: id, launchId: claim.launchId, state: "retired",
+      reason: "Launch never registered a worker. Its recorded processes are dead, its exact pane is gone, and its launch claim is released.", evidencePath };
+    atomicWrite(evidencePath, { claim, pane: launched, processes, result });
+    rmSync(taken, { recursive: true });
+    return result;
+  }
   function trackedRetirement(target: Identity, signal?: AbortSignal) {
     const pending = retireAgent(target, signal);
     retirements.add(pending);
@@ -967,11 +1061,11 @@ function createRuntime(pi: ExtensionAPI, config: StartupConfig) {
         assertNoRetirement(stateDir, workerId);
         const effort = parse(ClaudeEffort, params.thinking);
         const model = parse(ClaudeModel, params.model?.id ?? defaultClaudeModel);
-        return toolResult(await tracked(launches, spawnClaude(claudeHost, { role: params.role, cwd: resolve(ctx.cwd, params.cwd ?? ctx.cwd), task: params.task, model, effort }, signal)));
+        return toolResult(await tracked(launches, spawnClaude(claudeHost, { role: params.role, cwd: existingDirectory(resolve(ctx.cwd, params.cwd ?? ctx.cwd)), task: params.task, model, effort }, signal)));
       }
       const selection = selectWorker(ctx, { model: params.model ?? ctx.model ?? null, thinking: params.thinking });
       const childId = `w${randomUUID().replaceAll("-", "").slice(0, 20)}`;
-      return toolResult(await launch({ kind: "fresh", selection, childId, parent: workerId, childRole: params.role, childCwd: resolve(ctx.cwd, params.cwd ?? ctx.cwd),
+      return toolResult(await launch({ kind: "fresh", selection, childId, parent: workerId, childRole: params.role, childCwd: workingDirectory(resolve(ctx.cwd, params.cwd ?? ctx.cwd)),
         sessionPath: join(stateDir, "sessions", `${childId}.jsonl`), task: params.task }, ctx, signal));
     },
   });
@@ -1020,18 +1114,20 @@ function createRuntime(pi: ExtensionAPI, config: StartupConfig) {
         return toolResult(await submitTask(effective, params.task, signal));
       }
       await proveDead(target);
+      workingDirectory(target.cwd);
       return toolResult(await launch({ kind: "resume", childId: target.workerId, parent: target.parentId, childRole: target.role, childCwd: target.cwd,
         sessionPath: target.piSessionPath, task: params.task, previous: target }, ctx, signal));
     },
   });
   pi.registerTool({
-    name: "retire_agent", label: "Retire agent", description: "Retire one idle descendant after native shutdown and original process/socket death proof, then close only its exact owned pane. Refuses active work, unresolved launches, and live or uncertain descendants. An incomplete outcome retains a durable fence; retry the same agent_id for safe cleanup. Completed results and native conversation survive for cold follow-up.",
+    name: "retire_agent", label: "Retire agent", description: "Retire one idle descendant after native shutdown and original process/socket death proof, then close only its exact owned pane. Refuses active work, unresolved launches, and live or uncertain descendants. An incomplete outcome retains a durable fence; retry the same agent_id for safe cleanup. Completed results and native conversation survive for cold follow-up. A fresh child that never started retires once its launch failed and its exact pane is gone.",
     parameters: Type.Object({ agent_id: idSchema }),
     async execute(_id, params, signal) {
       if (isClaudeWorker(stateDir, params.agent_id)) {
         ownedClaude(params.agent_id);
         return toolResult(await tracked(retirements, retireClaude(claudeHost, params.agent_id)));
       }
+      if (!existsSync(identityPath(params.agent_id))) return toolResult(await tracked(retirements, retireUnstarted(params.agent_id, signal)));
       return toolResult(await trackedRetirement(owned(params.agent_id), signal));
     },
   });

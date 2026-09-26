@@ -125,6 +125,12 @@ Historical settled or unavailable results remain readable with their original ta
 
 Failed or cancelled spawn attempts retain a launch receipt. Creation commands finish within their CLI timeout even if the tool aborts, so the adapter can capture exact created identities. Cleanup verifies workspace, tab, and terminal before closing the new pane. Missing receipts or uncertain cleanup remain explicit failures for operator inspection. Successful completed conversations are never closed automatically. The caller releases the launch claim only after live native identity confirmation or proven cleanup. A closed pane without a known native process identity is insufficient cleanup proof after `agent start` was attempted. The claim then remains for operator reconciliation. No automatic retry or stale-claim removal occurs.
 
+A child whose own startup fails writes `operations/startup-failed-<launchId>.json` with its error, PID, and birth before it requests shutdown. The caller polls for that record while `agent start` waits and stops waiting as soon as it appears, so the launch fails in about a second with the child's reason instead of Herdr's readiness timeout. The caller gives that process up to three seconds to exit before it closes the pane.
+
+Before closing a pane after `agent start` was attempted, the caller records the pane's shell and foreground processes with their births in the receipt's `processes`. With no identity for the new pane, the failure record and those processes are the process proof. Once all of them are dead, the caller releases the claim. Otherwise the claim stays.
+
+`retire_agent` also accepts a fresh worker that never registered an identity. It requires an owned fresh launch claim, a `failed` launch receipt with its exact pane, at least one recorded process, all recorded processes dead, and neither that pane nor its terminal in `pane list`. Renaming the claim directory is the single commit point, so a concurrent retirer or the caller's own release finds nothing to take. It records `operations/retire-<workerId>-launch-<launchId>.json`. A late child cannot register afterwards, because startup requires the claim.
+
 Native shutdown first stops admission and waits for outstanding bounded launch operations to finish or clean up. It marks its active task unavailable and releases only its own Herdr report source. Socket and owned-lock cleanup runs in `finally` even if the release command fails. Shutdown cleanup is idempotent.
 
 ### Ordinary lead lifecycle
@@ -201,7 +207,7 @@ The adapter supplies internal child variables through `tab create --env`:
 - `DS_HERDR_STATE_DIR` and `DS_HERDR_SOCKET_DIR`, the shared private durable and socket directories.
 - `DS_HERDR_SESSION`, the captured server name, empty for the default server. The adapter also sets `HERDR_SESSION` and `HERDR_SESSION_NAME` to this value.
 - `DS_HERDR_WORKER_ID`, `DS_HERDR_ROLE`, and `DS_HERDR_PARENT_ID`.
-- `DS_HERDR_WORKSPACE`, the absolute child cwd, and `DS_HERDR_WORKSPACE_ID`.
+- `DS_HERDR_WORKSPACE`, the absolute child cwd, and `DS_HERDR_WORKSPACE_ID`. Spawn canonicalises the cwd and refuses a missing directory before any claim or tab. The child compares canonical paths, because Pi reports the real directory and macOS `/tmp` is a symlink.
 - `DS_HERDR_RESTART_GENERATION`, empty for a fresh child.
 - `DS_HERDR_LAUNCH_ID`, matching the caller's held launch claim.
 
