@@ -95,6 +95,10 @@ else {
     log({ type: "assistant", message: { content: [{ type: "text", text: "final" }] } });
     turnEnd("final report");
   }
+  else if (scenario === "idleend") {
+    use("ti1", "Bash", { command: "sleep 9999", description: "idle sleep", run_in_background: true }); result("ti1", { backgroundTaskId: "bi1" });
+    turnEnd("waiting");
+  }
   else if (scenario === "unreadable") { turnEnd("interim"); require("node:fs").rmSync(transcript); }
   else if (scenario === "monitor") {
     use("tm1", "Monitor", { command: "tail -f log", description: "watch the log", timeout_ms: 4000 }); result("tm1", { taskId: "bm1" });
@@ -287,6 +291,7 @@ try {
   onClose = undefined;
   assert.equal(raced.outcome, "completed");
   assert.equal(raced.finalText, "finished first");
+  assert.equal(readClaudeWorker(stateDir, racing.workerId).interrupting, false, "a result settled during the close clears the interrupt flag");
 
   // A wait that observes the pane mid-interrupt does not record the close as a lost pane.
   const contested = await spawnClaude(host, spec("SCENARIO:hang"));
@@ -382,6 +387,25 @@ try {
   const lostPaneResult = await waitClaude(host, lostPane.workerId, lostPane.submissionId, 12000);
   assert.equal(lostPaneResult.kind, "unavailable");
   assert.match(lostPaneResult.reason, /deferred work pending: background long sleep/);
+
+  // Closing an idle worker's pane ends its session cleanly; that SessionEnd is the interrupt's effect, not a lost result.
+  const idle = await spawnClaude(host, spec(`SCENARIO:idleend TRANSCRIPT:${tpath("idleend")}`));
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  assert.deepEqual((await waitClaude(host, idle.workerId, idle.submissionId, 300)).pending.map((item) => item.kind), ["background"]);
+  onClose = (paneId) => {
+    if (paneId !== paneOf(idle.workerId)) return;
+    writeFileSync(join(stateDir, "claude", idle.workerId, "hooks", "SessionEnd-9999999999-1.json"), JSON.stringify({ session_id: "s1", reason: "other" }));
+  };
+  const idleInterrupt = await interruptClaude(host, idle.workerId, idle.submissionId);
+  onClose = undefined;
+  assert.equal(idleInterrupt.outcome, "interrupted", "a SessionEnd caused by the interrupt settles interrupted");
+  assert.equal(readClaudeWorker(stateDir, idle.workerId).interrupting, false);
+  // Without an interrupt, the same SessionEnd is still a session that ended without a result.
+  const ended2 = await spawnClaude(host, spec(`SCENARIO:idleend TRANSCRIPT:${tpath("idleend2")}`));
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  writeFileSync(join(stateDir, "claude", ended2.workerId, "hooks", "SessionEnd-9999999999-2.json"), JSON.stringify({ session_id: "s1", reason: "other" }));
+  assert.equal((await waitClaude(host, ended2.workerId, ended2.submissionId, 10000)).kind, "unavailable");
+  await interruptClaude(host, ended2.workerId, ended2.submissionId).catch(() => {});
 
   // A Stop whose transcript cannot be read proves nothing: it never settles, and a lost pane says why.
   const unreadable = await spawnClaude(host, spec(`SCENARIO:unreadable TRANSCRIPT:${tpath("unreadable")}`));
