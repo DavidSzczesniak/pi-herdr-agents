@@ -197,6 +197,7 @@ Claude workers cannot run this extension or serve a socket, so the caller owns a
 
 **Closing.**
 - Interrupt and retirement close only the exact pane with `pane close`, and only while a server-wide `pane list` shows the recorded pane, terminal, workspace, and tab. They then verify through the same listing that the pane is absent.
+- Closing an idle worker's pane makes Claude exit cleanly and fire `SessionEnd`. A `SessionEnd` observed while the interrupt intent is recorded settles `interrupted`, and a `Stop` result or `StopFailure` that landed first still wins. Every settlement clears the intent.
 - An interrupt records its intent before closing. A pane found absent with that intent, and no terminal evidence, settles `interrupted`, whether the interrupter is still running or died between closing and recording.
 - An absent pane counts as closed. Retirement refuses an active task.
 - Launches, interrupts, and retirements are tracked with Pi launches and retirements, so session shutdown waits for them.

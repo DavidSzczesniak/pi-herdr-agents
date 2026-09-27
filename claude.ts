@@ -239,7 +239,8 @@ function settled(host: ClaudeHost, worker: ClaudeWorker, task: Partial<ClaudeTas
     writeFileSync(artifactPath, task.finalText, { mode: 0o600 });
   }
   host.audit("claude_settlement", { claudeWorkerId: worker.workerId, kind: task.kind, outcome: task.outcome ?? null });
-  return { ...worker, task: { ...worker.task, ...task, artifactPath } };
+  // A settled task has no interrupt left in flight, whoever settled it.
+  return { ...worker, interrupting: false, task: { ...worker.task, ...task, artifactPath } };
 }
 function fromEvidence(host: ClaudeHost, worker: ClaudeWorker): ClaudeWorker | undefined {
   const { terminal } = evidence(host.stateDir, worker.workerId);
@@ -249,6 +250,8 @@ function fromEvidence(host: ClaudeHost, worker: ClaudeWorker): ClaudeWorker | un
     finalText: text(input.last_assistant_message) ?? "", transcriptPath: text(input.transcript_path) ?? worker.task.transcriptPath });
   if (terminal.event === "StopFailure") return settled(host, worker, { kind: "settled", outcome: "error",
     finalText: text(input.last_assistant_message) ?? "", reason: text(input.error) ?? JSON.stringify(input).slice(0, 2000) });
+  // Closing the pane for an interrupt ends an idle session cleanly, and that SessionEnd is the interrupt's own effect.
+  if (worker.interrupting) return settled(host, worker, { kind: "settled", outcome: "interrupted", reason: "Pane closed by interrupt_agent" });
   return settled(host, worker, { kind: "unavailable", reason: `Claude session ended without a result (${text(input.reason) ?? "unknown"})` });
 }
 function transition(host: ClaudeHost, id: string, update: (worker: ClaudeWorker) => ClaudeWorker | undefined): ClaudeWorker {
@@ -297,7 +300,7 @@ async function reconcile(host: ClaudeHost, id: string): Promise<ClaudeWorker> {
   return transition(host, id, (current) => current.task.kind !== "active" ? undefined : closedWithoutResult(host, current));
 }
 function closedWithoutResult(host: ClaudeHost, worker: ClaudeWorker): ClaudeWorker {
-  const closed = { ...worker, state: "closed" as const, interrupting: false };
+  const closed = { ...worker, state: "closed" as const };
   return fromEvidence(host, closed) ?? (worker.interrupting
     ? settled(host, closed, { kind: "settled", outcome: "interrupted", reason: "Pane closed by interrupt_agent" })
     : settled(host, closed, { kind: "unavailable", reason: pendingReason(host.stateDir, worker.workerId) }));
