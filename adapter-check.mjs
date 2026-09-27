@@ -8,7 +8,7 @@ import { once } from "node:events";
 import adapter from "./index.ts";
 import { atomicWrite, request } from "./protocol.ts";
 import { socketDirectory } from "./startup.ts";
-import { claimLaunch, isOriginalProcessLive, processIdentity, planLines, tabPane, takeClaim, verifySession, waitProgress } from "./runtime.ts";
+import { claimLaunch, isOriginalProcessLive, processIdentity, planLines, tabPane, takeClaim, verifySession, waitProgress, recordSubmittedSize, runningTools } from "./runtime.ts";
 
 const directory = mkdtempSync(join(tmpdir(), "piha-adapter-"));
 const state = directory;
@@ -386,7 +386,8 @@ try {
   const plantClaude = (id, parentId, stop) => {
     const dir = join(state, "claude", id);
     mkdirSync(join(dir, "hooks"), { recursive: true, mode: 0o700 });
-    writeFileSync(join(dir, "hooks", "UserPromptSubmit-1-1.json"), JSON.stringify({ session_id: "cs", transcript_path: "/tmp/claude.jsonl" }));
+    writeFileSync(join(dir, "hooks", "UserPromptSubmit-1-1.json"), JSON.stringify({ session_id: "cs", transcript_path: join(dir, "transcript.jsonl") }));
+    writeFileSync(join(dir, "transcript.jsonl"), stop ? JSON.stringify({ type: "system", subtype: "stop_hook_summary", hookInfos: [{ command: "'/bin/sh' '/x/claude-hook.sh' 'Stop' '/x'" }] }) + "\n" : "");
     if (stop) writeFileSync(join(dir, "hooks", "Stop-2-2.json"), JSON.stringify({ session_id: "cs", last_assistant_message: stop }));
     atomicWrite(join(dir, "worker.json"), { workerId: id, parentId, role: "review", runtime: "claude", model: "claude-opus-5-5", effort: "high",
       cwd: directory, workspaceId: "w1", tabId: `tab-w1:${id}`, paneId: `w1:${id}`, terminalId: `term-w1:${id}`, launchId: "claude-launch",
@@ -398,18 +399,31 @@ try {
   const tool = async (name, params) => JSON.parse((await revived.tools.get(name).execute(name, params, undefined, undefined, revived.ctx)).content[0].text);
   const claudeResult = await tool("wait_agent", { agent_id: "cowned", submission_id: "sub-cowned", timeout_ms: 120000 });
   assert.equal(claudeResult.sessionGrowth, undefined, "a settled wait carries no progress fields");
-  assert.match(revived.tools.get("wait_agent").description, /two consecutive timeouts with zero sessionGrowth suggest a stall/);
+  assert.match(revived.tools.get("wait_agent").description, /Two consecutive timeouts with zero sessionGrowth and empty pending mean a stall/);
   // Progress between timed-out waits, per caller and submission, persisted across runtimes. The Claude transcript is its session file.
   const transcript = join(state, "claude-progress.jsonl");
   writeFileSync(transcript, "a".repeat(10));
-  assert.deepEqual(waitProgress(state, "lead", "cprogress", "sub-p", transcript), { sessionBytes: 10, sessionGrowth: null }, "first timeout has no baseline");
+  assert.deepEqual(waitProgress(state, "lead", "cprogress", "sub-p", transcript), { sessionBytes: 10, sessionGrowth: null }, "no submission record leaves growth unknown");
   writeFileSync(transcript, "a".repeat(25));
   assert.deepEqual(waitProgress(state, "lead", "cprogress", "sub-p", transcript), { sessionBytes: 25, sessionGrowth: 15 });
   assert.deepEqual(waitProgress(state, "lead", "cprogress", "sub-p", transcript), { sessionBytes: 25, sessionGrowth: 0 }, "no growth is a stall window");
   assert.deepEqual(waitProgress(state, "owner", "cprogress", "sub-p", transcript), { sessionBytes: 25, sessionGrowth: null }, "each caller keeps its own baseline");
+  // A Pi tool call that started and has not ended is pending: a long command writes nothing to the session.
+  const auditLine = (generation, event, data) => JSON.stringify({ at: "2026-09-27T00:00:00.000Z", workerId: "piworker", generation, submissionId: null, event, data }) + "\n";
+  writeFileSync(join(state, "audit", "piworker.ndjson"), auditLine("g1", "tool_start", { toolName: "bash", toolCallId: "t1" }) +
+    auditLine("g1", "tool_end", { toolName: "bash", toolCallId: "t1", isError: false }) + auditLine("g1", "tool_start", { toolName: "bash", toolCallId: "t2" }) +
+    auditLine("g0", "tool_start", { toolName: "read", toolCallId: "t0" }) + "not json\n");
+  assert.deepEqual(runningTools(state, "piworker", "g1"), [{ kind: "tool", tool: "bash", id: "t2", startedAt: "2026-09-27T00:00:00.000Z" }]);
+  assert.deepEqual(runningTools(state, "no-audit", "g1"), [], "no audit log means nothing is known to be running");
   assert.deepEqual(waitProgress(state, "lead", "cprogress", "sub-p", null), { sessionBytes: null, sessionGrowth: null }, "unknown transcript reports nulls");
   assert.deepEqual(waitProgress(state, "lead", "cdir", "sub-d", state), { sessionBytes: null, sessionGrowth: null }, "a directory is not a session file");
   assert.deepEqual(waitProgress(state, "lead", "cprogress", "sub-p", transcript), { sessionBytes: 25, sessionGrowth: null }, "growth needs two known sizes");
+  // The first timeout measures from the size recorded at submission.
+  writeFileSync(transcript, "x".repeat(40));
+  recordSubmittedSize(state, "pfirst", "sub-f", transcript);
+  writeFileSync(transcript, "x".repeat(55));
+  assert.deepEqual(waitProgress(state, "lead", "pfirst", "sub-f", transcript), { sessionBytes: 55, sessionGrowth: 15 }, "first timeout measures from submission");
+  assert.deepEqual(waitProgress(state, "lead", "pfirst", "sub-f", transcript), { sessionBytes: 55, sessionGrowth: 0 }, "two timeouts judge a stall");
   assert.equal(claudeResult.runtime, "claude");
   assert.equal(claudeResult.outcome, "completed");
   assert.equal(claudeResult.finalText, "planted review");
