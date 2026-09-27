@@ -95,6 +95,27 @@ else {
     log({ type: "assistant", message: { content: [{ type: "text", text: "final" }] } });
     turnEnd("final report");
   }
+  else if (scenario === "midturn") {
+    // The #150 reviewer: a background job finishes while the turn is still running, so Claude receives its notification
+    // as a queued_command attachment inside that turn, then ends the turn with nothing pending.
+    const notice = "<task-notification>\\n<task-id>bm7</task-id>\\n<tool-use-id>tm7</tool-use-id>\\n<status>completed</status>\\n</task-notification>";
+    use("tm7", "Bash", { command: "npm run release -- prepare", run_in_background: true }); result("tm7", { backgroundTaskId: "bm7" });
+    log({ type: "queue-operation", operation: "enqueue", content: notice });
+    log({ type: "queue-operation", operation: "remove", content: notice });
+    log({ type: "attachment", attachment: { type: "queued_command", commandMode: "task-notification", prompt: notice } });
+    log({ type: "assistant", message: { content: [{ type: "text", text: "verdict posted" }] } });
+    turnEnd("verdict posted");
+  }
+  else if (scenario === "monitornext") {
+    // A mid-turn notification after the Stop starts the next turn, so the expired monitor no longer settles the earlier Stop.
+    use("tn1", "Monitor", { command: "tail -f log", description: "watch", timeout_ms: 300 }); result("tn1", { taskId: "bn1" });
+    turnEnd("interim answer");
+    log({ type: "attachment", attachment: { type: "queued_command", commandMode: "task-notification",
+      prompt: "<task-notification><task-id>bn1</task-id><tool-use-id>tn1</tool-use-id><event>line</event></task-notification>" } });
+    gate("go");
+    log({ type: "assistant", message: { content: [{ type: "text", text: "final" }] } });
+    turnEnd("final answer");
+  }
   else if (scenario === "idleend") {
     use("ti1", "Bash", { command: "sleep 9999", description: "idle sleep", run_in_background: true }); result("ti1", { backgroundTaskId: "bi1" });
     turnEnd("waiting");
@@ -369,6 +390,16 @@ try {
   writeFileSync(tpath("deferred") + ".go2", "");
   const heldFinal = await waitClaude(host, deferred.workerId, deferred.submissionId, 10000);
   assert.equal(heldFinal.finalText, "final report", "the task settles on the first Stop with nothing pending");
+  // A job that finishes mid-turn is delivered inside that turn, so the turn's Stop settles the task.
+  const midturn = await spawnClaude(host, spec(`SCENARIO:midturn TRANSCRIPT:${tpath("midturn")}`));
+  const midturnResult = await waitClaude(host, midturn.workerId, midturn.submissionId, 10000);
+  assert.equal(midturnResult.finalText, "verdict posted", JSON.stringify(midturnResult));
+  const next = await spawnClaude(host, spec(`SCENARIO:monitornext TRANSCRIPT:${tpath("monitornext")}`));
+  await new Promise((resolve) => setTimeout(resolve, 800));
+  const nextHeld = await waitClaude(host, next.workerId, next.submissionId, 400);
+  assert.equal(nextHeld.kind, "timeout", `an earlier Stop never settles once input for the next turn arrived: ${JSON.stringify(nextHeld)}`);
+  writeFileSync(tpath("monitornext") + ".go", "");
+  assert.equal((await waitClaude(host, next.workerId, next.submissionId, 10000)).finalText, "final answer");
   // A monitor counts as pending only until its timeout, since it can end without a marker.
   const monitored = await spawnClaude(host, spec(`SCENARIO:monitor TRANSCRIPT:${tpath("monitor")}`));
   await new Promise((resolve) => setTimeout(resolve, 300));
@@ -428,6 +459,16 @@ try {
   const enqueued = { type: "queue-operation", operation: "enqueue", content: "<task-notification><tool-use-id>j1</tool-use-id><status>completed</status></task-notification>" };
   assert.equal(pendingWork([...job, enqueued], 2, clock).length, 1, "an enqueued notification is not delivered yet, so it finishes nothing for this Stop");
   assert.equal(pendingWork([...job, notified("j1", 500)], 2, clock).length, 0, "a delivered notification finishes the job");
+  const midTurn = (prompt, commandMode = "task-notification") => ({ type: "attachment", attachment: { type: "queued_command", prompt, commandMode } });
+  const finished = "<task-notification><tool-use-id>j1</tool-use-id><status>completed</status></task-notification>";
+  assert.equal(pendingWork([...job, midTurn(finished)], 2, clock).length, 0, "a notification delivered mid-turn finishes the job");
+  assert.equal(pendingWork([...job, midTurn([{ type: "text", text: finished }])], 2, clock).length, 0, "a text-block prompt is read too");
+  assert.equal(pendingWork([...job, midTurn("<task-notification><tool-use-id>j1</tool-use-id></task-notification>")], 2, clock).length, 1,
+    "a streamed event without a status is not completion");
+  assert.equal(pendingWork([...job, midTurn("typed by the user: j1 done", "prompt")], 2, clock).length, 1, "a human message mid-turn finishes nothing");
+  assert.equal(pendingWork([...job, midTurn(finished, "prompt")], 2, clock).length, 1, "a human message quoting notification markup finishes nothing");
+  assert.equal(pendingWork([...job, { type: "attachment", attachment: { type: "prompt_snapshot", prompt: finished } }], 2, clock).length, 1,
+    "only a queued_command attachment is a delivery");
   const accented = "é".repeat(200);
   assert.equal(pendingWork([call("u1", "Bash", { command: accented, run_in_background: true }), reply("u1", { backgroundTaskId: "b2" })], 1, clock)[0].summary, accented.slice(0, 120));
 

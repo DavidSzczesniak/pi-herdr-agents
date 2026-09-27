@@ -117,7 +117,7 @@ function hookRecords(stateDir: string, id: string): HookRecord[] {
 // a monitor, a wake-up. Only a Stop with nothing pending settles the task, so the result is the final turn's.
 export type ClaudePending = { kind: "background" | "monitor" | "wakeup" | "task"; tool: string; id: string; summary: string; until: string | null };
 type TranscriptLine = { type?: unknown; subtype?: unknown; timestamp?: unknown; content?: unknown; hookInfos?: unknown;
-  message?: { content?: unknown }; toolUseResult?: Record<string, unknown> };
+  message?: { content?: unknown }; toolUseResult?: Record<string, unknown>; attachment?: { type?: unknown; prompt?: unknown; commandMode?: unknown } };
 // Monitor streams events and can end with no transcript marker, so it counts as pending only until its timeout.
 // Assumed default when the call names none: Claude Code's documented maximum.
 const monitorTimeoutMs = 3_600_000;
@@ -153,8 +153,8 @@ export function readTranscript(workerId: string, file: string | null): Transcrip
 }
 const summarize = (value: unknown) => (typeof value === "string" ? value : JSON.stringify(value ?? "")).replace(/\s+/g, " ").slice(0, 120);
 // Work started in lines[0..end] and not finished there. A time-bounded item also ends at `now`.
-// A task notification counts once delivered to the model as a user message. Claude may enqueue it while a turn is
-// ending, but delivers it only in a later turn, after that turn's summary line, so it never finishes an earlier Stop's work.
+// A task notification counts once delivered to the model: as a user message that starts a later turn, or, when it arrives
+// mid-turn, as a queued_command attachment inside that turn. The queue-operation copies record queueing, not delivery.
 export function pendingWork(lines: TranscriptLine[], end: number, now: number): ClaudePending[] {
   const calls = new Map<string, { name: string; input: Record<string, unknown> }>();
   const open = new Map<string, ClaudePending & { taskId?: string; deadline?: number }>();
@@ -189,7 +189,7 @@ export function pendingWork(lines: TranscriptLine[], end: number, now: number): 
         for (const [key, pending] of open) if (pending.taskId === target || key === target) open.delete(key);
       }
     }
-    const notices = line.type === "user" && typeof content === "string" ? content : "";
+    const notices = line.type === "user" && typeof content === "string" ? content : delivered(line);
     for (const notice of notices.match(/<task-notification>[\s\S]*?<\/task-notification>/g) ?? []) {
       // Streamed monitor events carry no status; a status marks the task finished, whatever its outcome.
       if (!/<status>[^<]+<\/status>/.test(notice)) continue;
@@ -201,6 +201,16 @@ export function pendingWork(lines: TranscriptLine[], end: number, now: number): 
   const live = [...open.values()].filter((pending) => pending.deadline === undefined || pending.deadline > now)
     .map(({ taskId: _, deadline: __, ...pending }) => pending);
   return wakeup ? [...live, wakeup] : live;
+}
+// Input Claude received mid-turn arrives as a queued_command attachment: a notification, or a message the user typed.
+const queuedInput = (line: TranscriptLine) => line.type === "attachment" && line.attachment?.type === "queued_command";
+// A notification Claude received mid-turn. Its prompt is a string or a list of text blocks. A human message can quote
+// notification markup, so only the task-notification command mode counts.
+function delivered(line: TranscriptLine): string {
+  if (!queuedInput(line) || line.attachment?.commandMode !== "task-notification") return "";
+  const prompt = line.attachment.prompt;
+  if (typeof prompt === "string") return prompt;
+  return Array.isArray(prompt) ? prompt.map((block) => typeof block?.text === "string" ? block.text : "").join("\n") : "";
 }
 // Transcript lines where our Stop hook ran, one per Stop record, in order. The transcript is one session's append-only log.
 function stopBoundaries(lines: TranscriptLine[]): number[] {
@@ -225,7 +235,7 @@ function evidence(stateDir: string, id: string, now = Date.now()) {
     // The hook runs before Claude records its summary line; decide on a later poll.
     if (!lines || boundary === undefined) return { accepted, terminal: undefined, pending, unproven: !lines };
     // Only the latest turn end sees the clock: a time-bounded item that expires later starts no new turn.
-    const latest = stops === boundaries.length && lines.slice(boundary + 1).every((line) => line.type !== "user" && line.type !== "assistant");
+    const latest = stops === boundaries.length && lines.slice(boundary + 1).every((line) => line.type !== "user" && line.type !== "assistant" && !queuedInput(line));
     pending = pendingWork(lines, boundary, latest ? now : Date.parse(String(lines[boundary]?.timestamp)) || now);
     if (!pending.length) return { accepted, terminal: record, pending };
   }
