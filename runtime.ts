@@ -67,7 +67,9 @@ const submittedPath = (stateDir: string, agentId: string, submissionId: string) 
 // The size at submission is the first timeout's baseline, so two timeouts are enough to judge a stall.
 // Best effort: without it the first timeout reports unknown growth, which never fails a launch.
 export function recordSubmittedSize(stateDir: string, agentId: string, submissionId: string, sessionPath: string | null) {
-  try { atomicWrite(submittedPath(stateDir, agentId, submissionId), { sessionBytes: sessionSize(sessionPath) }); } catch {}
+  // Claude can accept a task before it creates the transcript; a known path with no file yet is empty.
+  const sessionBytes = sessionPath && !existsSync(sessionPath) ? 0 : sessionSize(sessionPath);
+  try { atomicWrite(submittedPath(stateDir, agentId, submissionId), { sessionBytes }); } catch {}
 }
 export function waitProgress(stateDir: string, callerId: string, agentId: string, submissionId: string, sessionPath: string | null) {
   const sessionBytes = sessionSize(sessionPath);

@@ -423,6 +423,10 @@ try {
   recordSubmittedSize(state, "pfirst", "sub-f", transcript);
   writeFileSync(transcript, "x".repeat(55));
   assert.deepEqual(waitProgress(state, "lead", "pfirst", "sub-f", transcript), { sessionBytes: 55, sessionGrowth: 15 }, "first timeout measures from submission");
+  const late = join(state, "late-transcript.jsonl");
+  recordSubmittedSize(state, "clate", "sub-l", late);
+  writeFileSync(late, "x".repeat(12));
+  assert.deepEqual(waitProgress(state, "lead", "clate", "sub-l", late), { sessionBytes: 12, sessionGrowth: 12 }, "a transcript created after acceptance grows from zero");
   assert.deepEqual(waitProgress(state, "lead", "pfirst", "sub-f", transcript), { sessionBytes: 55, sessionGrowth: 0 }, "two timeouts judge a stall");
   assert.equal(claudeResult.runtime, "claude");
   assert.equal(claudeResult.outcome, "completed");
