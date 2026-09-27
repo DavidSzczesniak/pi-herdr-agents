@@ -2,9 +2,9 @@
 // executable parses options like the real CLI and fires the adapter's own hooks. No model calls.
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { claudeCommand, interruptClaude, listClaude, readClaudeWorker, retireClaude, spawnClaude, unresolvedClaudeChild, waitClaude } from "./claude.ts";
+import { claudeCommand, interruptClaude, listClaude, pendingWork, readClaudeWorker, readTranscript, retireClaude, spawnClaude, unresolvedClaudeChild, waitClaude } from "./claude.ts";
 
 const root = mkdtempSync("/tmp/piha-claude-");
 const stateDir = join(root, "state");
@@ -35,14 +35,31 @@ if (positional.length !== 1) throw new Error("expected exactly one prompt, got "
 if (options["--setting-sources"] !== "" || options["--strict-mcp-config"] !== true) throw new Error("session not isolated");
 if (options["--add-dir"]?.length !== 1 || options["--permission-mode"] !== "bypassPermissions") throw new Error("bad directory or permission options");
 if (options["--disallowed-tools"]?.join(",") !== "Agent,Task,AskUserQuestion") throw new Error("leaf tools not disabled");
+if (process.env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS !== undefined) throw new Error("background tasks must stay available");
 if (!/No human watches.*You cannot start other agents/.test(options["--append-system-prompt"])) throw new Error("worker brief missing");
 let prompt = positional[0];
 const pointer = /^Your complete task brief is in (\\S+)\\. /.exec(prompt);
 if (pointer) prompt = readFileSync(pointer[1], "utf8");
 const hooks = JSON.parse(readFileSync(options["--settings"], "utf8")).hooks;
-const fire = (event, input) => execSync(hooks[event][0].hooks[0].command, { input: JSON.stringify({ hook_event_name: event, session_id: "s1", transcript_path: "/tmp/t.jsonl", ...input }) });
+// Like Claude Code, every session has a transcript, and each own-session Stop is followed by its summary line.
+const transcript = /TRANSCRIPT:(\\S+)/.exec(prompt)?.[1] ?? require("node:path").join(options["--add-dir"][0], "transcript.jsonl");
+require("node:fs").appendFileSync(transcript, "");
+const summary = () => require("node:fs").appendFileSync(transcript, JSON.stringify({ timestamp: new Date().toISOString(), type: "system",
+  subtype: "stop_hook_summary", hookInfos: [{ command: hooks.Stop[0].hooks[0].command }] }) + "\\n");
+const fire = (event, input) => {
+  const body = { hook_event_name: event, session_id: "s1", transcript_path: transcript, ...input };
+  execSync(hooks[event][0].hooks[0].command, { input: JSON.stringify(body) });
+  if (event === "Stop" && body.session_id === "s1") summary();
+};
 const pause = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 const scenario = /SCENARIO:(\\w+)/.exec(prompt)?.[1];
+// Deferred-work scenarios write a real transcript in Claude Code's shape and gate each later turn on a file the test creates.
+const { appendFileSync, existsSync } = require("node:fs");
+const log = (entry) => appendFileSync(transcript, JSON.stringify({ timestamp: new Date().toISOString(), ...entry }) + "\\n");
+const use = (id, name, input) => log({ type: "assistant", message: { content: [{ type: "tool_use", id, name, input }] } });
+const result = (id, toolUseResult) => log({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: id, content: "ok" }] }, toolUseResult });
+const turnEnd = (message) => fire("Stop", { last_assistant_message: message });
+const gate = (name) => { while (!existsSync(transcript + "." + name)) pause(20); };
 if (scenario === "trust") { console.log("Quick safety check: Yes, I trust this folder"); setInterval(() => {}, 1000); }
 else {
   fire("UserPromptSubmit", { prompt });
@@ -57,10 +74,36 @@ else {
     const { spawn } = require("node:child_process");
     for (const message of ["overlap a", "overlap b"]) {
       const child = spawn("sh", ["-c", hooks.Stop[0].hooks[0].command]);
-      child.stdin.end(JSON.stringify({ session_id: "s1", last_assistant_message: message }));
+      child.stdin.end(JSON.stringify({ session_id: "s1", transcript_path: transcript, last_assistant_message: message }));
+      child.on("exit", summary);
     }
   }
   else if (scenario === "end") fire("SessionEnd", { reason: "logout" });
+  else if (scenario === "deferred") {
+    use("tu1", "Bash", { command: "npm test", run_in_background: true }); result("tu1", { backgroundTaskId: "bt1" });
+    use("tu2", "ScheduleWakeup", { delaySeconds: 1200, prompt: "check the log" }); result("tu2", { scheduledFor: Date.now() + 1200000 });
+    turnEnd("still running");
+    gate("go1");
+    log({ type: "queue-operation", operation: "enqueue", content: "<task-notification>\\n<task-id>bt1</task-id>\\n<tool-use-id>tu1</tool-use-id>\\n<status>completed</status>\\n</task-notification>" });
+    log({ type: "user", message: { content: "<task-notification>\\n<task-id>bt1</task-id>\\n<tool-use-id>tu1</tool-use-id>\\n<status>completed</status>\\n</task-notification>" } });
+    fire("UserPromptSubmit", { transcript_path: transcript, prompt: "notification" });
+    log({ type: "assistant", message: { content: [{ type: "text", text: "report" }] } });
+    turnEnd("report after test");
+    gate("go2");
+    log({ type: "system", subtype: "scheduled_task_fire", content: "Claude resuming /loop wakeup" });
+    fire("UserPromptSubmit", { transcript_path: transcript, prompt: "check the log" });
+    log({ type: "assistant", message: { content: [{ type: "text", text: "final" }] } });
+    turnEnd("final report");
+  }
+  else if (scenario === "unreadable") { turnEnd("interim"); require("node:fs").rmSync(transcript); }
+  else if (scenario === "monitor") {
+    use("tm1", "Monitor", { command: "tail -f log", description: "watch the log", timeout_ms: 4000 }); result("tm1", { taskId: "bm1" });
+    turnEnd("watching");
+  }
+  else if (scenario === "deferhang") {
+    use("th1", "Bash", { command: "sleep 9999", description: "long sleep", run_in_background: true }); result("th1", { backgroundTaskId: "bh1" });
+    turnEnd("waiting on sleep");
+  }
   setInterval(() => {}, 1000);
 }
 `);
@@ -119,16 +162,18 @@ const spec = (task, extra = {}) => ({ role: "review", cwd, task, model: "claude-
 const paneOf = (id) => readClaudeWorker(stateDir, id).paneId;
 
 try {
+  mkdirSync(join(host.stateDir, "operations"), { recursive: true });
   // Completion: acceptance from UserPromptSubmit, settlement from Stop, credentials and provider routing unset, isolated leaf session.
   const done = await spawnClaude(host, spec("Review this. SCENARIO:complete"));
   assert.equal(done.kind, "accepted");
   assert.equal(done.evidence, "user_prompt_submit");
+  assert.ok(existsSync(join(host.stateDir, "operations", `submitted-${done.workerId}-${done.submissionId}.json`)), "acceptance records the transcript baseline");
   const settled = await waitClaude(host, done.workerId, done.submissionId, 10000);
   assert.equal(settled.kind, "settled");
   assert.equal(settled.outcome, "completed");
   assert.match(settled.finalText, /^done model=claude-opus-5-5 effort=high apiKey=unset bedrock=unset /, "credentials and provider routing are unset");
   assert.equal(readFileSync(settled.artifactPath, "utf8"), settled.finalText);
-  assert.equal(settled.transcriptPath, "/tmp/t.jsonl");
+  assert.equal(settled.transcriptPath, join(stateDir, "claude", done.workerId, "transcript.jsonl"));
   assert.ok(Buffer.byteLength(herdrCalls.find((args) => args[1] === "run")[3]) < 1024, "Herdr types only a short exec line");
   await assert.rejects(waitClaude(host, done.workerId, "other-submission", 1000), /Unknown submission/);
 
@@ -217,7 +262,7 @@ try {
   // A running task times out without settling and cannot be retired.
   const hung = await spawnClaude(host, spec("SCENARIO:hang"));
   assert.deepEqual(await waitClaude(host, hung.workerId, hung.submissionId, 1500),
-    { kind: "timeout", runtime: "claude", workerId: hung.workerId, submissionId: hung.submissionId, active: true });
+    { kind: "timeout", runtime: "claude", workerId: hung.workerId, submissionId: hung.submissionId, active: true, pending: [] });
   await assert.rejects(retireClaude(host, hung.workerId), /active task/);
   assert.ok(unresolvedClaudeChild(stateDir, (parentId) => parentId === "lead"), "open or active Claude children block parent retirement");
   assert.equal(unresolvedClaudeChild(stateDir, (parentId) => parentId === "someone-else"), undefined);
@@ -235,6 +280,8 @@ try {
   onClose = (paneId) => {
     if (paneId !== paneOf(racing.workerId)) return;
     writeFileSync(join(stateDir, "claude", racing.workerId, "hooks", "Stop-1-1.json"), JSON.stringify({ session_id: "s1", last_assistant_message: "finished first" }));
+    appendFileSync(join(stateDir, "claude", racing.workerId, "transcript.jsonl"), JSON.stringify({ type: "system", subtype: "stop_hook_summary",
+      hookInfos: [{ command: "'/bin/sh' '/x/claude-hook.sh' 'Stop' '/x'" }] }) + "\n");
   };
   const raced = await interruptClaude(host, racing.workerId, racing.submissionId);
   onClose = undefined;
@@ -300,6 +347,79 @@ try {
   panes.delete("w2:p99");
   panes.set(movedPane.pane_id, movedPane);
 
+  // Deferred work: a Stop with a background job or wake-up pending keeps the task active and reports what is pending.
+  mkdirSync(join(root, "transcripts"));
+  const tpath = (name) => join(root, "transcripts", `${name}.jsonl`);
+  const deferred = await spawnClaude(host, spec(`SCENARIO:deferred TRANSCRIPT:${tpath("deferred")}`));
+  await new Promise((resolve) => setTimeout(resolve, 400));
+  const heldFirst = await waitClaude(host, deferred.workerId, deferred.submissionId, 1500);
+  assert.equal(heldFirst.kind, "timeout", "a Stop with deferred work pending does not settle");
+  assert.deepEqual(heldFirst.pending.map((item) => [item.kind, item.tool, item.id]), [["background", "Bash", "tu1"], ["wakeup", "ScheduleWakeup", "tu2"]]);
+  assert.ok(heldFirst.pending[1].until && heldFirst.pending[0].summary === "npm test");
+  writeFileSync(tpath("deferred") + ".go1", "");
+  await new Promise((resolve) => setTimeout(resolve, 400));
+  const heldSecond = await waitClaude(host, deferred.workerId, deferred.submissionId, 1500);
+  assert.equal(heldSecond.kind, "timeout", "the wake-up is still pending after the background job finishes");
+  assert.deepEqual(heldSecond.pending.map((item) => item.kind), ["wakeup"]);
+  writeFileSync(tpath("deferred") + ".go2", "");
+  const heldFinal = await waitClaude(host, deferred.workerId, deferred.submissionId, 10000);
+  assert.equal(heldFinal.finalText, "final report", "the task settles on the first Stop with nothing pending");
+  // A monitor counts as pending only until its timeout, since it can end without a marker.
+  const monitored = await spawnClaude(host, spec(`SCENARIO:monitor TRANSCRIPT:${tpath("monitor")}`));
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  const watching = await waitClaude(host, monitored.workerId, monitored.submissionId, 200);
+  assert.deepEqual(watching.pending?.map((item) => item.kind), ["monitor"], JSON.stringify(watching));
+  assert.equal((await waitClaude(host, monitored.workerId, monitored.submissionId, 10000)).finalText, "watching");
+  // Interrupting a worker that waits on deferred work is an interruption; a pane lost while waiting is unavailable.
+  const hanging = await spawnClaude(host, spec(`SCENARIO:deferhang TRANSCRIPT:${tpath("hang")}`));
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  assert.equal((await waitClaude(host, hanging.workerId, hanging.submissionId, 300)).kind, "timeout");
+  assert.equal((await interruptClaude(host, hanging.workerId, hanging.submissionId)).outcome, "interrupted");
+  const lostPane = await spawnClaude(host, spec(`SCENARIO:deferhang TRANSCRIPT:${tpath("lost")}`));
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  panes.get(paneOf(lostPane.workerId)).child.kill("SIGKILL");
+  panes.delete(paneOf(lostPane.workerId));
+  const lostPaneResult = await waitClaude(host, lostPane.workerId, lostPane.submissionId, 12000);
+  assert.equal(lostPaneResult.kind, "unavailable");
+  assert.match(lostPaneResult.reason, /deferred work pending: background long sleep/);
+
+  // A Stop whose transcript cannot be read proves nothing: it never settles, and a lost pane says why.
+  const unreadable = await spawnClaude(host, spec(`SCENARIO:unreadable TRANSCRIPT:${tpath("unreadable")}`));
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  assert.equal((await waitClaude(host, unreadable.workerId, unreadable.submissionId, 300)).kind, "timeout");
+  panes.get(paneOf(unreadable.workerId)).child.kill("SIGKILL");
+  panes.delete(paneOf(unreadable.workerId));
+  assert.match((await waitClaude(host, unreadable.workerId, unreadable.submissionId, 12000)).reason, /transcript could not be read/);
+  // Only a successful call starts or stops deferred work, and a completion after the Stop hook fired belongs to a later turn.
+  const clock = Date.now();
+  const at = (offset) => new Date(clock + offset).toISOString();
+  const call = (id, name, input, offset = 0) => ({ timestamp: at(offset), type: "assistant", message: { content: [{ type: "tool_use", id, name, input }] } });
+  const reply = (id, toolUseResult, isError = false, offset = 0) => ({ timestamp: at(offset), type: "user", toolUseResult,
+    message: { content: [{ type: "tool_result", tool_use_id: id, content: "x", is_error: isError }] } });
+  const notified = (id, offset) => ({ timestamp: at(offset), type: "user", message: { content: `<task-notification><tool-use-id>${id}</tool-use-id><status>completed</status></task-notification>` } });
+  assert.deepEqual(pendingWork([call("f1", "Bash", { command: "x", run_in_background: true }), reply("f1", {}, true)], 1, clock), [], "a failed background launch starts nothing");
+  const job = [call("j1", "Bash", { command: "npm test", run_in_background: true }), reply("j1", { backgroundTaskId: "b1" })];
+  assert.equal(pendingWork([...job, call("k1", "TaskStop", { task_id: "b1" }), reply("k1", {}, true)], 3, clock).length, 1, "a failed stop leaves the job pending");
+  assert.equal(pendingWork([...job, call("k2", "TaskStop", { task_id: "b1" }), reply("k2", {})], 3, clock).length, 0, "a successful stop ends it");
+  const enqueued = { type: "queue-operation", operation: "enqueue", content: "<task-notification><tool-use-id>j1</tool-use-id><status>completed</status></task-notification>" };
+  assert.equal(pendingWork([...job, enqueued], 2, clock).length, 1, "an enqueued notification is not delivered yet, so it finishes nothing for this Stop");
+  assert.equal(pendingWork([...job, notified("j1", 500)], 2, clock).length, 0, "a delivered notification finishes the job");
+  const accented = "é".repeat(200);
+  assert.equal(pendingWork([call("u1", "Bash", { command: accented, run_in_background: true }), reply("u1", { backgroundTaskId: "b2" })], 1, clock)[0].summary, accented.slice(0, 120));
+
+  // The reader parses only appended bytes, keeps a character split across reads, and breaks continuity per worker on a shrink.
+  const partialPath = tpath("partial");
+  const line = Buffer.from(JSON.stringify({ type: "user", message: { content: "é" } }) + "\n");
+  const cut = line.indexOf(Buffer.from("é")) + 1;
+  writeFileSync(partialPath, line.subarray(0, cut));
+  assert.deepEqual(readTranscript("wa", partialPath), []);
+  appendFileSync(partialPath, line.subarray(cut));
+  assert.equal(readTranscript("wa", partialPath)[0].message.content, "é", "a split multibyte character survives");
+  writeFileSync(partialPath, "");
+  assert.equal(readTranscript("wa", partialPath), "unreadable", "a shrunk transcript breaks continuity");
+  assert.equal(readTranscript("wa", partialPath), "unreadable", "and stays broken for that worker");
+  assert.deepEqual(readTranscript("wb", partialPath), [], "another worker's reader is unaffected");
+
   // Listing reports owned workers without final text; retiring the rest clears the parent-retirement block.
   const rows = await listClaude(host, (parentId) => parentId === "lead");
   assert.ok(rows.length >= 10 && rows.every((row) => row.kind === "claude_status" && row.task.finalText === ""));
@@ -315,7 +435,7 @@ try {
   assert.throws(() => claudeCommand({ PATH: "/nonexistent" }), /not found on PATH/);
   assert.throws(() => claudeCommand({ PI_HERDR_CLAUDE_BIN: "claude" }), /must be absolute/);
   assert.ok(audits.some((entry) => entry.event === "claude_launch") && audits.some((entry) => entry.event === "claude_settlement"));
-  console.log("PASS Claude runtime module: interrupt versus observer mid-close, abandoned interrupts, detachment during launch, overlapping hooks, concurrent observers, capped errors, detached-runtime refusal, uncertain creation blocking, moved panes, hook acceptance and first-terminal settlement, session correlation, option-safe and file-pointer briefs, isolated leaf flags, unset API keys, error and session-end outcomes, trust refusal, cancelled and lost tab creation, launch-line limit, exact-pane interrupt and retirement in split tabs, interrupt race, lost panes, parent-retirement blocking, listing, effort validation, executable resolution. Herdr stubbed; fake claude; no model calls.");
+  console.log("PASS Claude runtime module: interrupt versus observer mid-close, abandoned interrupts, detachment during launch, overlapping hooks, concurrent observers, capped errors, detached-runtime refusal, uncertain creation blocking, moved panes, hook acceptance and first-terminal settlement, deferred background jobs, wake-ups and monitors held open and reported, interrupt and pane loss while deferred, unreadable transcripts, failed deferred calls, undelivered notifications, session correlation, option-safe and file-pointer briefs, isolated leaf flags, unset API keys, error and session-end outcomes, trust refusal, cancelled and lost tab creation, launch-line limit, exact-pane interrupt and retirement in split tabs, interrupt race, lost panes, parent-retirement blocking, listing, effort validation, executable resolution. Herdr stubbed; fake claude; no model calls.");
 } finally {
   for (const pane of panes.values()) pane.child?.kill("SIGKILL");
   rmSync(root, { recursive: true, force: true });

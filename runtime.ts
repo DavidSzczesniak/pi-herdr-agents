@@ -57,14 +57,44 @@ export function takeClaim(stateDir: string, workerId: string, launchId: string, 
 }
 // Session growth between timed-out waits separates a working worker from a stalled one. Saved per caller so it survives a reload.
 const WaitProgressSchema = Type.Object({ sessionBytes: Type.Union([Type.Integer({ minimum: 0 }), Type.Null()]) });
-export function waitProgress(stateDir: string, callerId: string, agentId: string, submissionId: string, sessionPath: string | null) {
-  let sessionBytes: number | null = null;
+function sessionSize(sessionPath: string | null): number | null {
   // Only a regular file counts. A Claude hook supplies the transcript path.
-  try { if (sessionPath) { const stat = statSync(sessionPath); if (stat.isFile()) sessionBytes = stat.size; } } catch {}
+  try { if (sessionPath) { const stat = statSync(sessionPath); if (stat.isFile()) return stat.size; } } catch {}
+  return null;
+}
+const submittedPath = (stateDir: string, agentId: string, submissionId: string) =>
+  join(stateDir, "operations", `submitted-${parse(SafeId, agentId)}-${parse(SafeId, submissionId)}.json`);
+// The size at submission is the first timeout's baseline, so two timeouts are enough to judge a stall.
+// Best effort: without it the first timeout reports unknown growth, which never fails a launch.
+export function recordSubmittedSize(stateDir: string, agentId: string, submissionId: string, sessionPath: string | null) {
+  try { atomicWrite(submittedPath(stateDir, agentId, submissionId), { sessionBytes: sessionSize(sessionPath) }); } catch {}
+}
+export function waitProgress(stateDir: string, callerId: string, agentId: string, submissionId: string, sessionPath: string | null) {
+  const sessionBytes = sessionSize(sessionPath);
   const path = join(stateDir, "operations", `wait-${parse(SafeId, callerId)}-${parse(SafeId, agentId)}-${parse(SafeId, submissionId)}.json`);
-  const previous = existsSync(path) ? readRecord(WaitProgressSchema, path).sessionBytes : null;
+  const submitted = submittedPath(stateDir, agentId, submissionId);
+  const previous = existsSync(path) ? readRecord(WaitProgressSchema, path).sessionBytes
+    : existsSync(submitted) ? readRecord(WaitProgressSchema, submitted).sessionBytes : null;
   atomicWrite(path, { sessionBytes });
   return { sessionBytes, sessionGrowth: previous !== null && sessionBytes !== null ? sessionBytes - previous : null };
+}
+// Tool calls a Pi worker started and has not finished, from its own audit log. A long command writes nothing to the
+// session until it returns, so this separates a busy worker from a stalled one.
+const AuditToolSchema = Type.Object({ at: Type.String(), generation: Type.String(), event: Type.String(),
+  data: Type.Object({ toolName: Type.Optional(Type.String()), toolCallId: Type.Optional(Type.String()) }) });
+export function runningTools(stateDir: string, workerId: string, generation: string) {
+  const running = new Map<string, { kind: "tool"; tool: string; id: string; startedAt: string }>();
+  let raw = "";
+  try { raw = readFileSync(join(stateDir, "audit", `${parse(SafeId, workerId)}.ndjson`), "utf8"); } catch { return []; }
+  for (const line of raw.split("\n")) {
+    let event: Static<typeof AuditToolSchema>;
+    try { event = parse(AuditToolSchema, JSON.parse(line)); } catch { continue; }
+    const id = event.data.toolCallId;
+    if (event.generation !== generation || !id) continue;
+    if (event.event === "tool_start") running.set(id, { kind: "tool", tool: event.data.toolName ?? "unknown", id, startedAt: event.at });
+    if (event.event === "tool_end") running.delete(id);
+  }
+  return [...running.values()];
 }
 export function retirementFence(stateDir: string, workerId: string): string {
   return join(stateDir, "locks", `retire-${parse(SafeId, workerId)}`);

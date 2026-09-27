@@ -74,7 +74,7 @@ Child launches explicitly inherit the caller's effective Pi config directory, in
 
 `retire_agent({agent_id})` explicitly retires one idle descendant. Retire leaf workers before parents. It refuses active or queued work, unresolved launches, and live or unresolved descendants. Native shutdown acknowledgment is not success: the operation proves the original process and socket dead, checks the exact workspace, terminal, tab, and occupant, then closes only the owned pane or verifies its absence. Incomplete outcomes retain a durable fence and evidence path for safe cleanup retries. Retirement does not delete the native conversation, task results, model, thinking, plans, or artifacts. `followup_task` cold-resumes a completed retirement as the same worker and Pi conversation with a new generation and only a new submission. A fresh worker that never started, with no identity and only a failed launch claim, retires once its recorded processes are dead and its exact pane is gone. There is no automatic retirement.
 
-A task receipt requires a correlated native start event. Bounded waits do not cancel work. A timed-out `wait_agent` reports `sessionBytes` and `sessionGrowth`, the bytes the worker's session file grew since the same caller's previous timed-out wait. Two consecutive timeouts with zero growth suggest a stall. A long tool call also writes nothing, so check the worker's pane before interrupting. Interruption and cold continuation retain exact task, worker, process, model, and conversation identities. Ambiguous submissions are never automatically replayed. There are no adapter turn ceilings.
+A task receipt requires a correlated native start event. Bounded waits do not cancel work. A timed-out `wait_agent` reports `sessionBytes` and `sessionGrowth`, the bytes the worker's session file grew since the task was submitted, or since the same caller's previous timed-out wait. The timeout also reports `pending`: a Pi worker's tool calls still running, or a Claude worker's background commands, monitors, and wake-ups not yet finished. A long tool call writes nothing to the session, so growth alone cannot tell a busy worker from a stalled one. Two consecutive timeouts with zero growth and empty `pending` mean a stall. Interruption and cold continuation retain exact task, worker, process, model, and conversation identities. Ambiguous submissions are never automatically replayed. There are no adapter turn ceilings.
 
 ### Claude Code workers
 
@@ -86,11 +86,11 @@ A task receipt requires a correlated native start event. Bounded waits do not ca
     - `--strict-mcp-config` excludes MCP servers.
     - CLAUDE.md context and user skills still load, as Pi children load context files and skills.
   - API-key variables are unset so the session uses the Claude login.
-  - The worker has normal tools with `--permission-mode bypassPermissions`, the counterpart of Pi workers' normal tools. A read-only review is an assignment. Claude's own `Agent`, `Task`, and `AskUserQuestion` tools are disabled, and the worker gets the same "no human watches, stop and report" brief as Pi children.
+  - The worker has normal tools with `--permission-mode bypassPermissions`, the counterpart of Pi workers' normal tools. A read-only review is an assignment. Claude's own `Agent`, `Task`, and `AskUserQuestion` tools are disabled. Background commands, monitors, and wake-ups stay available: the task settles only at a turn end with none of them pending. The worker gets the same "no human watches, stop and report" brief as Pi children.
 - **Model and effort.** `model.id` names a Claude model, defaulting to `claude-opus-5-5`. `thinking` is Claude's effort: `low`, `medium`, `high`, `xhigh`, or `max`. Other levels are rejected before launch.
 - **Evidence.** Adapter hooks record it:
   - `UserPromptSubmit` is acceptance.
-  - The first `Stop` of that session completes with its final message.
+  - The first `Stop` of that session with no deferred work pending completes with its final message. Background commands, monitors, and wake-ups the worker started keep the task active until they finish.
   - `StopFailure` is an error.
   - `SessionEnd` without a result, or a pane that disappears without a result, is unavailable, unless an interrupt closed it, which makes it interrupted.
 - **Tools.** `wait_agent`, `list_agents`, `interrupt_agent`, and `retire_agent` work on the worker.

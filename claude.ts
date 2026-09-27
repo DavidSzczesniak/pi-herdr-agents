@@ -1,12 +1,13 @@
 import { randomUUID } from "node:crypto";
-import { accessSync, constants, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { accessSync, closeSync, constants, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
 import { Type, type Static } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { atomicWrite, errorText, parse, readRecord, Role, SafeId } from "./protocol.ts";
 import { privateDirectory } from "./startup.ts";
-import { roleBrief, tabPane, type Pane } from "./runtime.ts";
+import { recordSubmittedSize, roleBrief, tabPane, type Pane } from "./runtime.ts";
 
 // Claude Code workers cannot host this adapter, so the caller owns their whole state. They are one-shot leaf workers.
 export const ClaudeEffort = StringEnum(["low", "medium", "high", "xhigh", "max"] as const);
@@ -112,15 +113,124 @@ function hookRecords(stateDir: string, id: string): HookRecord[] {
       return { event: name.slice(0, name.indexOf("-")) as HookEvent, input: input as Record<string, unknown> };
     });
 }
-function evidence(stateDir: string, id: string) {
+// Claude fires Stop at every turn end, including a turn that ends waiting on work it deferred: a background command,
+// a monitor, a wake-up. Only a Stop with nothing pending settles the task, so the result is the final turn's.
+export type ClaudePending = { kind: "background" | "monitor" | "wakeup" | "task"; tool: string; id: string; summary: string; until: string | null };
+type TranscriptLine = { type?: unknown; subtype?: unknown; timestamp?: unknown; content?: unknown; hookInfos?: unknown;
+  message?: { content?: unknown }; toolUseResult?: Record<string, unknown> };
+// Monitor streams events and can end with no transcript marker, so it counts as pending only until its timeout.
+// Assumed default when the call names none: Claude Code's documented maximum.
+const monitorTimeoutMs = 3_600_000;
+// Deferred tools with no marker observed yet: pending until a task notification names them.
+const unprovenDeferredTools = new Set(["CronCreate", "Workflow", "RemoteTrigger"]);
+const stopTools = new Set(["TaskStop", "KillShell", "KillBash"]);
+// Claude appends to its transcript within a session. Parse only new bytes; a file that shrank or was replaced breaks
+// continuity, and nothing can be proven from it. State is per worker, so no other session's file can affect it.
+const transcripts = new Map<string, { ino: number; size: number; lines: TranscriptLine[]; partial: string; decoder: StringDecoder }>();
+const brokenTranscripts = new Set<string>();
+export function readTranscript(workerId: string, file: string | null): TranscriptLine[] | "unreadable" {
+  const path = file ? `${workerId}\0${file}` : "";
+  if (!file || brokenTranscripts.has(path)) return "unreadable";
+  let stat;
+  try { stat = statSync(file); } catch { return "unreadable"; }
+  const cached = transcripts.get(path);
+  if (cached && (cached.ino !== stat.ino || stat.size < cached.size)) { transcripts.delete(path); brokenTranscripts.add(path); return "unreadable"; }
+  const entry = cached ?? { ino: stat.ino, size: 0, lines: [], partial: "", decoder: new StringDecoder("utf8") };
+  if (stat.size > entry.size) {
+    let chunk: Buffer;
+    try {
+      const handle = openSync(file, "r");
+      try { chunk = Buffer.alloc(stat.size - entry.size); readSync(handle, chunk, 0, chunk.length, entry.size); } finally { closeSync(handle); }
+    } catch { return "unreadable"; }
+    // The decoder holds back a multibyte character split across reads.
+    const parts = (entry.partial + entry.decoder.write(chunk)).split("\n");
+    entry.partial = parts.pop() ?? "";
+    for (const part of parts) { try { const value: unknown = JSON.parse(part); if (value && typeof value === "object") entry.lines.push(value as TranscriptLine); } catch {} }
+    entry.size = stat.size;
+  }
+  transcripts.set(path, entry);
+  return entry.lines;
+}
+const summarize = (value: unknown) => (typeof value === "string" ? value : JSON.stringify(value ?? "")).replace(/\s+/g, " ").slice(0, 120);
+// Work started in lines[0..end] and not finished there. A time-bounded item also ends at `now`.
+// A task notification counts once delivered to the model as a user message. Claude may enqueue it while a turn is
+// ending, but delivers it only in a later turn, after that turn's summary line, so it never finishes an earlier Stop's work.
+export function pendingWork(lines: TranscriptLine[], end: number, now: number): ClaudePending[] {
+  const calls = new Map<string, { name: string; input: Record<string, unknown> }>();
+  const open = new Map<string, ClaudePending & { taskId?: string; deadline?: number }>();
+  let wakeup: ClaudePending | undefined;
+  for (const line of lines.slice(0, end + 1)) {
+    const content = line.message?.content;
+    const at = typeof line.timestamp === "string" ? Date.parse(line.timestamp) : NaN;
+    if (Array.isArray(content)) for (const block of content as Record<string, any>[]) {
+      if (block?.type === "tool_use") calls.set(String(block.id), { name: String(block.name), input: block.input ?? {} });
+      if (block?.type !== "tool_result" || block.is_error === true) continue;
+      // Only a call that succeeded started or stopped anything.
+      const id = String(block.tool_use_id);
+      const call = calls.get(id);
+      if (!call) continue;
+      const { name, input } = call;
+      const result = line.toolUseResult ?? {};
+      const item = { tool: name, id, until: null };
+      if (name === "ScheduleWakeup") {
+        if (input.stop === true) wakeup = undefined;
+        else if (typeof result.scheduledFor === "number") wakeup = { ...item, kind: "wakeup", summary: summarize(input.prompt), until: new Date(result.scheduledFor).toISOString() };
+      } else if (name === "Monitor" && typeof result.taskId === "string") {
+        const deadline = input.persistent === true ? undefined : (Number.isFinite(at) ? at : now) + (Number(input.timeout_ms) || monitorTimeoutMs);
+        open.set(id, { ...item, kind: "monitor", summary: summarize(input.description ?? input.command), taskId: result.taskId, deadline,
+          until: deadline === undefined ? null : new Date(deadline).toISOString() });
+      } else if (input.run_in_background === true && typeof result.backgroundTaskId === "string") {
+        open.set(id, { ...item, kind: "background", summary: summarize(input.description ?? input.command), taskId: result.backgroundTaskId });
+      } else if (unprovenDeferredTools.has(name)) {
+        const taskId = result.taskId ?? result.backgroundTaskId;
+        open.set(id, { ...item, kind: "task", summary: summarize(input), taskId: typeof taskId === "string" ? taskId : undefined });
+      } else if (stopTools.has(name)) {
+        const target = String(input.task_id ?? input.shell_id ?? input.bash_id ?? "");
+        for (const [key, pending] of open) if (pending.taskId === target || key === target) open.delete(key);
+      }
+    }
+    const notices = line.type === "user" && typeof content === "string" ? content : "";
+    for (const notice of notices.match(/<task-notification>[\s\S]*?<\/task-notification>/g) ?? []) {
+      // Streamed monitor events carry no status; a status marks the task finished, whatever its outcome.
+      if (!/<status>[^<]+<\/status>/.test(notice)) continue;
+      const ids = [...notice.matchAll(/<(?:tool-use-id|task-id)>([^<]+)<\/(?:tool-use-id|task-id)>/g)].map((match) => match[1]);
+      for (const [key, pending] of open) if (ids.includes(key) || (pending.taskId && ids.includes(pending.taskId))) open.delete(key);
+    }
+    if (line.type === "system" && line.subtype === "scheduled_task_fire") wakeup = undefined;
+  }
+  const live = [...open.values()].filter((pending) => pending.deadline === undefined || pending.deadline > now)
+    .map(({ taskId: _, deadline: __, ...pending }) => pending);
+  return wakeup ? [...live, wakeup] : live;
+}
+// Transcript lines where our Stop hook ran, one per Stop record, in order. The transcript is one session's append-only log.
+function stopBoundaries(lines: TranscriptLine[]): number[] {
+  return lines.flatMap((line, index) => line.type === "system" && line.subtype === "stop_hook_summary" &&
+    JSON.stringify(line.hookInfos ?? "").includes("claude-hook.sh' 'Stop'") ? [index] : []);
+}
+function evidence(stateDir: string, id: string, now = Date.now()) {
   const records = hookRecords(stateDir, id);
   const accepted = records.find((record) => record.event === "UserPromptSubmit")?.input;
   const session = accepted ? text(accepted.session_id) : null;
   // Session identity, not file order, ties a result to the task: equal write times can sort a Stop before its prompt.
-  const terminal = records.find((record) => record.event !== "UserPromptSubmit" && (!accepted || text(record.input.session_id) === session));
-  return { accepted, terminal };
+  const own = records.filter((record) => record.event !== "UserPromptSubmit" && (!accepted || text(record.input.session_id) === session));
+  // An unreadable transcript proves nothing, so no Stop settles until it can be read.
+  const read = readTranscript(id, accepted ? text(accepted.transcript_path) : null);
+  const lines = read === "unreadable" ? undefined : read;
+  const boundaries = lines ? stopBoundaries(lines) : [];
+  let stops = 0;
+  let pending: ClaudePending[] = [];
+  for (const record of own) {
+    if (record.event !== "Stop") return { accepted, terminal: record, pending: [] };
+    const boundary = boundaries[stops++];
+    // The hook runs before Claude records its summary line; decide on a later poll.
+    if (!lines || boundary === undefined) return { accepted, terminal: undefined, pending, unproven: !lines };
+    // Only the latest turn end sees the clock: a time-bounded item that expires later starts no new turn.
+    const latest = stops === boundaries.length && lines.slice(boundary + 1).every((line) => line.type !== "user" && line.type !== "assistant");
+    pending = pendingWork(lines, boundary, latest ? now : Date.parse(String(lines[boundary]?.timestamp)) || now);
+    if (!pending.length) return { accepted, terminal: record, pending };
+  }
+  return { accepted, terminal: undefined, pending: lines && accepted ? pendingWork(lines, lines.length - 1, now) : [], unproven: !lines && own.length > 0 };
 }
-
 function settled(host: ClaudeHost, worker: ClaudeWorker, task: Partial<ClaudeTask>): ClaudeWorker {
   if (task.reason) task = { ...task, reason: task.reason.slice(0, 4000) };
   let artifactPath: string | null = null;
@@ -190,9 +300,14 @@ function closedWithoutResult(host: ClaudeHost, worker: ClaudeWorker): ClaudeWork
   const closed = { ...worker, state: "closed" as const, interrupting: false };
   return fromEvidence(host, closed) ?? (worker.interrupting
     ? settled(host, closed, { kind: "settled", outcome: "interrupted", reason: "Pane closed by interrupt_agent" })
-    : settled(host, closed, { kind: "unavailable", reason: "Claude pane closed without a result" }));
+    : settled(host, closed, { kind: "unavailable", reason: pendingReason(host.stateDir, worker.workerId) }));
 }
 
+function pendingReason(stateDir: string, id: string) {
+  const { pending, unproven } = evidence(stateDir, id);
+  if (pending.length) return `Claude pane closed with deferred work pending: ${pending.map((item) => `${item.kind} ${item.summary}`).join("; ").slice(0, 1000)}`;
+  return unproven ? "Claude pane closed after a turn end whose transcript could not be read" : "Claude pane closed without a result";
+}
 export function publicClaudeTask(worker: ClaudeWorker) {
   const task = { ...worker.task };
   while (Buffer.byteLength(JSON.stringify(task)) > 45000 && task.finalText) task.finalText = task.finalText.slice(0, Math.floor(task.finalText.length * 0.8));
@@ -263,6 +378,7 @@ export async function spawnClaude(host: ClaudeHost, spec: { role: Static<typeof 
     }
     const session = { claudeSessionId: text(accepted.session_id), transcriptPath: text(accepted.transcript_path) };
     transition(host, workerId, (worker) => ({ ...worker, task: { ...worker.task, ...session } }));
+    recordSubmittedSize(host.stateDir, workerId, submissionId, session.transcriptPath);
     receipt("started");
     return { kind: "accepted" as const, evidence: "user_prompt_submit" as const, runtime: "claude" as const, workerId, submissionId,
       identity: { workerId, parentId: host.workerId, role: spec.role, paneId: pane.pane_id, model, effort } };
@@ -293,7 +409,8 @@ export async function waitClaude(host: ClaudeHost, id: string, submissionId: str
     signal?.throwIfAborted();
     worker = poll % 10 === 0 ? await reconcile(host, id) : observe(host, id);
   }
-  if (worker.task.kind === "active") return { kind: "timeout" as const, runtime: "claude" as const, workerId: id, submissionId, active: true };
+  if (worker.task.kind === "active") return { kind: "timeout" as const, runtime: "claude" as const, workerId: id, submissionId, active: true,
+    pending: evidence(host.stateDir, id).pending };
   return publicClaudeTask(worker);
 }
 

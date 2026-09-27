@@ -8,7 +8,7 @@ import { dirname, isAbsolute, join, resolve } from "node:path";
 import { extensionPath, herdrCommand, privateDirectory, startupConfig, type StartupConfig } from "./startup.ts";
 import { atomicWrite, errorText, ModelSchema, ThinkingSchema, parse, readIdentityRecord, readRecord, RequestSchema, request, SafeId, socketAlive, TaskSchema, type Identity, type Request, type Result, type Selection, type Task } from "./protocol.ts";
 import { ClaudeEffort, ClaudeModel, claudeCommand, defaultClaudeModel, interruptClaude, isClaudeWorker, listClaude, readClaudeWorker, retireClaude, spawnClaude, unresolvedClaudeChild, waitClaude, type ClaudeHost, type ClaudeWorker } from "./claude.ts";
-import { assertNoRetirement, claimLaunch, LaunchClaimSchema, isOriginalProcessLive, PaneResponse, PlanRecordSchema, PlanSchema, planLines, processIdentity, readStartupFailure, recordedThinking, retirementFence, roleBrief, selectWorker, waitProgress, startupFailurePath, takeClaim, unstartedRetirement, PaneSchema, tabPane, verifySession, workingDirectory, existingDirectory, type Pane } from "./runtime.ts";
+import { assertNoRetirement, claimLaunch, LaunchClaimSchema, isOriginalProcessLive, PaneResponse, PlanRecordSchema, PlanSchema, planLines, processIdentity, readStartupFailure, recordedThinking, retirementFence, roleBrief, selectWorker, waitProgress, runningTools, recordSubmittedSize, startupFailurePath, takeClaim, unstartedRetirement, PaneSchema, tabPane, verifySession, workingDirectory, existingDirectory, type Pane } from "./runtime.ts";
 
 const toolNames = ["spawn_agent", "list_agents", "wait_agent", "followup_task", "interrupt_agent", "retire_agent", "update_plan"];
 const retirementResultFields = { kind: Type.Literal("retirement"), workerId: SafeId, generation: SafeId,
@@ -535,6 +535,7 @@ function createRuntime(pi: ExtensionAPI, config: StartupConfig) {
     const receiptPath = join(stateDir, "operations", `${workerId}-${submissionId}.json`);
     const receipt = { workerId: target.workerId, generation: target.generation, submissionId, callerId: workerId, callerGeneration: generation };
     atomicWrite(receiptPath, { ...receipt, kind: "submitting" });
+    recordSubmittedSize(stateDir, target.workerId, submissionId, target.piSessionPath);
     try {
       const result = await call(target, { kind: "submit", submissionId, task }, signal);
       if (result.kind === "status" || result.kind === "retire_requested" || result.workerId !== target.workerId || result.generation !== target.generation || result.submissionId !== submissionId)
@@ -1109,7 +1110,7 @@ function createRuntime(pi: ExtensionAPI, config: StartupConfig) {
     },
   });
   pi.registerTool({
-    name: "wait_agent", label: "Wait for agent", description: "Wait for one exact submission to settle. Timeout leaves the worker active and reports sessionBytes and sessionGrowth since your previous timed-out wait; two consecutive timeouts with zero sessionGrowth suggest a stall, but a long tool call also writes nothing, so check the worker's pane before interrupting. ambiguous and unavailable are not completion; never replay them. Final text capped at 45 KiB with full artifact path; interrupted/error are distinct outcomes.",
+    name: "wait_agent", label: "Wait for agent", description: "Wait for one exact submission to settle. Timeout leaves the worker active and reports sessionBytes, sessionGrowth since submission or your previous timed-out wait, and pending: tool calls still running, or a Claude worker's deferred background jobs, monitors, and wake-ups. Two consecutive timeouts with zero sessionGrowth and empty pending mean a stall. ambiguous and unavailable are not completion; never replay them. Final text capped at 45 KiB with full artifact path; interrupted/error are distinct outcomes.",
     parameters: Type.Object({ ...targetFields, timeout_ms: Type.Integer({ minimum: 120000, maximum: 600000 }) }),
     async execute(_id, params, signal) {
       if (isClaudeWorker(stateDir, params.agent_id)) {
@@ -1119,7 +1120,8 @@ function createRuntime(pi: ExtensionAPI, config: StartupConfig) {
       }
       const target = owned(params.agent_id);
       const result = await call(target, { kind: "wait", submissionId: params.submission_id, timeoutMs: params.timeout_ms }, signal);
-      return toolResult(withProgress(result, params.agent_id, params.submission_id, target.piSessionPath));
+      const progress = withProgress(result, params.agent_id, params.submission_id, target.piSessionPath);
+      return toolResult(progress.kind === "timeout" ? { ...progress, pending: runningTools(stateDir, target.workerId, target.generation) } : progress);
     },
   });
   pi.registerTool({
