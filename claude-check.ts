@@ -496,11 +496,7 @@ try {
     JSON.stringify({ session_id: "s1", last_assistant_message }));
   const summary = () => append({ type: "system", subtype: "stop_hook_summary", hookInfos: [{ command: "'/bin/sh' '/x/claude-hook.sh' 'Stop' '/x'" }] });
   stop(1, "first turn");
-  assert.deepEqual(await waitRunning(), [
-    { kind: "tool", tool: "Read", id: "parallel-b", startedAt: at(0) },
-    { kind: "tool", tool: "Bash", id: "no-time", startedAt: null },
-    { kind: "tool", tool: "Bash", id: "bad-time", startedAt: null },
-  ]);
+  assert.deepEqual(await waitRunning(), []);
   summary();
   assert.equal((completeWait(await waitClaude(host, running.workerId, running.submissionId, 0))).finalText, "first turn");
 

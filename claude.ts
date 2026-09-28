@@ -254,19 +254,18 @@ function evidence(stateDir: string, id: string, now = Date.now()) {
   const boundaries = lines ? stopBoundaries(lines) : [];
   let stops = 0;
   let pending: ClaudePending[] = [];
-  const running = () => lines && accepted ? runningToolCalls(lines, boundaries.at(-1) ?? -1) : [];
   for (const record of own) {
     if (record.event !== "Stop") return { accepted, terminal: record, pending: [], running: [] };
     const boundary = boundaries[stops++];
     // The hook runs before Claude records its summary line; decide on a later poll.
-    if (!lines || boundary === undefined) return { accepted, terminal: undefined, pending, running: running(), unproven: !lines };
+    if (!lines || boundary === undefined) return { accepted, terminal: undefined, pending, running: [], unproven: !lines };
     // Only the latest turn end sees the clock: a time-bounded item that expires later starts no new turn.
     const latest = stops === boundaries.length && lines.slice(boundary + 1).every((line) => line.type !== "user" && line.type !== "assistant" && !queuedInput(line));
     pending = pendingWork(lines, boundary, latest ? now : Date.parse(String(lines[boundary]?.timestamp)) || now);
     if (!pending.length) return { accepted, terminal: record, pending, running: [] };
   }
   return { accepted, terminal: undefined, pending: lines && accepted ? pendingWork(lines, lines.length - 1, now) : [],
-    running: running(), unproven: !lines && own.length > 0 };
+    running: lines && accepted ? runningToolCalls(lines, boundaries.at(-1) ?? -1) : [], unproven: !lines && own.length > 0 };
 }
 function settled(host: ClaudeHost, worker: ClaudeWorker, task: Partial<ClaudeTask>): ClaudeWorker {
   if (task.reason) task = { ...task, reason: task.reason.slice(0, 4000) };
