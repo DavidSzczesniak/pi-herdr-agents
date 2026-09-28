@@ -388,7 +388,9 @@ try {
   const heldFirst = timedOut(await waitClaude(host, deferred.workerId, deferred.submissionId, 1500));
   assert.equal(heldFirst.kind, "timeout", "a Stop with deferred work pending does not settle");
   assert.deepEqual(heldFirst.pending.map((item) => [item.kind, item.tool, item.id]), [["background", "Bash", "tu1"], ["wakeup", "ScheduleWakeup", "tu2"]]);
-  assert.ok(present(heldFirst.pending[1], "wakeup").until && present(heldFirst.pending[0], "background job").summary === "npm test");
+  const wakeup = present(heldFirst.pending[1], "wakeup");
+  const backgroundJob = present(heldFirst.pending[0], "background job");
+  assert.ok(wakeup.kind !== "tool" && wakeup.until && backgroundJob.kind !== "tool" && backgroundJob.summary === "npm test");
   writeFileSync(tpath("deferred") + ".go1", "");
   await new Promise((resolve) => setTimeout(resolve, 400));
   const heldSecond = timedOut(await waitClaude(host, deferred.workerId, deferred.submissionId, 1500));
@@ -459,6 +461,76 @@ try {
   const reply = (id: string, toolUseResult: Record<string, unknown>, isError = false, offset = 0) => ({ timestamp: at(offset), type: "user", toolUseResult,
     message: { content: [{ type: "tool_result", tool_use_id: id, content: "x", is_error: isError }] } });
   const notified = (id: string, offset: number) => ({ timestamp: at(offset), type: "user", message: { content: `<task-notification><tool-use-id>${id}</tool-use-id><status>completed</status></task-notification>` } });
+  const running = await spawnClaude(host, spec("SCENARIO:hang"));
+  const runningPath = present(readClaudeWorker(stateDir, running.workerId).task.transcriptPath, "running transcript");
+  const append = (entry: unknown) => appendFileSync(runningPath, JSON.stringify(entry) + "\n");
+  const waitRunning = async () => timedOut(await waitClaude(host, running.workerId, running.submissionId, 0)).pending;
+  append({ timestamp: "2026-09-27T00:00:00.000Z", type: "assistant", message: { content: [{ type: "tool_use", id: "foreground", name: "Bash", input: { command: "sleep 9999" } }] } });
+  const foreground = { kind: "tool", tool: "Bash", id: "foreground", startedAt: "2026-09-27T00:00:00.000Z" };
+  assert.deepEqual(await waitRunning(), [foreground]);
+  assert.deepEqual(await waitRunning(), [foreground]);
+  append(reply("foreground", {}));
+  assert.deepEqual(await waitRunning(), []);
+  append(call("failed-call", "Bash", { command: "false" }));
+  assert.deepEqual(await waitRunning(), [{ kind: "tool", tool: "Bash", id: "failed-call", startedAt: at(0) }]);
+  append(reply("failed-call", {}, true));
+  append(call("parallel-a", "Bash", {}));
+  append(call("parallel-b", "Read", {}));
+  append(reply("unrelated", {}));
+  assert.deepEqual(await waitRunning(), [
+    { kind: "tool", tool: "Bash", id: "parallel-a", startedAt: at(0) },
+    { kind: "tool", tool: "Read", id: "parallel-b", startedAt: at(0) },
+  ]);
+  append(reply("parallel-a", {}));
+  assert.deepEqual(await waitRunning(), [{ kind: "tool", tool: "Read", id: "parallel-b", startedAt: at(0) }]);
+  append({ type: "assistant", message: { content: [{ type: "tool_use", id: "no-time", name: "Bash" }] } });
+  append({ timestamp: "bad time", type: "assistant", message: { content: [{ type: "tool_use", id: "bad-time", name: "Bash" },
+    { type: "tool_use", id: "", name: "Bash" }, { type: "tool_use", id: "bad-name", name: "" }] } });
+  assert.deepEqual(await waitRunning(), [
+    { kind: "tool", tool: "Read", id: "parallel-b", startedAt: at(0) },
+    { kind: "tool", tool: "Bash", id: "no-time", startedAt: null },
+    { kind: "tool", tool: "Bash", id: "bad-time", startedAt: null },
+  ]);
+  const runningHooks = join(stateDir, "claude", running.workerId, "hooks");
+  const stop = (number: number, last_assistant_message: string) => writeFileSync(join(runningHooks, `Stop-${number}-1.json`),
+    JSON.stringify({ session_id: "s1", last_assistant_message }));
+  const summary = () => append({ type: "system", subtype: "stop_hook_summary", hookInfos: [{ command: "'/bin/sh' '/x/claude-hook.sh' 'Stop' '/x'" }] });
+  stop(1, "first turn");
+  assert.deepEqual(await waitRunning(), []);
+  summary();
+  assert.equal((completeWait(await waitClaude(host, running.workerId, running.submissionId, 0))).finalText, "first turn");
+
+  const background = await spawnClaude(host, spec("SCENARIO:hang"));
+  const backgroundPath = present(readClaudeWorker(stateDir, background.workerId).task.transcriptPath, "background transcript");
+  const appendBackground = (entry: unknown) => appendFileSync(backgroundPath, JSON.stringify(entry) + "\n");
+  const waitBackground = async () => timedOut(await waitClaude(host, background.workerId, background.submissionId, 0)).pending;
+  appendBackground(call("bg", "Bash", { command: "npm test", run_in_background: true }));
+  assert.deepEqual(await waitBackground(), [{ kind: "tool", tool: "Bash", id: "bg", startedAt: at(0) }]);
+  appendBackground(reply("bg", { backgroundTaskId: "job" }));
+  const bgItem = { kind: "background", tool: "Bash", id: "bg", summary: "npm test", until: null };
+  assert.deepEqual(await waitBackground(), [bgItem]);
+  appendBackground(call("stop-job", "TaskStop", { task_id: "job" }));
+  assert.deepEqual(await waitBackground(), [bgItem, { kind: "tool", tool: "TaskStop", id: "stop-job", startedAt: at(0) }]);
+  appendBackground(reply("stop-job", {}, true));
+  assert.deepEqual(await waitBackground(), [bgItem]);
+  appendBackground(call("failed-bg", "Bash", { run_in_background: true }));
+  assert.deepEqual(await waitBackground(), [bgItem, { kind: "tool", tool: "Bash", id: "failed-bg", startedAt: at(0) }]);
+  appendBackground(reply("failed-bg", {}, true));
+  assert.deepEqual(await waitBackground(), [bgItem]);
+  appendBackground(call("old", "Read", {}));
+  assert.deepEqual(await waitBackground(), [bgItem, { kind: "tool", tool: "Read", id: "old", startedAt: at(0) }]);
+  const bgHooks = join(stateDir, "claude", background.workerId, "hooks");
+  writeFileSync(join(bgHooks, "Stop-1-1.json"), JSON.stringify({ session_id: "s1", last_assistant_message: "waiting" }));
+  appendBackground({ type: "system", subtype: "stop_hook_summary", hookInfos: [{ command: "'/bin/sh' '/x/claude-hook.sh' 'Stop' '/x'" }] });
+  assert.deepEqual(await waitBackground(), [bgItem]);
+  appendBackground(call("current", "Read", {}));
+  assert.deepEqual(await waitBackground(), [bgItem, { kind: "tool", tool: "Read", id: "current", startedAt: at(0) }]);
+  appendBackground(reply("current", {}));
+  appendBackground(call("finish-job", "TaskStop", { task_id: "job" }));
+  appendBackground(reply("finish-job", {}));
+  writeFileSync(join(bgHooks, "Stop-2-1.json"), JSON.stringify({ session_id: "s1", last_assistant_message: "finished" }));
+  appendBackground({ type: "system", subtype: "stop_hook_summary", hookInfos: [{ command: "'/bin/sh' '/x/claude-hook.sh' 'Stop' '/x'" }] });
+  assert.equal((completeWait(await waitClaude(host, background.workerId, background.submissionId, 0))).finalText, "finished");
   assert.deepEqual(pendingWork([call("f1", "Bash", { command: "x", run_in_background: true }), reply("f1", {}, true)], 1, clock), [], "a failed background launch starts nothing");
   const job = [call("j1", "Bash", { command: "npm test", run_in_background: true }), reply("j1", { backgroundTaskId: "b1" })];
   assert.equal(pendingWork([...job, call("k1", "TaskStop", { task_id: "b1" }), reply("k1", {}, true)], 3, clock).length, 1, "a failed stop leaves the job pending");

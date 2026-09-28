@@ -1112,7 +1112,7 @@ function createRuntime(pi: ExtensionAPI, config: StartupConfig) {
     },
   });
   pi.registerTool({
-    name: "wait_agent", label: "Wait for agent", description: "Wait for one exact submission to settle. Timeout leaves the worker active and reports sessionBytes, sessionGrowth since submission or your previous timed-out wait, and pending: tool calls still running, or a Claude worker's deferred background jobs, monitors, and wake-ups. Two consecutive timeouts with zero sessionGrowth and empty pending mean a stall. ambiguous and unavailable are not completion; never replay them. Final text capped at 45 KiB with full artifact path; interrupted/error are distinct outcomes.",
+    name: "wait_agent", label: "Wait for agent", description: "Wait for one exact submission to settle. Timeout leaves the worker active and reports sessionBytes, sessionGrowth since submission or your previous timed-out wait, and pending: running tool calls for either runtime, plus a Claude worker's deferred background jobs, monitors, and wake-ups. Two consecutive timeouts with zero sessionGrowth and empty pending mean a stall. ambiguous and unavailable are not completion; never replay them. Final text capped at 45 KiB with full artifact path; interrupted/error are distinct outcomes.",
     parameters: Type.Object({ ...targetFields, timeout_ms: Type.Integer({ minimum: 120000, maximum: 600000 }) }),
     async execute(_id, params, signal) {
       if (isClaudeWorker(stateDir, params.agent_id)) {
