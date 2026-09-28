@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url";
 import adapter from "./index.ts";
 import { atomicWrite } from "./protocol.ts";
 import { runtimeSocket, socketDirectory } from "./startup.ts";
-import { fakeApi, fakeContext, fakeModel, fakeRegistry, fakeSessions, fakeUi, hookRegistry, toolRegistry, present } from "./fakes.ts";
+import { fakeApi, fakeContext, fakeModel, fakeRegistry, fakeSessions, fakeUi, hookRegistry, toolRegistry, present, fixtureEnvironment } from "./fakes.ts";
 
 type RaceMessage = { kind: "ready"; worker: string } | { kind: "opened"; worker: string; model: string; thinking: string } | { kind: "result"; worker: string; error: string };
 
@@ -86,7 +86,7 @@ if (process.argv[2] === "contender") {
     }
   }
   function start(worker: string) {
-    const child = fork(file, ["contender"], { env: { ...process.env, RACE_STATE: state, RACE_WORKER: worker }, stdio: ["ignore", "inherit", "inherit", "ipc"] });
+    const child = fork(file, ["contender"], { env: fixtureEnvironment({ RACE_STATE: state, RACE_WORKER: worker }), stdio: ["ignore", "inherit", "inherit", "ipc"] });
     children.push(child);
     child.on("message", (message: RaceMessage) => messages.push(message));
     return child;

@@ -8,7 +8,7 @@ import { once } from "node:events";
 import adapter from "./index.ts";
 import { atomicWrite, request } from "./protocol.ts";
 import { socketDirectory } from "./startup.ts";
-import { fakeApi, fakeContext, fakeModel, fakeRegistry, fakeSessions, fakeUi, hookRegistry, toolRegistry, present, toolText } from "./fakes.ts";
+import { fakeApi, fakeContext, fakeModel, fakeRegistry, fakeSessions, fakeUi, hookRegistry, toolRegistry, present, toolText, installFixtureEnvironment } from "./fakes.ts";
 import type { ExtensionEvent } from "@earendil-works/pi-coding-agent";
 import type { Request, Result } from "./protocol.ts";
 import { Type } from "typebox";
@@ -28,11 +28,9 @@ const header = { type: "session", version: 3, id: "session-lead", timestamp: new
 
 function fixture(options: { workerId?: string; role?: string; thinking?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"; parentId?: string; auth?: boolean; mode?: string; restart?: string; sessionId?: string; failReport?: boolean; launchFault?: string; launchId?: string } = {}) {
   const { workerId = "lead", role = "lead", thinking = "high", parentId = "", auth = true, mode = "started", restart = "", sessionId = `session-${workerId}`, failReport = false, launchFault = "", launchId = "" } = options;
-  Object.assign(process.env, { DS_HERDR_STATE_DIR: state, DS_HERDR_SESSION: "slice", DS_HERDR_WORKSPACE: directory,
-    DS_HERDR_WORKER_ID: workerId, DS_HERDR_ROLE: role, DS_HERDR_PARENT_ID: parentId, DS_HERDR_RESTART_GENERATION: restart,
+  installFixtureEnvironment({ DS_HERDR_STATE_DIR: state, DS_HERDR_SESSION: "slice", DS_HERDR_WORKSPACE: directory,
+    DS_HERDR_WORKER_ID: workerId, DS_HERDR_ROLE: role, DS_HERDR_PARENT_ID: parentId, DS_HERDR_RESTART_GENERATION: restart, DS_HERDR_LAUNCH_ID: launchId,
     HERDR_ENV: "1", HERDR_SESSION: "slice", HERDR_SOCKET_PATH: "/fixture/herdr.sock", HERDR_WORKSPACE_ID: "w1", HERDR_PANE_ID: `w1:p-${workerId}` });
-  delete process.env.DS_HERDR_WORKSPACE_ID;
-  process.env.DS_HERDR_LAUNCH_ID = launchId;
   const hooks = hookRegistry();
   const tools = toolRegistry();
   const commands: string[][] = [];

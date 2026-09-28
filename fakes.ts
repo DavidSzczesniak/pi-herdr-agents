@@ -76,6 +76,22 @@ export function toolText(result: AgentToolResult<unknown>): string {
   return first.text;
 }
 
+export function fixtureEnvironment(overrides: NodeJS.ProcessEnv, inherited: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  for (const [key, value] of Object.entries(inherited)) if (!key.startsWith("DS_HERDR_")) env[key] = value;
+  for (const [key, value] of Object.entries(overrides)) {
+    if (value === undefined) delete env[key];
+    else env[key] = value;
+  }
+  return env;
+}
+
+export function installFixtureEnvironment(overrides: NodeJS.ProcessEnv): void {
+  const env = fixtureEnvironment(overrides);
+  for (const key of Object.keys(process.env)) if (!(key in env)) delete process.env[key];
+  Object.assign(process.env, env);
+}
+
 export function present<T>(value: T | null | undefined, what: string): T {
   if (value === null || value === undefined) throw new Error(`expected ${what}`);
   return value;

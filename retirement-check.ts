@@ -10,7 +10,7 @@ import { request } from "./protocol.ts";
 import { socketDirectory } from "./startup.ts";
 import { claimLaunch, isOriginalProcessLive, processIdentity } from "./runtime.ts";
 import { atomicWrite } from "./protocol.ts";
-import { fakeApi, fakeContext, fakeModel, fakeRegistry, fakeSessions, fakeUi, hookRegistry, toolRegistry, present, toolText } from "./fakes.ts";
+import { fakeApi, fakeContext, fakeModel, fakeRegistry, fakeSessions, fakeUi, hookRegistry, toolRegistry, present, toolText, fixtureEnvironment, installFixtureEnvironment } from "./fakes.ts";
 import type { ExtensionEvent } from "@earendil-works/pi-coding-agent";
 import type { ChildProcess } from "node:child_process";
 import type { Request } from "./protocol.ts";
@@ -45,10 +45,7 @@ if (inChild) {
   }
 } else {
   mkdirSync(join(directory, "sessions"), { mode: 0o700 });
-  Object.assign(process.env, configEnv);
-  delete process.env.DS_HERDR_WORKSPACE_ID;
-  delete process.env.DS_HERDR_LAUNCH_ID;
-  delete process.env.DS_HERDR_RESTART_GENERATION;
+  installFixtureEnvironment(configEnv);
 }
 function native() {
   const hooks = hookRegistry();
@@ -142,7 +139,7 @@ if (inChild) {
     async function child(childId: string, childMode = "idle", parentId = "lead", extraEnv: Record<string, string> = {}) {
       rmSync(join(directory, `${childId}.ready`), { force: true });
       const proc = spawn(process.execPath, [new URL(import.meta.url).pathname, "child", childId, childMode, parentId],
-        { env: { ...originalEnv, RETIRE_STATE: directory, ...extraEnv }, stdio: ["ignore", "pipe", "pipe"] });
+        { env: fixtureEnvironment({ RETIRE_STATE: directory, ...extraEnv }, originalEnv), stdio: ["ignore", "pipe", "pipe"] });
       children.push(proc);
       exits.push(once(proc, "exit"));
       let stderr = "";

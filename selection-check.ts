@@ -10,7 +10,7 @@ import adapter from "./index.ts";
 import { atomicWrite, parseIdentity, request } from "./protocol.ts";
 import { recordedThinking, selectWorker } from "./runtime.ts";
 import { socketDirectory } from "./startup.ts";
-import { fakeApi, fakeContext, fakeRegistry, fakeSessions, fakeUi, hookRegistry, toolRegistry, present, toolText } from "./fakes.ts";
+import { fakeApi, fakeContext, fakeRegistry, fakeSessions, fakeUi, hookRegistry, toolRegistry, present, toolText, installFixtureEnvironment } from "./fakes.ts";
 import type { ExtensionEvent, ExtensionError } from "@earendil-works/pi-coding-agent";
 import type { Model, Api, ModelThinkingLevel } from "@earendil-works/pi-ai";
 import type { Request } from "./protocol.ts";
@@ -52,11 +52,10 @@ let nextChildThinking: ModelThinkingLevel | undefined;
 function fixture(options: { id?: string; parent?: string; role?: string; model?: Model<Api>; thinking?: ModelThinkingLevel; auth?: boolean; sessionFile?: string; sessionId?: string; launchId?: string; restart?: string } = {}): SelectionFixture {
   const { id = "lead", parent = "", role = "lead", model = reasoning, thinking = "high", auth = true,
     sessionFile = join(root, `${id}.jsonl`), sessionId = `session-${id}`, launchId = "", restart = "" } = options;
-  Object.assign(process.env, { HERDR_ENV: "1", HERDR_SOCKET_PATH: "/fixture/selection.sock", HERDR_SESSION: "", HERDR_PANE_ID: id,
+  installFixtureEnvironment({ HERDR_ENV: "1", HERDR_SOCKET_PATH: "/fixture/selection.sock", HERDR_SESSION: "", HERDR_SESSION_NAME: undefined, HERDR_PANE_ID: id,
     HERDR_WORKSPACE_ID: "w1", DS_HERDR_STATE_DIR: root, DS_HERDR_WORKER_ID: id, DS_HERDR_PARENT_ID: parent,
     DS_HERDR_ROLE: role, DS_HERDR_SESSION: "", DS_HERDR_WORKSPACE: root, DS_HERDR_LAUNCH_ID: launchId,
     DS_HERDR_RESTART_GENERATION: restart });
-  delete process.env.DS_HERDR_SOCKET_DIR;
   const hooks = hookRegistry(), tools = toolRegistry();
   let level = clampThinkingLevel(present(model, "selected model"), thinking), idle = true, sends = 0;
   let error: string | undefined;

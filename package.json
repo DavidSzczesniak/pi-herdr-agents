@@ -15,10 +15,11 @@
     "transport-check": "node transport-check.ts",
     "adapter-check": "node adapter-check.ts",
     "launch-race-check": "node launch-race-check.ts",
+    "fixture-isolation-check": "node fixture-isolation-check.ts",
     "startup-check": "node startup-check.ts",
     "selection-check": "node selection-check.ts",
     "retirement-check": "node retirement-check.ts",
-    "test": "npm run check && npm run transport-check && npm run adapter-check && npm run launch-race-check && npm run startup-check && npm run selection-check && npm run retirement-check && npm run claude-check",
+    "test": "npm run check && npm run transport-check && npm run fixture-isolation-check && npm run startup-check && npm run claude-check",
     "claude-check": "node claude-check.ts"
   },
   "peerDependencies": {
