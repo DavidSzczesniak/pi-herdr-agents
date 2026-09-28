@@ -116,6 +116,8 @@ function hookRecords(stateDir: string, id: string): HookRecord[] {
 // Claude fires Stop at every turn end, including a turn that ends waiting on work it deferred: a background command,
 // a monitor, a wake-up. Only a Stop with nothing pending settles the task, so the result is the final turn's.
 export type ClaudePending = { kind: "background" | "monitor" | "wakeup" | "task"; tool: string; id: string; summary: string; until: string | null };
+type ClaudeRunningTool = { kind: "tool"; tool: string; id: string; startedAt: string | null };
+type ClaudeWaitPending = ClaudePending | ClaudeRunningTool;
 type TranscriptLine = { type?: unknown; subtype?: unknown; timestamp?: unknown; content?: unknown; hookInfos?: unknown;
   message?: { content?: unknown }; toolUseResult?: Record<string, unknown>; attachment?: { type?: unknown; prompt?: unknown; commandMode?: unknown } };
 // Monitor streams events and can end with no transcript marker, so it counts as pending only until its timeout.
@@ -217,6 +219,29 @@ function stopBoundaries(lines: TranscriptLine[]): number[] {
   return lines.flatMap((line, index) => line.type === "system" && line.subtype === "stop_hook_summary" &&
     JSON.stringify(line.hookInfos ?? "").includes("claude-hook.sh' 'Stop'") ? [index] : []);
 }
+function runningToolCalls(lines: readonly TranscriptLine[], afterBoundary: number): ClaudeRunningTool[] {
+  const open = new Map<string, ClaudeRunningTool>();
+  for (const line of lines.slice(afterBoundary + 1)) {
+    if (line.type !== "assistant" && line.type !== "user") continue;
+    const content = line.message?.content;
+    if (!Array.isArray(content)) continue;
+    for (const value of content) {
+      const block: unknown = value;
+      if (!block || typeof block !== "object" || Array.isArray(block)) continue;
+      if (line.type === "assistant" && "type" in block && block.type === "tool_use" &&
+        "id" in block && typeof block.id === "string" && block.id &&
+        "name" in block && typeof block.name === "string" && block.name && !open.has(block.id)) {
+        const timestamp = line.timestamp;
+        open.set(block.id, { kind: "tool", tool: block.name, id: block.id,
+          startedAt: typeof timestamp === "string" && Number.isFinite(Date.parse(timestamp)) ? timestamp : null });
+      } else if (line.type === "user" && "type" in block && block.type === "tool_result" &&
+        "tool_use_id" in block && typeof block.tool_use_id === "string") {
+        open.delete(block.tool_use_id);
+      }
+    }
+  }
+  return [...open.values()];
+}
 function evidence(stateDir: string, id: string, now = Date.now()) {
   const records = hookRecords(stateDir, id);
   const accepted = records.find((record) => record.event === "UserPromptSubmit")?.input;
@@ -229,17 +254,19 @@ function evidence(stateDir: string, id: string, now = Date.now()) {
   const boundaries = lines ? stopBoundaries(lines) : [];
   let stops = 0;
   let pending: ClaudePending[] = [];
+  const running = () => lines && accepted ? runningToolCalls(lines, boundaries.at(-1) ?? -1) : [];
   for (const record of own) {
-    if (record.event !== "Stop") return { accepted, terminal: record, pending: [] };
+    if (record.event !== "Stop") return { accepted, terminal: record, pending: [], running: [] };
     const boundary = boundaries[stops++];
     // The hook runs before Claude records its summary line; decide on a later poll.
-    if (!lines || boundary === undefined) return { accepted, terminal: undefined, pending, unproven: !lines };
+    if (!lines || boundary === undefined) return { accepted, terminal: undefined, pending, running: running(), unproven: !lines };
     // Only the latest turn end sees the clock: a time-bounded item that expires later starts no new turn.
     const latest = stops === boundaries.length && lines.slice(boundary + 1).every((line) => line.type !== "user" && line.type !== "assistant" && !queuedInput(line));
     pending = pendingWork(lines, boundary, latest ? now : Date.parse(String(lines[boundary]?.timestamp)) || now);
-    if (!pending.length) return { accepted, terminal: record, pending };
+    if (!pending.length) return { accepted, terminal: record, pending, running: [] };
   }
-  return { accepted, terminal: undefined, pending: lines && accepted ? pendingWork(lines, lines.length - 1, now) : [], unproven: !lines && own.length > 0 };
+  return { accepted, terminal: undefined, pending: lines && accepted ? pendingWork(lines, lines.length - 1, now) : [],
+    running: running(), unproven: !lines && own.length > 0 };
 }
 function settled(host: ClaudeHost, worker: ClaudeWorker, task: Partial<ClaudeTask>): ClaudeWorker {
   if (task.reason) task = { ...task, reason: task.reason.slice(0, 4000) };
@@ -422,8 +449,11 @@ export async function waitClaude(host: ClaudeHost, id: string, submissionId: str
     signal?.throwIfAborted();
     worker = poll % 10 === 0 ? await reconcile(host, id) : observe(host, id);
   }
-  if (worker.task.kind === "active") return { kind: "timeout" as const, runtime: "claude" as const, workerId: id, submissionId, active: true,
-    pending: evidence(host.stateDir, id).pending };
+  if (worker.task.kind === "active") {
+    const observed = evidence(host.stateDir, id);
+    const pending: ClaudeWaitPending[] = [...observed.pending, ...observed.running];
+    return { kind: "timeout" as const, runtime: "claude" as const, workerId: id, submissionId, active: true, pending };
+  }
   return publicClaudeTask(worker);
 }
 

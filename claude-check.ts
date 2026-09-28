@@ -388,7 +388,9 @@ try {
   const heldFirst = timedOut(await waitClaude(host, deferred.workerId, deferred.submissionId, 1500));
   assert.equal(heldFirst.kind, "timeout", "a Stop with deferred work pending does not settle");
   assert.deepEqual(heldFirst.pending.map((item) => [item.kind, item.tool, item.id]), [["background", "Bash", "tu1"], ["wakeup", "ScheduleWakeup", "tu2"]]);
-  assert.ok(present(heldFirst.pending[1], "wakeup").until && present(heldFirst.pending[0], "background job").summary === "npm test");
+  const wakeup = present(heldFirst.pending[1], "wakeup");
+  const backgroundJob = present(heldFirst.pending[0], "background job");
+  assert.ok(wakeup.kind !== "tool" && wakeup.until && backgroundJob.kind !== "tool" && backgroundJob.summary === "npm test");
   writeFileSync(tpath("deferred") + ".go1", "");
   await new Promise((resolve) => setTimeout(resolve, 400));
   const heldSecond = timedOut(await waitClaude(host, deferred.workerId, deferred.submissionId, 1500));
@@ -519,6 +521,8 @@ try {
   assert.deepEqual(await waitBackground(), [bgItem, { kind: "tool", tool: "Bash", id: "failed-bg", startedAt: at(0) }]);
   appendBackground(reply("failed-bg", {}, true));
   assert.deepEqual(await waitBackground(), [bgItem]);
+  appendBackground(call("old", "Read", {}));
+  assert.deepEqual(await waitBackground(), [bgItem, { kind: "tool", tool: "Read", id: "old", startedAt: at(0) }]);
   const bgHooks = join(stateDir, "claude", background.workerId, "hooks");
   writeFileSync(join(bgHooks, "Stop-1-1.json"), JSON.stringify({ session_id: "s1", last_assistant_message: "waiting" }));
   appendBackground({ type: "system", subtype: "stop_hook_summary", hookInfos: [{ command: "'/bin/sh' '/x/claude-hook.sh' 'Stop' '/x'" }] });
