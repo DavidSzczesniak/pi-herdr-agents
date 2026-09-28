@@ -10,25 +10,29 @@ import { request } from "./protocol.ts";
 import { socketDirectory } from "./startup.ts";
 import { claimLaunch, isOriginalProcessLive, processIdentity } from "./runtime.ts";
 import { atomicWrite } from "./protocol.ts";
+import { fakeApi, fakeContext, fakeModel, fakeRegistry, fakeSessions, fakeUi, hookRegistry, toolRegistry, present, toolText } from "./fakes.ts";
+import type { ExtensionEvent } from "@earendil-works/pi-coding-agent";
+import type { ChildProcess } from "node:child_process";
+import type { Request } from "./protocol.ts";
 
 const directory = process.env.RETIRE_STATE || mkdtempSync(join(tmpdir(), "piha-retire-"));
 const originalEnv = { ...process.env };
-const identities = new Map();
-const closed = new Set();
-const faults = new Map();
-let startResumed;
-let createdId;
-let cleanupAbort;
-let abortPoint;
-const pane = id => ({ pane_id: `w:p-${id}`, workspace_id: "w", tab_id: `tab-${id}`, terminal_id: `term-${id}` });
-const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
-const identity = id => JSON.parse(readFileSync(join(directory, "workers", `${id}.json`), "utf8"));
-const query = (who, kind, rest = {}) => request(who.socketPath, { kind, callerId: "lead", callerGeneration: identity("lead").generation,
-  generation: who.generation, ...rest });
+const identities = new Map<string, ReturnType<typeof identity>>();
+const closed = new Set<string>();
+const faults = new Map<string, string>();
+let startResumed: ((op: string[]) => Promise<void>) | undefined;
+let createdId: string | undefined;
+let cleanupAbort: AbortController | undefined;
+let abortPoint: string | undefined;
+const pane = (id: string) => ({ pane_id: `w:p-${id}`, workspace_id: "w", tab_id: `tab-${id}`, terminal_id: `term-${id}` });
+const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+const identity = (id: string) => JSON.parse(readFileSync(join(directory, "workers", `${id}.json`), "utf8"));
+type OwnRequest = Request extends infer R ? R extends Request ? Omit<R, "callerId" | "callerGeneration" | "generation"> : never : never;
+const query = (who: { socketPath: string; generation: string }, operation: OwnRequest) => request(who.socketPath, { ...operation, callerId: "lead", callerGeneration: identity("lead").generation, generation: who.generation });
 const inChild = process.argv[2] === "child";
-const id = inChild ? process.argv[3] : "lead";
-const mode = inChild ? process.argv[4] : "idle";
-const parent = inChild ? process.argv[5] : "";
+const id = inChild ? present(process.argv[3], "child id") : "lead";
+const mode = inChild ? present(process.argv[4], "child mode") : "idle";
+const parent = inChild ? present(process.argv[5], "child parent") : "";
 const configEnv = { DS_HERDR_STATE_DIR: process.env.RETIRE_STATE || directory, DS_HERDR_SESSION: "fixture", DS_HERDR_WORKSPACE: process.env.RETIRE_STATE || directory,
   DS_HERDR_WORKER_ID: id, DS_HERDR_ROLE: inChild ? "implement" : "lead", DS_HERDR_PARENT_ID: parent,
   HERDR_ENV: "1", HERDR_SESSION: "fixture", HERDR_SOCKET_PATH: "/fixture/retirement.sock", HERDR_WORKSPACE_ID: "w", HERDR_PANE_ID: pane(process.env.RETIRE_NEW_PANE ? `${id}-new` : id).pane_id };
@@ -47,37 +51,38 @@ if (inChild) {
   delete process.env.DS_HERDR_RESTART_GENERATION;
 }
 function native() {
-  const hooks = new Map();
-  const tools = new Map();
+  const hooks = hookRegistry();
+  const tools = toolRegistry();
   const file = join(process.env.RETIRE_STATE || directory, "sessions", `${id}.jsonl`);
   if (!existsSync(file)) writeFileSync(file, JSON.stringify({ type: "session", version: 3, id: `pi-${id}`, cwd: process.env.RETIRE_STATE || directory }) + "\n");
   let active = false;
   let queued = mode === "queued";
-  const ctx = { cwd: process.env.RETIRE_STATE || directory, mode: "tui", hasUI: true,
-    model: mode === "noauth" ? null : { provider: "fixture", id: "model", reasoning: true },
-    modelRegistry: { find: (provider, name) => ({ provider, id: name, reasoning: true }),
-      hasConfiguredAuth: () => true, getProviderAuthStatus: () => ({ configured: true }) },
-    sessionManager: { getSessionFile: () => file, getSessionId: () => `pi-${id}` },
+  const ctx = fakeContext({ cwd: process.env.RETIRE_STATE || directory, mode: "tui", hasUI: true, signal: undefined,
+    model: mode === "noauth" ? undefined : fakeModel("fixture", "model"),
+    modelRegistry: fakeRegistry({ find: (provider, name) => fakeModel(provider, name),
+      hasConfiguredAuth: () => true, getProviderAuthStatus: () => ({ configured: true }) }),
+    sessionManager: fakeSessions({ getSessionFile: () => file, getSessionId: () => `pi-${id}` }),
     isIdle: () => !active, hasPendingMessages: () => queued,
-    shutdown: () => { if (inChild && mode !== "no-shutdown") void emit("session_shutdown").then(() => process.exit(0)); },
-    ui: { notify(message) { throw new Error(message); }, setWidget() {} },
-  };
-  const emit = async (name, event = {}) => { for (const hook of hooks.get(name) || []) await hook(event, ctx); };
-  const api = { on(name, fn) { hooks.set(name, [...(hooks.get(name) || []), fn]); }, registerTool(tool) { tools.set(tool.name, tool); },
+    shutdown: () => { if (inChild && mode !== "no-shutdown") void emit({ type: "session_shutdown", reason: "quit" }).then(() => process.exit(0)); },
+    ui: fakeUi({ notify(message) { throw new Error(message); }, setWidget() {} }),
+  });
+  if (mode === "noauth") Reflect.set(ctx, "model", null);
+  const emit = (event: ExtensionEvent) => hooks.emit(event, ctx);
+  const api = fakeApi({ on: hooks.on, registerTool: tools.register,
     registerCommand() {}, getActiveTools: () => ["read", "bash"], setActiveTools() {}, getThinkingLevel: () => "medium",
     async exec(_command, args) {
       const op = args.slice(args.indexOf("herdr") + 1);
       if (op[0] === "tab" && op[1] === "create") {
-        createdId = op.find(value => value.startsWith("DS_HERDR_WORKER_ID=")).split("=")[1];
+        createdId = present(present(op.find(value => value.startsWith("DS_HERDR_WORKER_ID=")), "worker environment").split("=")[1], "created worker id");
         return response({ result: { root_pane: pane(`${createdId}-new`) } });
       }
       if (op[0] === "agent" && op[1] === "start") {
         await startResumed?.(op);
         return response({});
       }
-      if (op[0] === "pane" && op[1] === "get") return response({ result: { pane: pane(op[2].slice(4)) } });
+      if (op[0] === "pane" && op[1] === "get") return response({ result: { pane: pane(present(op[2], "pane id").slice(4)) } });
       if (op[0] === "pane" && op[1] === "list") {
-        if (abortPoint === "after-close-list" && closed.has("abort-after-close")) cleanupAbort.abort();
+        if (abortPoint === "after-close-list" && closed.has("abort-after-close")) present(cleanupAbort, "cleanup abort controller").abort();
         return response({ result: { panes: [...identities.keys()].filter(key => !closed.has(key))
           .filter(key => faults.get(key) !== "absent" || isOriginalProcessLive(identity(key)))
           .map(key => faults.get(key) === "moved" && !isOriginalProcessLive(identity(key)) ? { ...pane(key), tab_id: "other-tab" } :
@@ -85,57 +90,58 @@ function native() {
               faults.get(key) === "workspace-move" && !isOriginalProcessLive(identity(key)) ? { ...pane(key), workspace_id: "other-workspace" } :
                 faults.get(key) === "pane-id-move" && !isOriginalProcessLive(identity(key)) ? { ...pane(key), pane_id: "w:p-relocated" } : pane(key)) } });
       }
-      if (op[0] === "tab" && op[1] === "get") return response({ result: { tab: { tab_id: op[2], workspace_id: "w", pane_count: 1 } } });
+      if (op[0] === "tab" && op[1] === "get") return response({ result: { tab: { tab_id: present(op[2], "pane id"), workspace_id: "w", pane_count: 1 } } });
       if (op[0] === "pane" && op[1] === "process-info") {
-        const key = op[3].slice(4);
-        if (abortPoint === "process-info" && key === "cleanup-abort") cleanupAbort.abort();
+        const key = present(op[3], "pane id").slice(4);
+        if (abortPoint === "process-info" && key === "cleanup-abort") present(cleanupAbort, "cleanup abort controller").abort();
         const fault = faults.get(key);
-        const info = { pane_id: op[3], shell_pid: fault === "null-shell" ? null : 1,
+        const info = { pane_id: present(op[3], "pane id"), shell_pid: fault === "null-shell" ? null : 1,
           foreground_process_group_id: fault === "null-group" ? null : fault === "foreign-group" || fault === "empty-foreground" ? 2 : 1,
           foreground_processes: fault === "empty-foreground" ? [] : [{ pid: fault === "occupant" || fault === "foreign-process" ? 2 : 1, name: "process" }] };
-        if (fault === "missing-group") delete info.foreground_process_group_id;
-        if (fault === "missing-foreground") delete info.foreground_processes;
-        return response({ result: { process_info: info } });
+        const rawInfo: Record<string, unknown> = { ...info };
+        if (fault === "missing-group") delete rawInfo.foreground_process_group_id;
+        if (fault === "missing-foreground") delete rawInfo.foreground_processes;
+        return response({ result: { process_info: rawInfo } });
       }
       if (op[0] === "pane" && op[1] === "close") {
-        closed.add(op[2].slice(4));
-        if (abortPoint === "close" && op[2] === "w:p-abort-after-close") cleanupAbort.abort();
-        if (op[2] === "w:p-close-error") return { code: 1, killed: false, stdout: "", stderr: "fixture close response lost" };
+        closed.add(present(op[2], "pane id").slice(4));
+        if (abortPoint === "close" && present(op[2], "pane id") === "w:p-abort-after-close") present(cleanupAbort, "cleanup abort controller").abort();
+        if (present(op[2], "pane id") === "w:p-close-error") return { code: 1, killed: false, stdout: "", stderr: "fixture close response lost" };
         return response(null);
       }
       return response(null);
     },
-    sendUserMessage(text) { active = true;
+    sendUserMessage(text) { if (typeof text !== "string") throw new Error("expected user text"); active = true;
       if (mode === "resume") void (async () => {
-        await emit("input", { source: "extension", text });
-        await emit("before_agent_start", { prompt: text, systemPromptOptions: { promptGuidelines: [] } });
-        await emit("agent_start");
+        await emit({ type: "input", source: "extension", text });
+        await emit({ type: "before_agent_start", prompt: text, systemPrompt: "", systemPromptOptions: { cwd: directory, selectedTools: [], toolSnippets: {}, toolGuidelines: {}, promptGuidelines: [], appendSystemPrompt: "", sections: {}, contextFiles: [], skills: [] } });
+        await emit({ type: "agent_start" });
       })();
     }, appendEntry() {},
-  };
-  function response(value) { return { code: 0, killed: false, stdout: value ? JSON.stringify(value) : "", stderr: "" }; }
+  });
+  function response(value: unknown) { return { code: 0, killed: false, stdout: value ? JSON.stringify(value) : "", stderr: "" }; }
   adapter(api);
-  return { tools, ctx, emit, setQueued(value) { queued = value; } };
+  return { tools, ctx, emit, setQueued(value: boolean) { queued = value; } };
 }
 if (inChild) {
   const fixture = native();
-  await fixture.emit("session_start");
+  await fixture.emit({ type: "session_start", reason: "startup" });
   if (mode === "busy" || mode === "pending") {
     await request(identity(id).socketPath, { kind: "submit", callerId: id, callerGeneration: identity(id).generation,
       generation: identity(id).generation, submissionId: `task-${id}`, task: "do not retire" });
   }
-  writeFileSync(join(process.env.RETIRE_STATE, `${id}.ready`), "ready");
+  writeFileSync(join(present(process.env.RETIRE_STATE, "retirement state"), `${id}.ready`), "ready");
   setInterval(() => {}, 1000);
 } else {
-  const children = [];
-  const exits = [];
+  const children: ChildProcess[] = [];
+  const exits: Promise<unknown[]>[] = [];
   const fixture = native();
   try {
-    await fixture.emit("session_start");
+    await fixture.emit({ type: "session_start", reason: "startup" });
     assert.ok(fixture.tools.has("retire_agent"));
-    async function child(childId, childMode = "idle", parentId = "lead", extraEnv = {}) {
+    async function child(childId: string, childMode = "idle", parentId = "lead", extraEnv: Record<string, string> = {}) {
       rmSync(join(directory, `${childId}.ready`), { force: true });
-      const proc = spawn(process.execPath, ["--experimental-strip-types", new URL(import.meta.url).pathname, "child", childId, childMode, parentId],
+      const proc = spawn(process.execPath, [new URL(import.meta.url).pathname, "child", childId, childMode, parentId],
         { env: { ...originalEnv, RETIRE_STATE: directory, ...extraEnv }, stdio: ["ignore", "pipe", "pipe"] });
       children.push(proc);
       exits.push(once(proc, "exit"));
@@ -146,12 +152,12 @@ if (inChild) {
       identities.set(childId, identity(childId));
       return proc;
     }
-    startResumed = async op => {
-      const claim = JSON.parse(readFileSync(join(directory, "locks", `launch-${createdId}`, "claim.json")));
-      await child(createdId, "resume", "lead", { DS_HERDR_LAUNCH_ID: claim.launchId,
+    startResumed = async () => {
+      const claim = JSON.parse(readFileSync(join(directory, "locks", `launch-${createdId}`, "claim.json"), "utf8"));
+      await child(present(createdId, "created id"), "resume", "lead", { DS_HERDR_LAUNCH_ID: claim.launchId,
         DS_HERDR_RESTART_GENERATION: claim.previousGeneration, RETIRE_NEW_PANE: "1" });
     };
-    const retire = async childId => JSON.parse((await fixture.tools.get("retire_agent").execute("retire", { agent_id: childId }, undefined, undefined, fixture.ctx)).content[0].text);
+    const retire = async (childId: string) => JSON.parse(toolText(await fixture.tools.get("retire_agent").execute("retire", { agent_id: childId }, undefined, undefined, fixture.ctx)));
     await child("idle");
     const old = identity("idle");
     const retired = await retire("idle");
@@ -189,9 +195,9 @@ if (inChild) {
       pid: process.pid, pidBirth: "dead-original-birth", token: "abandoned-owner" });
     assert.equal((await retire("idle")).state, "retired", "a dead lease allows exclusive finished-fence recovery");
     assert.equal(existsSync(strandedFence), false, "finished receipt retry must remove its stranded fence");
-    const idleFollowup = JSON.parse((await fixture.tools.get("followup_task").execute("idle-cold", {
+    const idleFollowup = JSON.parse(toolText(await fixture.tools.get("followup_task").execute("idle-cold", {
       agent_id: "idle", task: "only new work after finished fence cleanup",
-    }, undefined, undefined, fixture.ctx)).content[0].text);
+    }, undefined, undefined, fixture.ctx)));
     assert.equal(idleFollowup.kind, "accepted");
     assert.equal(idleFollowup.identity.piSessionId, old.piSessionId);
     assert.notEqual(idleFollowup.identity.generation, old.generation);
@@ -199,14 +205,14 @@ if (inChild) {
     assert.equal(idleFollowup.identity.thinking, old.thinking);
     assert.equal(identity("idle").piSessionId, old.piSessionId);
     assert.equal(identity("idle").model.id, "model");
-    const busy = await child("busy", "busy");
+    await child("busy", "busy");
     await assert.rejects(retire("busy"), /Retirement refused/);
     assert.ok(!closed.has("busy"));
     await child("race");
     const raceTarget = identity("race");
     const race = await Promise.allSettled([
       retire("race"),
-      query(raceTarget, "submit", { submissionId: "racing-task", task: "one task" }),
+      query(raceTarget, { kind: "submit", submissionId: "racing-task", task: "one task" }),
     ]);
     const retirementWon = race[0].status === "fulfilled" && race[0].value.state === "retired";
     const submissionWon = race[1].status === "fulfilled" && race[1].value.kind !== "unavailable";
@@ -216,17 +222,17 @@ if (inChild) {
       retire("followup-race"),
       fixture.tools.get("followup_task").execute("new", { agent_id: "followup-race", task: "only new work" }, undefined, undefined, fixture.ctx),
     ]);
-    if (followup.every(outcome => outcome.status === "fulfilled") && followup[0].value.state === "retired") {
-      const next = JSON.parse(followup[1].value.content[0].text);
+    if (followup[0].status === "fulfilled" && followup[1].status === "fulfilled" && followup[0].value.state === "retired") {
+      const next = JSON.parse(toolText(followup[1].value));
       assert.notEqual(next.generation, followup[0].value.generation,
         "a follow-up after retirement must use a new generation, never the retiring writer");
     }
-    const queued = await child("queued", "queued");
+    await child("queued", "queued");
     await assert.rejects(retire("queued"), /Retirement refused/);
-    const pending = await child("pending", "pending");
+    await child("pending", "pending");
     await assert.rejects(retire("pending"), /Retirement refused/);
-    const ancestor = await child("ancestor");
-    const leaf = await child("leaf", "idle", "ancestor");
+    await child("ancestor");
+    await child("leaf", "idle", "ancestor");
     await assert.rejects(retire("ancestor"), /Descendant leaf live/);
     assert.equal((await retire("leaf")).state, "retired");
     const ancestorIdentity = identity("ancestor");
@@ -242,7 +248,7 @@ if (inChild) {
     const abort = new AbortController();
     const operation = fixture.tools.get("retire_agent").execute("retire", { agent_id: "stuck" }, abort.signal, undefined, fixture.ctx);
     setTimeout(() => abort.abort(), 150);
-    const incomplete = JSON.parse((await operation).content[0].text);
+    const incomplete = JSON.parse(toolText(await operation));
     assert.equal(incomplete.state, "incomplete");
     assert.equal(incomplete.shutdownRequested, true);
     assert.equal(incomplete.deathVerified, false);
@@ -267,7 +273,7 @@ if (inChild) {
     atomicWrite(taskFile, oldTask);
     assert.equal((await retire("historical")).state, "retired");
     assert.deepEqual(JSON.parse(readFileSync(taskFile, "utf8")), oldTask, "retirement must not rewrite settled records");
-    const revived = JSON.parse((await fixture.tools.get("followup_task").execute("cold", { agent_id: "historical", task: "only the new task" }, undefined, undefined, fixture.ctx)).content[0].text);
+    const revived = JSON.parse(toolText(await fixture.tools.get("followup_task").execute("cold", { agent_id: "historical", task: "only the new task" }, undefined, undefined, fixture.ctx)));
     assert.equal(revived.kind, "accepted");
     assert.equal(revived.identity.piSessionId, "pi-historical");
     assert.equal(revived.identity.workerId, "historical");
@@ -275,8 +281,10 @@ if (inChild) {
     assert.equal(revived.identity.thinking, "medium");
     assert.equal(revived.identity.model.id, "model");
     assert.deepEqual(JSON.parse(readFileSync(taskFile, "utf8")), oldTask);
-    assert.equal((await query(identity("historical"), "wait", { submissionId: "old-result", timeoutMs: 10 })).finalText, "exact historical result");
-    const replaced = await child("replaced");
+    const historicalResult = await query(identity("historical"), { kind: "wait", submissionId: "old-result", timeoutMs: 10 });
+    if (!("finalText" in historicalResult)) throw new Error("expected historical result");
+    assert.equal(historicalResult.finalText, "exact historical result");
+    await child("replaced");
     faults.set("replaced", "occupant");
     const replacement = await retire("replaced");
     assert.equal(replacement.state, "incomplete");
@@ -284,7 +292,7 @@ if (inChild) {
     assert.ok(!closed.has("replaced"));
     faults.delete("replaced");
     assert.equal((await retire("replaced")).state, "retired");
-    const moved = await child("moved");
+    await child("moved");
     faults.set("moved", "moved");
     assert.equal((await retire("moved")).state, "incomplete");
     assert.ok(!closed.has("moved"));
@@ -323,8 +331,8 @@ if (inChild) {
     await child("cleanup-abort");
     cleanupAbort = new AbortController();
     abortPoint = "process-info";
-    const abortedBeforeClose = JSON.parse((await fixture.tools.get("retire_agent").execute("abort-cleanup", {
-      agent_id: "cleanup-abort" }, cleanupAbort.signal, undefined, fixture.ctx)).content[0].text);
+    const abortedBeforeClose = JSON.parse(toolText(await fixture.tools.get("retire_agent").execute("abort-cleanup", {
+      agent_id: "cleanup-abort" }, cleanupAbort.signal, undefined, fixture.ctx)));
     assert.equal(abortedBeforeClose.state, "incomplete");
     assert.equal(abortedBeforeClose.deathVerified, true);
     assert.equal(abortedBeforeClose.paneClosed, false);
@@ -334,8 +342,8 @@ if (inChild) {
     await child("abort-after-close");
     cleanupAbort = new AbortController();
     abortPoint = "close";
-    const abortedAfterClose = JSON.parse((await fixture.tools.get("retire_agent").execute("abort-after-close", {
-      agent_id: "abort-after-close" }, cleanupAbort.signal, undefined, fixture.ctx)).content[0].text);
+    const abortedAfterClose = JSON.parse(toolText(await fixture.tools.get("retire_agent").execute("abort-after-close", {
+      agent_id: "abort-after-close" }, cleanupAbort.signal, undefined, fixture.ctx)));
     assert.equal(abortedAfterClose.state, "incomplete");
     assert.equal(abortedAfterClose.deathVerified, true);
     assert.equal(abortedAfterClose.paneClosed, true, "observed closure survives cancellation");
@@ -355,11 +363,11 @@ if (inChild) {
     for (let i = 0; !existsSync(evidence) && i < 100; i++) await delay(10);
     assert.ok(existsSync(evidence), "retirement must reserve before caller shutdown");
     let cleaned = false;
-    const shuttingDown = fixture.emit("session_shutdown").then(() => { cleaned = true; });
+    const shuttingDown = fixture.emit({ type: "session_shutdown", reason: "quit" }).then(() => { cleaned = true; });
     await delay(30);
     assert.equal(cleaned, false, "caller cleanup waits for its outbound retirement to record an outcome");
     reloadAbort.abort();
-    const aborted = JSON.parse((await outbound).content[0].text);
+    const aborted = JSON.parse(toolText(await outbound));
     assert.equal(aborted.state, "incomplete");
     await shuttingDown;
     assert.equal(cleaned, true);
@@ -369,7 +377,7 @@ if (inChild) {
   } finally {
     for (const proc of children) if (proc.exitCode === null) proc.kill("SIGTERM");
     await Promise.all(exits);
-    await fixture.emit("session_shutdown");
+    await fixture.emit({ type: "session_shutdown", reason: "quit" });
     for (const key of Object.keys(process.env)) if (!(key in originalEnv)) delete process.env[key];
     Object.assign(process.env, originalEnv);
     rmSync(socketDirectory(directory, originalEnv.XDG_RUNTIME_DIR || "/tmp"), { recursive: true, force: true });

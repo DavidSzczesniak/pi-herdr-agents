@@ -64,7 +64,7 @@ const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
 const text = (value: unknown) => (typeof value === "string" ? value : null);
 
 // Resolve from the lead's PATH: the Herdr pane environment need not contain it. PI_HERDR_CLAUDE_BIN overrides.
-export function claudeCommand(env: { PATH?: string; PI_HERDR_CLAUDE_BIN?: string }): string {
+export function claudeCommand(env: { PATH?: string | undefined; PI_HERDR_CLAUDE_BIN?: string | undefined }): string {
   if (env.PI_HERDR_CLAUDE_BIN) {
     if (!isAbsolute(env.PI_HERDR_CLAUDE_BIN)) throw new Error("PI_HERDR_CLAUDE_BIN must be absolute");
     return env.PI_HERDR_CLAUDE_BIN;
@@ -157,7 +157,7 @@ const summarize = (value: unknown) => (typeof value === "string" ? value : JSON.
 // mid-turn, as a queued_command attachment inside that turn. The queue-operation copies record queueing, not delivery.
 export function pendingWork(lines: TranscriptLine[], end: number, now: number): ClaudePending[] {
   const calls = new Map<string, { name: string; input: Record<string, unknown> }>();
-  const open = new Map<string, ClaudePending & { taskId?: string; deadline?: number }>();
+  const open = new Map<string, ClaudePending & { taskId?: string | undefined; deadline?: number | undefined }>();
   let wakeup: ClaudePending | undefined;
   for (const line of lines.slice(0, end + 1)) {
     const content = line.message?.content;

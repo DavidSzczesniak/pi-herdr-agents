@@ -121,7 +121,7 @@ function createRuntime(pi: ExtensionAPI, config: StartupConfig) {
     return readIdentity(id);
   }
   async function herdr(args: string[], signal?: AbortSignal): Promise<unknown> {
-    const output = await pi.exec("env", herdrCommand(config, args), { timeout: 30000, signal });
+    const output = await pi.exec("env", herdrCommand(config, args), signal ? { timeout: 30000, signal } : { timeout: 30000 });
     if (output.code !== 0 || output.killed) throw new Error(`Herdr ${args.slice(0, 2).join(" ")}: ${output.stderr || output.stdout}`);
     if (args[0] === "pane" && ["report-agent", "release-agent", "close", "run"].includes(args[1] ?? "") && !output.stdout.trim()) return undefined;
     return JSON.parse(output.stdout);
@@ -283,7 +283,7 @@ function createRuntime(pi: ExtensionAPI, config: StartupConfig) {
     socket.on("data", (chunk: string) => {
       if (dispatched) return;
       buffer += chunk;
-      if (Buffer.byteLength(buffer) > 1024 * 1024) return socket.destroy();
+      if (Buffer.byteLength(buffer) > 1024 * 1024) { socket.destroy(); return; }
       const end = buffer.indexOf("\n");
       if (end < 0) return;
       dispatched = true;
@@ -403,19 +403,20 @@ function createRuntime(pi: ExtensionAPI, config: StartupConfig) {
     audit("thinking_level_select", { model: identity.model, thinking: identity.thinking });
   });
   const guardWorkerConversation = () => {
-    if (role !== "lead") return { cancel: true };
+    return role !== "lead" ? { cancel: true } : undefined;
   };
   pi.on("session_before_switch", guardWorkerConversation);
   pi.on("session_before_fork", guardWorkerConversation);
   pi.on("session_before_tree", guardWorkerConversation);
   pi.on("input", (event) => {
-    if (!identity || shuttingDown) return;
+    if (!identity || shuttingDown) return undefined;
     if (retiring) return { action: "handled" };
-    if (!active) return;
+    if (!active) return undefined;
     if (event.source !== "extension" || event.text !== `[ds-task ${active.nonce}]\n${active.task}`) return { action: "handled" };
     active = { ...active, phase: "input_observed" };
     atomicWrite(taskPath(active.submissionId), active);
     audit("input_observed", { nonce: active.nonce });
+    return undefined;
   });
   pi.on("before_agent_start", (event) => {
     if (!identity || shuttingDown) return;
@@ -425,7 +426,7 @@ function createRuntime(pi: ExtensionAPI, config: StartupConfig) {
     if (identity.role !== "lead") event.systemPromptOptions.appendSystemPrompt = [event.systemPromptOptions.appendSystemPrompt, roleBrief(identity.role)].filter(Boolean).join("\n\n");
   });
   pi.on("tool_call", () => {
-    if (shuttingDown && role !== "lead") return { block: true, reason: "Runtime shutting down" };
+    return shuttingDown && role !== "lead" ? { block: true, reason: "Runtime shutting down" } : undefined;
   });
   pi.on("agent_start", async (_event, ctx) => {
     context = ctx;
@@ -445,7 +446,7 @@ function createRuntime(pi: ExtensionAPI, config: StartupConfig) {
   });
   pi.on("before_provider_request", () => { if (identity && !shuttingDown) audit("provider_request"); });
   pi.on("cache_warming_decision", () => {
-    if (identity && !shuttingDown && role !== "lead") return { action: "stop" };
+    return identity && !shuttingDown && role !== "lead" ? { action: "stop" } : undefined;
   });
   pi.on("message_end", (event) => {
     if (!identity || shuttingDown || event.message.role !== "assistant") return;
@@ -688,6 +689,7 @@ function createRuntime(pi: ExtensionAPI, config: StartupConfig) {
         if (readStartupFailure(stateDir, launchId, childId)) return "failed";
         await new Promise((resolve) => setTimeout(resolve, 200));
       }
+      return undefined;
     })();
     try {
       if (await Promise.race([herdr(args, stop.signal).then(() => "ready"), failed]) === "failed") throw new Error("Worker startup failed");
