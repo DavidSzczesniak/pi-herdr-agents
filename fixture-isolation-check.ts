@@ -4,6 +4,12 @@ import { once } from "node:events";
 import { watch, mkdtempSync, mkdirSync, readdirSync, rmSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fixtureEnvironment } from "./fakes.ts";
+
+const inherited = { PATH: "/fixture/bin", DS_HERDR_SOCKET_DIR: "/unrelated", DS_HERDR_FUTURE_KEY: "unrelated" };
+const overrides = { DS_HERDR_LAUNCH_ID: "fixture-claim", DS_HERDR_RESTART_GENERATION: "fixture-generation" };
+assert.deepEqual(fixtureEnvironment(overrides, inherited), { PATH: "/fixture/bin", ...overrides });
+assert.equal(inherited.DS_HERDR_SOCKET_DIR, "/unrelated");
 
 const root = mkdtempSync(join(tmpdir(), "piha-isolation-"));
 const socketDir = join(root, "sockets");
