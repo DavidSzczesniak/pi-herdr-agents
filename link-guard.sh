@@ -35,7 +35,12 @@ function command(json,    i, j, c, previous, depth, inToolInput, key, raw) {
   }
   return ""
 }
-function flush() { if (word != "") words[++n] = word; word = "" }
+function flush() {
+  if (started && waiting) {
+    delimiters[++pending] = word; strip[pending] = waitingStrip; waiting = 0
+  } else if (word != "") words[++n] = word
+  word = ""; started = 0
+}
 function classify(    i, w, j, c, end, symbolic, targetDirectory, count, first, last, dir) {
   i = 1
   while (i <= n && (words[i] ~ /^(!|\{|then|do|else|elif|if|while|until)$/ || words[i] ~ /^[A-Za-z_][A-Za-z0-9_]*=/)) i++
@@ -70,8 +75,8 @@ function classify(    i, w, j, c, end, symbolic, targetDirectory, count, first, 
   return symbolic && dir == "node_modules" && (targetDirectory || count == 1 || last == "." || last ~ /\/$/ || w == "node_modules")
 }
 function segment() { flush(); if (n && classify()) found = 1; n = 0 }
-function scan(text,    i, c, q, sq) {
-  sq = sprintf("%c", 39); q = ""; n = 0; word = ""
+function scan(text,    i, c, q, sq, k, start, rest, end, line, closed) {
+  sq = sprintf("%c", 39); q = ""; n = 0; word = ""; started = 0; waiting = 0; pending = 0
   for (i = 1; i <= length(text); i++) {
     c = substr(text, i, 1)
     if (q == sq) { if (c == sq) q = ""; else word = word c }
@@ -80,13 +85,33 @@ function scan(text,    i, c, q, sq) {
       else if (c == "\\" && index("$`\"\\\n", substr(text, i + 1, 1))) word = word substr(text, ++i, 1)
       else word = word c
     }
-    else if (c == sq || c == "\"") q = c
-    else if (c == "<" && substr(text, i + 1, 1) == "<") { segment(); return }
-    else if (c == "\\") { c = substr(text, ++i, 1); if (c != "\n") word = word c }
-    else if (c == "#" && word == "") { while (i < length(text) && substr(text, i + 1, 1) != "\n") i++ }
+    else if (c == sq || c == "\"") { q = c; started = 1 }
+    else if (c == "<" && substr(text, i + 1, 1) == "<") {
+      flush()
+      if (substr(text, i + 2, 1) == "<") i += 2
+      else { waiting = 1; waitingStrip = substr(text, i + 2, 1) == "-"; i += waitingStrip ? 2 : 1 }
+    }
+    else if (c == "\\") { c = substr(text, ++i, 1); if (c != "\n") { word = word c; started = 1 } }
+    else if (c == "#" && !started) { while (i < length(text) && substr(text, i + 1, 1) != "\n") i++ }
     else if (c == " " || c == "\t") flush()
-    else if (index(";&|()`\n", c)) segment()
-    else word = word c
+    else if (c == "\n") {
+      segment()
+      if (waiting) return
+      for (k = 1; k <= pending; k++) {
+        closed = 0
+        while (i < length(text)) {
+          start = i + 1; rest = substr(text, start); end = index(rest, "\n")
+          line = end ? substr(rest, 1, end - 1) : rest
+          i = end ? start + end - 1 : length(text)
+          if (strip[k]) sub(/^\t+/, "", line)
+          if (line == delimiters[k]) { closed = 1; break }
+        }
+        if (!closed) return
+      }
+      pending = 0
+    }
+    else if (index(";&|()`", c)) { segment(); if (waiting) return }
+    else { word = word c; started = 1 }
   }
   segment()
 }

@@ -39,8 +39,17 @@ function linksNodeModules(words: string[]): boolean {
 
 function simpleCommands(text: string): string[][] {
   const segments: string[][] = [];
-  let words: string[] = [], word = "", quote: "'" | '"' | undefined;
-  const flush = () => { if (word) words.push(word); word = ""; };
+  const pending: { delimiter: string; stripTabs: boolean }[] = [];
+  let words: string[] = [], word = "", started = false, quote: "'" | '"' | undefined;
+  let waitingStripTabs: boolean | undefined;
+  const flush = () => {
+    if (started && waitingStripTabs !== undefined) {
+      pending.push({ delimiter: word, stripTabs: waitingStripTabs });
+      waitingStripTabs = undefined;
+    } else if (word) words.push(word);
+    word = "";
+    started = false;
+  };
   const segment = () => { flush(); if (words.length) segments.push(words); words = []; };
   for (let i = 0; i < text.length; i++) {
     const c = text[i]!;
@@ -50,13 +59,33 @@ function simpleCommands(text: string): string[][] {
       else if (c === "\\" && i + 1 < text.length && "$`\"\\\n".includes(text[i + 1]!)) word += text[++i];
       else word += c;
     }
-    else if (c === "'" || c === '"') quote = c;
-    else if (c === "<" && text[i + 1] === "<") { segment(); return segments; }
-    else if (c === "\\") { const next = text[++i] ?? ""; if (next !== "\n") word += next; }
-    else if (c === "#" && !word) { while (i + 1 < text.length && text[i + 1] !== "\n") i++; }
+    else if (c === "'" || c === '"') { quote = c; started = true; }
+    else if (c === "<" && text[i + 1] === "<") {
+      flush();
+      if (text[i + 2] === "<") i += 2;
+      else { waitingStripTabs = text[i + 2] === "-"; i += waitingStripTabs ? 2 : 1; }
+    }
+    else if (c === "\\") { const next = text[++i] ?? ""; if (next !== "\n") { word += next; started = true; } }
+    else if (c === "#" && !started) { while (i + 1 < text.length && text[i + 1] !== "\n") i++; }
     else if (c === " " || c === "\t") flush();
-    else if (";&|()`\n".includes(c)) segment();
-    else word += c;
+    else if (c === "\n") {
+      segment();
+      if (waitingStripTabs !== undefined) return segments;
+      for (const { delimiter, stripTabs } of pending) {
+        let closed = false;
+        while (i + 1 < text.length) {
+          const start = i + 1;
+          const end = text.indexOf("\n", start);
+          const line = text.slice(start, end < 0 ? text.length : end);
+          i = end < 0 ? text.length : end;
+          if ((stripTabs ? line.replace(/^\t+/, "") : line) === delimiter) { closed = true; break; }
+        }
+        if (!closed) return segments;
+      }
+      pending.length = 0;
+    }
+    else if (";&|()`".includes(c)) { segment(); if (waitingStripTabs !== undefined) return segments; }
+    else { word += c; started = true; }
   }
   segment();
   return segments;

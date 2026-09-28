@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { dependencyLinkCases } from "./link-guard-cases.ts";
 import { dependencyLinkReason, dependencyLinkRefusal, dependencyLinkScript } from "./link-guard.ts";
 
@@ -17,6 +20,27 @@ for (const { command, blocked } of dependencyLinkCases) {
   assert.equal(result.stderr, blocked ? `${reason}\n` : "", `Claude refusal: ${JSON.stringify(command)}`);
 }
 const link = "ln -s ../main/node_modules .";
+const examples = [
+  { command: `cat > f <<EOF\nx\nEOF\n${link}`, file: "x\n", stdout: "" },
+  { command: `cat <<< hi; ${link}`, file: undefined, stdout: "hi\n" },
+  { command: `cat > f <<'EOF'\n${link}\nEOF\n${link}`, file: `${link}\n`, stdout: "" },
+  { command: `cat > f <<-"EOF"\n\t${link}\n\tEOF\n${link}`, file: `${link}\n`, stdout: "" },
+  { command: `cat <<ONE <<'TWO' > f\n${link}\nONE\nbody\nTWO\n${link}`, file: "body\n", stdout: "" },
+];
+for (const { command, file, stdout } of examples) {
+  assert.equal(spawnSync("bash", ["-n"], { input: command }).status, 0, `real shell syntax: ${command}`);
+  const directory = mkdtempSync(join(tmpdir(), "piha-heredoc-"));
+  try {
+    const position = command.lastIndexOf(link);
+    const safe = command.slice(0, position) + "printf executed > marker" + command.slice(position + link.length);
+    const result = spawnSync("bash", ["-c", safe], { cwd: directory, encoding: "utf8" });
+    assert.equal(result.status, 0, `real shell execution: ${command} ${result.stderr}`);
+    assert.equal(result.stdout, stdout);
+    assert.equal(readFileSync(join(directory, "marker"), "utf8"), "executed");
+    if (file !== undefined) assert.equal(readFileSync(join(directory, "f"), "utf8"), file);
+    assert.equal(existsSync(join(directory, "node_modules")), false);
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+}
 for (const input of [
   JSON.stringify(body(link), null, 2),
   JSON.stringify({ tool_input: { description: "x", command: link }, command: "npm ci", note: { command: "npm ci" } }),
