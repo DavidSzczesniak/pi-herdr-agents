@@ -1,7 +1,7 @@
 // Claude runtime contracts. Herdr is stubbed; the launch script, settings, and hook script are real, and a fake claude
 // executable parses options like the real CLI and fires the adapter's own hooks. No model calls.
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { present } from "./fakes.ts";
@@ -206,6 +206,27 @@ try {
   assert.match(settled.finalText, /^done model=claude-opus-5-5 effort=high apiKey=unset bedrock=unset /, "credentials and provider routing are unset");
   assert.equal(readFileSync(present(settled.artifactPath, "settled artifact"), "utf8"), settled.finalText);
   assert.equal(settled.transcriptPath, join(stateDir, "claude", done.workerId, "transcript.jsonl"));
+  const workerDir = join(stateDir, "claude", done.workerId);
+  const settings = JSON.parse(readFileSync(join(workerDir, "settings.json"), "utf8"));
+  assert.deepEqual(Object.keys(settings.hooks).sort(), ["UserPromptSubmit", "Stop", "StopFailure", "SessionEnd", "PreToolUse"].sort());
+  const policy = settings.hooks.PreToolUse;
+  assert.equal(policy.length, 1);
+  assert.equal(policy[0].matcher, "Bash");
+  assert.equal(policy[0].hooks[0].type, "command");
+  assert.equal(policy[0].hooks[0].timeout, 5);
+  assert.match(policy[0].hooks[0].command, /link-guard\.sh/);
+  assert.doesNotMatch(policy[0].hooks[0].command, /claude-hook\.sh/);
+  const fireGuard = (command: string) => spawnSync("/bin/sh", ["-c", policy[0].hooks[0].command], { encoding: "utf8",
+    input: JSON.stringify({ hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: { command, description: "ln -s ../other/node_modules ." } }) });
+  const blocked = fireGuard("ln -s ../other/node_modules node_modules");
+  assert.equal(blocked.status, 2);
+  assert.equal(blocked.stderr, "Refused: this links another checkout's node_modules. Install dependencies in this worktree instead (for example `npm ci`).\n");
+  for (const command of ["npm ci", "ln -s a b"]) {
+    const allowed = fireGuard(command);
+    assert.equal(allowed.status, 0, command);
+    assert.equal(allowed.stderr, "", command);
+  }
+  assert.deepEqual(readdirSync(join(workerDir, "hooks")).filter((name) => name.startsWith("PreToolUse")), [], "policy is not settlement evidence");
   assert.ok(Buffer.byteLength(present(present(herdrCalls.find((args) => args[1] === "run"), "run command")[3], "exec line")) < 1024, "Herdr types only a short exec line");
   await assert.rejects(waitClaude(host, done.workerId, "other-submission", 1000), /Unknown submission/);
 

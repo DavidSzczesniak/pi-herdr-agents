@@ -1,0 +1,67 @@
+import { fileURLToPath } from "node:url";
+
+export const dependencyLinkReason = "Refused: this links another checkout's node_modules. Install dependencies in this worktree instead (for example `npm ci`).";
+export const dependencyLinkScript = fileURLToPath(new URL("./link-guard.sh", import.meta.url));
+
+const prefix = /^(!|\{|then|do|else|elif|if|while|until)$|^[A-Za-z_][A-Za-z0-9_]*=/;
+
+function linksNodeModules(words: string[]): boolean {
+  let i = 0;
+  while (i < words.length && prefix.test(words[i]!)) i++;
+  if (words[i] !== "ln" && !words[i]?.endsWith("/ln")) return false;
+  let end = false, symbolic = false, targetDirectory = false;
+  const operands: string[] = [];
+  for (i++; i < words.length; i++) {
+    const word = words[i]!;
+    if (/^[0-9]*[<>]/.test(word)) { if (/^[0-9]*[<>]+$/.test(word)) i++; }
+    else if (!end && word === "--") end = true;
+    else if (!end && /^--./.test(word)) {
+      if (word === "--symbolic") symbolic = true;
+      else if (word === "--target-directory" || word.startsWith("--target-directory=")) {
+        targetDirectory = true;
+        if (word === "--target-directory") i++;
+      } else if (word === "--suffix") i++;
+    } else if (!end && /^-./.test(word)) {
+      for (let j = 1; j < word.length; j++) {
+        if (word[j] === "s") symbolic = true;
+        else if (word[j] === "t" || word[j] === "S") {
+          if (word[j] === "t") targetDirectory = true;
+          if (j === word.length - 1) i++;
+          break;
+        }
+      }
+    } else operands.push(word);
+  }
+  const first = operands[0]?.replace(/\/+$/, "").split("/").pop();
+  const last = operands.at(-1);
+  return symbolic && first === "node_modules" && (targetDirectory || operands.length === 1 || last === "." || last?.endsWith("/") || last?.replace(/\/+$/, "").split("/").pop() === "node_modules");
+}
+
+function simpleCommands(text: string): string[][] {
+  const segments: string[][] = [];
+  let words: string[] = [], word = "", quote: "'" | '"' | undefined;
+  const flush = () => { if (word) words.push(word); word = ""; };
+  const segment = () => { flush(); if (words.length) segments.push(words); words = []; };
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i]!;
+    if (quote === "'") { if (c === "'") quote = undefined; else word += c; }
+    else if (quote === '"') {
+      if (c === '"') quote = undefined;
+      else if (c === "\\" && i + 1 < text.length && "$`\"\\\n".includes(text[i + 1]!)) word += text[++i];
+      else word += c;
+    }
+    else if (c === "'" || c === '"') quote = c;
+    else if (c === "<" && text[i + 1] === "<") { segment(); return segments; }
+    else if (c === "\\") { const next = text[++i] ?? ""; if (next !== "\n") word += next; }
+    else if (c === "#" && !word) { while (i + 1 < text.length && text[i + 1] !== "\n") i++; }
+    else if (c === " " || c === "\t") flush();
+    else if (";&|()`\n".includes(c)) segment();
+    else word += c;
+  }
+  segment();
+  return segments;
+}
+
+export function dependencyLinkRefusal(command: string): string | undefined {
+  return simpleCommands(command).some(linksNodeModules) ? dependencyLinkReason : undefined;
+}

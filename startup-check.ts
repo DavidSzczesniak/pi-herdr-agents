@@ -20,7 +20,7 @@ const navigationEvents = [
   { type: "session_before_fork", entryId: "", position: "at" },
   { type: "session_before_tree", preparation: { targetId: "", oldLeafId: null, commonAncestorId: null, entriesToSummarize: [], userWantsSummary: false }, signal: new AbortController().signal },
 ] satisfies ExtensionEvent[];
-const inertEvents = [{ type: "input", source: "extension", text: "" }, { type: "tool_call", toolCallId: "fixture", toolName: "bash", input: { command: "" } }, ...navigationEvents, { type: "cache_warming_decision", warmCost: 0, missCost: 0, continuationProbability: 0, action: "warm" }] satisfies ExtensionEvent[];
+const inertEvents = [{ type: "input", source: "extension", text: "" }, { type: "tool_call", toolCallId: "fixture", toolName: "bash", input: { command: "ln -s ../other/node_modules node_modules" } }, ...navigationEvents, { type: "cache_warming_decision", warmCost: 0, missCost: 0, continuationProbability: 0, action: "warm" }] satisfies ExtensionEvent[];
 function fixture({ id = "session-a", mode = "tui", persistent = true, env = {}, fail = false }: { id?: string; mode?: string; persistent?: boolean; env?: Record<string, string | undefined>; fail?: boolean | "report" } = {}) {
   const sessionFile = join(root, `${id}.jsonl`);
   if (!existsSync(sessionFile)) writeFileSync(sessionFile, JSON.stringify({ type: "session", id }) + "\n");
@@ -102,6 +102,13 @@ try {
   const b = fixture({ id: "session-b", env: { HERDR_SOCKET_PATH: "/exact/named.sock", HERDR_SESSION: "named" } });
   await a.start(); await b.start();
   assert.equal(a.tools.size, 7);
+  const bash = (command: string) => ({ type: "tool_call" as const, toolCallId: "fixture", toolName: "bash", input: { command } });
+  const link = bash("ln -s ../other/node_modules node_modules");
+  const refusal = [{ block: true, reason: "Refused: this links another checkout's node_modules. Install dependencies in this worktree instead (for example `npm ci`)." }];
+  assert.deepEqual(await a.emit(link), refusal, "lead refuses a borrowed dependency directory");
+  for (const command of ["npm ci", "ln -s a b", "ln -s ../other/node_modules backup"])
+    assert.deepEqual(await a.emit(bash(command)), [undefined], `lead permits ${command}`);
+  assert.deepEqual(await a.emit({ type: "tool_call", toolCallId: "fixture", toolName: "read", input: { path: "ln -s ../other/node_modules node_modules" } }), [undefined]);
   assert.ok(a.tools.has("retire_agent"), "ordinary autoload discovers retirement without changing root tool selection");
   assert.equal(a.changes, 0, "root preserves user-selected tools");
   assert.notEqual(a.config.stateDir, b.config.stateDir);
@@ -137,7 +144,10 @@ try {
   await linkedChild.stop();
   for (const event of navigationEvents)
     assert.deepEqual(await child.emit(event), [{ cancel: true }], "worker retains assigned conversation history");
-  assert.deepEqual(await child.emit({ type: "tool_call", toolCallId: "fixture", toolName: "bash", input: { command: "" } }), [undefined], "review role has no shell ban");
+  assert.deepEqual(await child.emit(bash("")), [undefined], "review role has no shell ban");
+  assert.deepEqual(await child.emit(link), refusal, "Pi worker refuses a borrowed dependency directory");
+  for (const command of ["npm ci", "ln -s a b"])
+    assert.deepEqual(await child.emit(bash(command)), [undefined], `Pi worker permits ${command}`);
   const duplicate = fixture();
   await duplicate.start();
   assert.match(present(duplicate.notifications[0], "duplicate notification"), /still live/);
@@ -146,6 +156,7 @@ try {
   assert.equal(a.identity().generation, original.generation);
   assert.ok(existsSync(original.socketPath));
   await a.stop();
+  assert.deepEqual(await a.emit(link), [undefined], "stopped lead adapter is inert");
   const restored = fixture();
   // Native Pi leaves an empty session unflushed, even though getSessionFile returns its path.
   rmSync(present(restored.ctx.sessionManager.getSessionFile(), "restored session file"));
@@ -159,6 +170,8 @@ try {
   assert.equal(listed[0].identity.generation, childIdentity.generation, "root reload preserves live descendants");
   assert.equal(listed[0].kind, "status");
   assert.equal(restored.shutdowns, 0);
+  assert.deepEqual(await restored.emit(link), refusal, "empty-history reload keeps one effective guard");
+  assert.deepEqual(await restored.emit(bash("npm ci")), [undefined]);
   writeFileSync(present(restored.ctx.sessionManager.getSessionFile(), "restored session file"), JSON.stringify({ type: "session", id: "session-a" }) + "\n");
   await restored.stop();
   // A crashed previous generation must pass death proof, never merely available:false.
@@ -209,7 +222,9 @@ try {
   assert.equal(fault.changes, 0);
   assert.equal(fault.tools.size, 0);
   assert.deepEqual(await fault.emit({ type: "input", source: "extension", text: "" }), [undefined]);
-  assert.deepEqual(await fault.emit({ type: "tool_call", toolCallId: "fixture", toolName: "bash", input: { command: "" } }), [undefined]);
+  assert.deepEqual(await fault.emit(link), [undefined], "faulted lead adapter is inert");
+  await child.stop();
+  assert.deepEqual(await child.emit(link), [{ block: true, reason: "Runtime shutting down" }], "shutdown takes precedence over link refusal");
   const guidelines = { type: "before_agent_start" as const, prompt: "", systemPrompt: "", systemPromptOptions: { cwd: project, selectedTools: [], toolSnippets: {}, toolGuidelines: {}, promptGuidelines: [], appendSystemPrompt: "", sections: {}, contextFiles: [], skills: [] } };
   await fault.emit(guidelines);
   assert.deepEqual(guidelines.systemPromptOptions.promptGuidelines, []);
