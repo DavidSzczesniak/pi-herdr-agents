@@ -8,57 +8,62 @@ import { once } from "node:events";
 import adapter from "./index.ts";
 import { atomicWrite, request } from "./protocol.ts";
 import { socketDirectory } from "./startup.ts";
+import { fakeApi, fakeContext, fakeModel, fakeRegistry, fakeSessions, fakeUi, hookRegistry, toolRegistry, present, toolText } from "./fakes.ts";
+import type { ExtensionEvent } from "@earendil-works/pi-coding-agent";
+import type { Request, Result } from "./protocol.ts";
+import { Type } from "typebox";
+import type { ChildProcess } from "node:child_process";
 import { claimLaunch, isOriginalProcessLive, processIdentity, planLines, tabPane, takeClaim, verifySession, waitProgress, recordSubmittedSize, runningTools } from "./runtime.ts";
 
 const directory = mkdtempSync(join(tmpdir(), "piha-adapter-"));
 const state = directory;
 const originalEnv = { ...process.env };
-const fixtures = [];
-let processProbe;
-const extraPanes = [];
-let panePids = [];
+const fixtures: { stop(): Promise<void> }[] = [];
+let processProbe: ChildProcess | undefined;
+const extraPanes: ReturnType<typeof pane>[] = [];
+let panePids: number[] = [];
 let closeKills = false;
 const pane = (id = "w1:p1") => ({ pane_id: id, workspace_id: "w1", terminal_id: `term-${id}`, tab_id: `tab-${id}` });
 const header = { type: "session", version: 3, id: "session-lead", timestamp: new Date().toISOString(), cwd: directory };
 
-function fixture({ workerId = "lead", role = "lead", thinking = "high", parentId = "", auth = true, mode = "started", restart = "", sessionId = `session-${workerId}`, failReport = false, launchFault = "", launchId = "" } = {}) {
+function fixture(options: { workerId?: string; role?: string; thinking?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"; parentId?: string; auth?: boolean; mode?: string; restart?: string; sessionId?: string; failReport?: boolean; launchFault?: string; launchId?: string } = {}) {
+  const { workerId = "lead", role = "lead", thinking = "high", parentId = "", auth = true, mode = "started", restart = "", sessionId = `session-${workerId}`, failReport = false, launchFault = "", launchId = "" } = options;
   Object.assign(process.env, { DS_HERDR_STATE_DIR: state, DS_HERDR_SESSION: "slice", DS_HERDR_WORKSPACE: directory,
     DS_HERDR_WORKER_ID: workerId, DS_HERDR_ROLE: role, DS_HERDR_PARENT_ID: parentId, DS_HERDR_RESTART_GENERATION: restart,
     HERDR_ENV: "1", HERDR_SESSION: "slice", HERDR_SOCKET_PATH: "/fixture/herdr.sock", HERDR_WORKSPACE_ID: "w1", HERDR_PANE_ID: `w1:p-${workerId}` });
   delete process.env.DS_HERDR_WORKSPACE_ID;
   process.env.DS_HERDR_LAUNCH_ID = launchId;
-  const hooks = new Map();
-  const tools = new Map();
-  const commands = [];
-  const widgets = new Map();
+  const hooks = hookRegistry();
+  const tools = toolRegistry();
+  const commands: string[][] = [];
+  const widgets = new Map<string, unknown>();
   let selectedTools = ["read", "bash", "external_evidence"];
-  let startupError;
+  let startupError: string | undefined;
   let effort = thinking;
   let idle = true;
   let shutdowns = 0;
   let sends = 0;
-  let runSignal;
-  let spawned;
-  let launched;
-  let abortController;
+  let runSignal: AbortSignal | undefined;
+  let spawned: ReturnType<typeof pane> | undefined;
+  let launched: Record<string, string> | undefined;
+  let abortController: AbortController | undefined;
   const sessionFile = join(state, `${workerId}.jsonl`);
   if (!existsSync(sessionFile)) writeFileSync(sessionFile, JSON.stringify({ ...header, id: sessionId }) + "\n");
-  const ctx = {
+  const ctx = fakeContext({
     cwd: directory, mode: "tui", hasUI: true, get signal() { return runSignal; },
-    model: { provider: "fixture", id: "no-network", reasoning: true },
-    modelRegistry: { find: (provider, id) => ({ provider, id, reasoning: true }),
-      hasConfiguredAuth: () => auth, getProviderAuthStatus: () => ({ configured: auth }) },
-    sessionManager: { getSessionFile: () => sessionFile, getSessionId: () => sessionId },
+    model: fakeModel("fixture", "no-network"),
+    modelRegistry: fakeRegistry({ find: (provider, id) => fakeModel(provider, id),
+      hasConfiguredAuth: () => auth, getProviderAuthStatus: () => ({ configured: auth }) }),
+    sessionManager: fakeSessions({ getSessionFile: () => sessionFile, getSessionId: () => sessionId }),
     isIdle: () => idle, hasPendingMessages: () => false,
     abort: () => abortController?.abort(), shutdown: () => { shutdowns++; },
-    ui: { notify(message) { startupError = message; }, setWidget(key, lines) { widgets.set(key, lines); } },
-  };
-  const emit = async (name, event = {}) => { for (const callback of hooks.get(name) ?? []) await callback(event, ctx); };
-  const api = {
-    on(name, callback) { hooks.set(name, [...(hooks.get(name) ?? []), callback]); },
-    registerTool(tool) { tools.set(tool.name, tool); },
+    ui: fakeUi({ notify(message) { startupError = message; }, setWidget(key, lines) { widgets.set(key, lines); } }),
+  });
+  const emit = async (event: ExtensionEvent) => { await hooks.emit(event, ctx); };
+  const api = fakeApi({
+    on: hooks.on, registerTool: tools.register,
     registerCommand() {},
-    getAllTools: () => ["read", "bash", "edit", "write", "grep", "find", "ls", "external_evidence", ...tools.keys()].map(name => ({ name })),
+    getAllTools: () => ["read", "bash", "edit", "write", "grep", "find", "ls", "external_evidence", ...tools.keys()].map(name => ({ name, description: "fixture", parameters: Type.Object({}), sourceInfo: { path: "fixture", source: "fixture", scope: "temporary", origin: "top-level" } })),
     getActiveTools: () => selectedTools, setActiveTools: names => { selectedTools = names; },
     getThinkingLevel: () => effort, setThinkingLevel: level => { effort = level; },
     appendEntry(type, data) { writeFileSync(sessionFile, JSON.stringify({ type: "custom", customType: type, data }) + "\n", { flag: "a" }); },
@@ -71,7 +76,7 @@ function fixture({ workerId = "lead", role = "lead", thinking = "high", parentId
         spawned = pane("w1:new");
         launched = Object.fromEntries(op.filter(value => /^DS_HERDR_(LAUNCH|WORKER)_ID=/.test(value)).map(value => value.split("=")));
         if (launchFault === "unknown-create") return { code: 1, killed: true, stderr: "fixture receipt lost", stdout: "" };
-        if (launchFault === "abort-after-create") abortController.abort();
+        if (launchFault === "abort-after-create") present(abortController, "launch abort controller").abort();
         return { code: 0, killed: false, stderr: "", stdout: JSON.stringify({ result: { root_pane: spawned } }) };
       }
       if (op[0] === "pane" && op[1] === "process-info")
@@ -79,10 +84,10 @@ function fixture({ workerId = "lead", role = "lead", thinking = "high", parentId
           foreground_process_group_id: panePids[0] ?? null, foreground_processes: panePids.map(pid => ({ pid, name: "pi" })) } } }) };
       if (op[0] === "agent" && op[1] === "start" && launchFault.startsWith("child-exits")) {
         // The child fails its own startup and exits; Herdr would keep waiting for readiness.
-        atomicWrite(join(state, "operations", `startup-failed-${launched.DS_HERDR_LAUNCH_ID}.json`), { launchId: launched.DS_HERDR_LAUNCH_ID,
-          workerId: launched.DS_HERDR_WORKER_ID, error: "fixture cwd mismatch", pid: process.pid,
-          pidBirth: launchFault === "child-exits-live" ? processIdentity(process.pid).birth : "exited-child" });
-        return new Promise(resolve => options.signal.addEventListener("abort", () => resolve({ code: 1, killed: true, stderr: "", stdout: "" })));
+        atomicWrite(join(state, "operations", `startup-failed-${present(launched, "launched environment").DS_HERDR_LAUNCH_ID}.json`), { launchId: present(launched, "launched environment").DS_HERDR_LAUNCH_ID,
+          workerId: present(launched, "launched environment").DS_HERDR_WORKER_ID, error: "fixture cwd mismatch", pid: process.pid,
+          pidBirth: launchFault === "child-exits-live" ? present(processIdentity(process.pid), "process identity").birth : "exited-child" });
+        return new Promise(resolve => present(options?.signal, "exec signal").addEventListener("abort", () => resolve({ code: 1, killed: true, stderr: "", stdout: "" })));
       }
       if (op[0] === "agent" && op[1] === "start") return { code: 1, killed: false, stderr: "fixture startup failure", stdout: "" };
       if (op[0] === "pane" && op[1] === "list") return { code: 0, killed: false, stderr: "", stdout: JSON.stringify({ result: { panes: [...["w1:cowned", "w1:cstranger", "w1:cwaiting"].map(id => pane(id)), ...extraPanes] } }) };
@@ -92,31 +97,38 @@ function fixture({ workerId = "lead", role = "lead", thinking = "high", parentId
       return { code: 0, killed: false, stderr: "", stdout: "" };
     },
     sendUserMessage(text) {
+      if (typeof text !== "string") throw new Error("expected user text");
       sends++;
       void (async () => {
-        await emit("input", { source: "extension", text });
+        await emit({ type: "input", source: "extension", text });
         if (mode !== "started") return;
-        await emit("before_agent_start", { prompt: text, systemPromptOptions: { promptGuidelines: [] } });
+        await emit({ type: "before_agent_start", prompt: text, systemPrompt: "", systemPromptOptions: { cwd: directory, selectedTools: [], toolSnippets: {}, toolGuidelines: {}, promptGuidelines: [], appendSystemPrompt: "", sections: {}, contextFiles: [], skills: [] } });
         idle = false;
         abortController = new AbortController();
         runSignal = abortController.signal;
-        await emit("agent_start");
+        await emit({ type: "agent_start" });
       })();
     },
-  };
+  });
   adapter(api);
   const instance = {
     tools, commands, widgets, ctx, emit, sessionFile,
     get sends() { return sends; }, get shutdowns() { return shutdowns; }, get effort() { return effort; }, get activeTools() { return selectedTools; },
-    setAbort(controller) { abortController = controller; },
-    async start(reason = "startup") { await emit("session_start", { reason }); if (startupError) throw new Error(startupError); return JSON.parse(readFileSync(join(state, "workers", `${workerId}.json`))); },
-    async settle() { await emit("agent_before_settle", { outcome: "completed" }); idle = true; await emit("agent_settled"); },
-    async stop() { await emit("session_shutdown"); },
+    setAbort(controller: AbortController) { abortController = controller; },
+    async start(reason: "startup" | "reload" = "startup") { await emit({ type: "session_start", reason }); if (startupError) throw new Error(startupError); return JSON.parse(readFileSync(join(state, "workers", `${workerId}.json`), "utf8")); },
+    async settle() { await emit({ type: "agent_before_settle", outcome: "completed", entries: [], continue: false, context: { contextEntries: [], contextMessages: [], llmMessages: [], pendingMessages: [], canContinue: false } }); idle = true; await emit({ type: "agent_settled" }); },
+    async stop() { await emit({ type: "session_shutdown", reason: "quit" }); },
   };
   fixtures.push(instance);
   return instance;
 }
-const selfRequest = (identity, operation) => request(identity.socketPath, { callerId: identity.workerId, callerGeneration: identity.generation, generation: identity.generation, ...operation });
+type OwnRequest = Request extends infer R ? R extends Request ? Omit<R, "callerId" | "callerGeneration" | "generation"> : never : never;
+const selfRequest = (identity: { socketPath: string; workerId: string; generation: string }, operation: OwnRequest) => request(identity.socketPath, { callerId: identity.workerId, callerGeneration: identity.generation, generation: identity.generation, ...operation });
+const status = async (identity: { socketPath: string; workerId: string; generation: string }): Promise<Extract<Result, { kind: "status" }>> => {
+  const result = await selfRequest(identity, { kind: "status" });
+  if (result.kind !== "status") throw new Error(`expected status, got ${result.kind}`);
+  return result;
+};
 try {
   const current = processIdentity(process.pid);
   assert.ok(current);
@@ -133,7 +145,7 @@ try {
   const noauth = await selfRequest(lead, { kind: "submit", submissionId: "noauth", task: "not executed" });
   assert.equal(noauth.kind, "unavailable");
   assert.equal(root.sends, 0);
-  assert.equal((await selfRequest(lead, { kind: "status" })).active, null);
+  assert.equal((await status(lead)).active, null);
   await assert.rejects(selfRequest(lead, { kind: "submit", submissionId: "noauth", task: "duplicate" }), /Duplicate/);
   await root.tools.get("update_plan").execute("p1", { plan: [{ step: "  exact step  ", status: "pending" }] }, undefined, undefined, root.ctx);
   const leadPlan = readFileSync(join(state, "plans", "lead.json"), "utf8");
@@ -162,15 +174,16 @@ try {
   const originalModelOwner = await modelOwner.start();
   assert.deepEqual(originalModelOwner.model, { provider: "fixture", id: "no-network" });
   const selectedModel = { provider: "another-provider", id: "human-selected-model" };
-  modelOwner.ctx.model = selectedModel;
-  await modelOwner.emit("model_select", { model: selectedModel, source: "set" });
+  const nativeModel = fakeModel(selectedModel.provider, selectedModel.id);
+  modelOwner.ctx.model = nativeModel;
+  await modelOwner.emit({ type: "model_select", model: nativeModel, previousModel: fakeModel("fixture", "no-network"), source: "set" });
   await modelOwner.stop();
-  const deadModelOwner = JSON.parse(readFileSync(join(state, "workers", "model-owner.json")));
+  const deadModelOwner = JSON.parse(readFileSync(join(state, "workers", "model-owner.json"), "utf8"));
   assert.deepEqual(deadModelOwner.model, selectedModel, "native model_select persists current authoritative model");
   assert.ok(!readFileSync(modelOwner.sessionFile, "utf8").includes('"type":"message"'), "preflight-only session has no messages");
   atomicWrite(join(state, "workers", "model-owner.json"), { ...deadModelOwner, pidBirth: "dead-previous-process" });
   await assert.rejects(root.tools.get("followup_task").execute("model-revive", { agent_id: "model-owner", task: "new task only" }, undefined, undefined, root.ctx), /fixture startup failure/);
-  const modelStart = root.commands.find(args => args[2] === "agent" && args[3] === "start");
+  const modelStart = present(root.commands.find(args => args[2] === "agent" && args[3] === "start"), "model start command");
   assert.equal(modelStart[modelStart.indexOf("--model") + 1], "another-provider/human-selected-model");
   assert.ok(existsSync(join(state, "locks", "launch-model-owner", "claim.json")), "unconfirmed native process retains launch fence");
   const startsBeforeRetry = root.commands.length;
@@ -185,14 +198,14 @@ try {
     callerGeneration: lead.generation, pid: lead.pid, pidBirth: lead.pidBirth });
   process.env.DS_HERDR_LAUNCH_ID = "wrong-token";
   await assert.rejects(claimed.start(), /launch claim/, "child refuses an unrelated launch token");
-  const recorded = JSON.parse(readFileSync(join(state, "operations", "startup-failed-wrong-token.json")));
+  const recorded = JSON.parse(readFileSync(join(state, "operations", "startup-failed-wrong-token.json"), "utf8"));
   assert.match(recorded.error, /launch claim/, "a failed child records why for its launcher");
   assert.deepEqual([recorded.workerId, recorded.pid], ["claimed", process.pid]);
   assert.ok(existsSync(join(launchClaim.path, "claim.json")), "child never releases caller's claim");
   const matchingClaimed = fixture({ workerId: "claimed", parentId: "lead", role: "implement", thinking: "medium", launchId: "launch-token" });
   process.env.DS_HERDR_LAUNCH_ID = "launch-token";
   const claimedIdentity = await matchingClaimed.start();
-  assert.equal((await selfRequest(claimedIdentity, { kind: "status" })).identity.model.id, "no-network");
+  assert.equal(present((await status(claimedIdentity)).identity.model, "claimed model").id, "no-network");
   launchClaim.release();
   assert.equal(existsSync(launchClaim.path), false, "launcher can release exact claim after matching live identity");
   await matchingClaimed.stop();
@@ -207,12 +220,14 @@ try {
   const pending = await pendingWorker.start();
   const ambiguous = await selfRequest(pending, { kind: "submit", submissionId: "ambiguous", task: "never replay" });
   assert.equal(ambiguous.kind, "ambiguous");
-  assert.equal((await selfRequest(pending, { kind: "status" })).active.phase, "ambiguous");
+  const pendingActive = present((await status(pending)).active, "pending task");
+  if (pendingActive.kind !== "active") throw new Error("expected active pending task");
+  assert.equal(pendingActive.phase, "ambiguous");
   const reset = await selfRequest(pending, { kind: "interrupt", submissionId: "ambiguous", timeoutMs: 10 });
   assert.equal(reset.kind, "reset_requested");
   await new Promise(resolve => setTimeout(resolve, 80));
   assert.equal(pendingWorker.shutdowns, 1);
-  assert.equal(JSON.parse(readFileSync(join(state, "tasks", "pending", "ambiguous.json"))).kind, "unavailable");
+  assert.equal(JSON.parse(readFileSync(join(state, "tasks", "pending", "ambiguous.json"), "utf8")).kind, "unavailable");
   assert.equal(pendingWorker.sends, 1);
   await pendingWorker.stop();
 
@@ -224,8 +239,8 @@ try {
   assert.ok(fault.commands.some(args => args[2] === "tab" && args[3] === "create" && args.includes("--workspace") && args.includes("w1")));
   assert.ok(fault.commands.some(args => args[2] === "pane" && args[3] === "close" && args[4] === "w1:new"));
   assert.ok(!fault.commands.some(args => args.includes("split")));
-  const cancelledLaunch = fault.commands.find(args => args[2] === "tab" && args[3] === "create");
-  const cancelledWorker = cancelledLaunch.find(value => value.startsWith("DS_HERDR_WORKER_ID=")).split("=")[1];
+  const cancelledLaunch = present(fault.commands.find(args => args[2] === "tab" && args[3] === "create"), "cancelled tab command");
+  const cancelledWorker = present(cancelledLaunch.find(value => value.startsWith("DS_HERDR_WORKER_ID=")), "cancelled worker environment").split("=")[1];
   assert.equal(existsSync(join(state, "locks", `launch-${cancelledWorker}`)), false, "proven pre-start cleanup releases launch claim");
   await fault.stop();
 
@@ -234,18 +249,18 @@ try {
   assert.equal(startupFault.effort, "high");
   await assert.rejects(startupFault.tools.get("spawn_agent").execute("spawn-fail", { role: "implement", thinking: "medium", task: "complete brief" }, undefined, undefined, startupFault.ctx), /fixture startup failure.*exact newly-created pane closed/);
   assert.ok(startupFault.commands.some(args => args[2] === "pane" && args[3] === "close" && args[4] === "w1:new"));
-  const unstarted = startupFault.commands.find(args => args[2] === "tab" && args[3] === "create").find(value => value.startsWith("DS_HERDR_WORKER_ID=")).split("=")[1];
+  const unstarted = present(present(startupFault.commands.find(args => args[2] === "tab" && args[3] === "create"), "tab command").find(value => value.startsWith("DS_HERDR_WORKER_ID=")), "worker environment").split("=")[1];
   assert.ok(existsSync(join(state, "locks", `launch-${unstarted}`)), "an unexplained startup failure keeps its claim");
   const retireUnstarted = () => startupFault.tools.get("retire_agent").execute("retire", { agent_id: unstarted }, undefined, undefined, startupFault.ctx);
   await assert.rejects(retireUnstarted(), /No recorded process/, "pane absence alone is not process proof");
   await assert.rejects(root.tools.get("retire_agent").execute("retire", { agent_id: "never-launched" }, undefined, undefined, root.ctx), /No worker identity or launch claim/);
   // The pane's process outlives the close, so the claim stays until a later retire proves it dead.
   const paneProbe = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
-  panePids = [paneProbe.pid];
+  panePids = [present(paneProbe.pid, "pane process pid")];
   await assert.rejects(startupFault.tools.get("spawn_agent").execute("spawn-slow", { role: "implement", thinking: "medium", task: "complete brief" }, undefined, undefined, startupFault.ctx),
     /launch claim retained/);
   panePids = [];
-  const slow = startupFault.commands.filter(args => args[2] === "tab" && args[3] === "create").at(-1).find(value => value.startsWith("DS_HERDR_WORKER_ID=")).split("=")[1];
+  const slow = present(present(startupFault.commands.filter(args => args[2] === "tab" && args[3] === "create").at(-1), "tab command").find(value => value.startsWith("DS_HERDR_WORKER_ID=")), "worker environment").split("=")[1];
   const retireSlow = () => startupFault.tools.get("retire_agent").execute("retire", { agent_id: slow }, undefined, undefined, startupFault.ctx);
   await assert.rejects(retireSlow(), /still live/, "a live recorded process blocks retirement");
   const probeExit = once(paneProbe, "exit");
@@ -254,45 +269,45 @@ try {
   extraPanes.push({ ...pane("w1:other"), terminal_id: "term-w1:new" });
   await assert.rejects(retireSlow(), /ambiguous/, "a partial pane match is not ours to close");
   extraPanes.length = 0;
-  assert.equal(JSON.parse((await retireSlow()).content[0].text).state, "retired", "a recorded process proven dead releases the claim");
+  assert.equal(JSON.parse(toolText(await retireSlow())).state, "retired", "a recorded process proven dead releases the claim");
   assert.ok(!existsSync(join(state, "locks", `launch-${slow}`)));
   // Closing the pane ends its processes, so the snapshot alone proves cleanup.
   const hungUp = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
-  panePids = [hungUp.pid];
+  panePids = [present(hungUp.pid, "hung-up process pid")];
   closeKills = true;
   await assert.rejects(startupFault.tools.get("spawn_agent").execute("spawn-hup", { role: "implement", thinking: "medium", task: "complete brief" }, undefined, undefined, startupFault.ctx),
     /process cleanup proven/);
   panePids = [];
   closeKills = false;
-  const hup = startupFault.commands.filter(args => args[2] === "tab" && args[3] === "create").at(-1).find(value => value.startsWith("DS_HERDR_WORKER_ID=")).split("=")[1];
+  const hup = present(present(startupFault.commands.filter(args => args[2] === "tab" && args[3] === "create").at(-1), "tab command").find(value => value.startsWith("DS_HERDR_WORKER_ID=")), "worker environment").split("=")[1];
   assert.ok(!existsSync(join(state, "locks", `launch-${hup}`)), "a snapshot proven dead releases the claim without a failure record");
   // A retirer that took the claim first leaves the launcher's release nothing to do; a fence removed by anyone else is an error.
   const raced = claimLaunch(state, { launchId: "raced-launch", workerId: "raced", previousGeneration: null,
     piSessionPath: join(state, "raced.jsonl"), model: { provider: "fixture", id: "no-network" }, thinking: "medium", callerId: "startup-fault",
-    callerGeneration: "g", pid: process.pid, pidBirth: processIdentity(process.pid).birth });
+    callerGeneration: "g", pid: process.pid, pidBirth: present(processIdentity(process.pid), "process identity").birth });
   const racedTaken = takeClaim(state, "raced", "raced-launch", "retired");
   assert.ok(racedTaken);
   raced.release();
   rmSync(racedTaken, { recursive: true });
   const lostFence = claimLaunch(state, { launchId: "lost-launch", workerId: "lost-fence", previousGeneration: null,
     piSessionPath: join(state, "lost.jsonl"), model: { provider: "fixture", id: "no-network" }, thinking: "medium", callerId: "startup-fault",
-    callerGeneration: "g", pid: process.pid, pidBirth: processIdentity(process.pid).birth });
+    callerGeneration: "g", pid: process.pid, pidBirth: present(processIdentity(process.pid), "process identity").birth });
   rmSync(lostFence.path, { recursive: true });
   assert.throws(() => lostFence.release(), /fence was removed/);
   // A retirement interrupted after taking the claim finishes on retry.
   const interrupted = claimLaunch(state, { launchId: "interrupted-launch", workerId: "interrupted", previousGeneration: null,
     piSessionPath: join(state, "interrupted.jsonl"), model: { provider: "fixture", id: "no-network" }, thinking: "medium", callerId: "startup-fault",
-    callerGeneration: "g", pid: process.pid, pidBirth: processIdentity(process.pid).birth });
+    callerGeneration: "g", pid: process.pid, pidBirth: present(processIdentity(process.pid), "process identity").birth });
   assert.ok(takeClaim(state, "interrupted", "interrupted-launch", "retired"));
-  const finished = JSON.parse((await startupFault.tools.get("retire_agent").execute("retire", { agent_id: "interrupted" }, undefined, undefined, startupFault.ctx)).content[0].text);
+  const finished = JSON.parse(toolText(await startupFault.tools.get("retire_agent").execute("retire", { agent_id: "interrupted" }, undefined, undefined, startupFault.ctx)));
   assert.match(finished.reason, /interrupted retirement/);
   assert.ok(!existsSync(join(state, "locks", "retired-launch-interrupted-interrupted-launch")));
-  assert.equal(JSON.parse((await startupFault.tools.get("retire_agent").execute("retire", { agent_id: "interrupted" }, undefined, undefined, startupFault.ctx)).content[0].text).evidencePath,
+  assert.equal(JSON.parse(toolText(await startupFault.tools.get("retire_agent").execute("retire", { agent_id: "interrupted" }, undefined, undefined, startupFault.ctx))).evidencePath,
     finished.evidencePath, "a repeat returns the recorded retirement");
   void interrupted;
   const crafted = claimLaunch(state, { launchId: "crafted-launch", workerId: "crafted", previousGeneration: null,
     piSessionPath: join(state, "crafted.jsonl"), model: { provider: "fixture", id: "no-network" }, thinking: "medium", callerId: "startup-fault",
-    callerGeneration: "g", pid: process.pid, pidBirth: processIdentity(process.pid).birth });
+    callerGeneration: "g", pid: process.pid, pidBirth: present(processIdentity(process.pid), "process identity").birth });
   atomicWrite(join(state, "operations", "launch-crafted-launch.json"), { launchId: "crafted-launch", workerId: "crafted", pane: pane("w1:crafted"),
     data: { kind: "starting" } });
   await assert.rejects(startupFault.tools.get("retire_agent").execute("retire", { agent_id: "crafted" }, undefined, undefined, startupFault.ctx), /Launch not finished/);
@@ -302,24 +317,24 @@ try {
   await outsider.stop();
   crafted.release();
   // A process recorded for the failed launch lets retire take the claim once the pane is gone.
-  atomicWrite(join(state, "operations", `launch-${JSON.parse(readFileSync(join(state, "locks", `launch-${unstarted}`, "claim.json"))).launchId}.json`),
-    { ...JSON.parse(readFileSync(join(state, "operations", `launch-${JSON.parse(readFileSync(join(state, "locks", `launch-${unstarted}`, "claim.json"))).launchId}.json`))),
+  atomicWrite(join(state, "operations", `launch-${JSON.parse(readFileSync(join(state, "locks", `launch-${unstarted}`, "claim.json"), "utf8")).launchId}.json`),
+    { ...JSON.parse(readFileSync(join(state, "operations", `launch-${JSON.parse(readFileSync(join(state, "locks", `launch-${unstarted}`, "claim.json"), "utf8")).launchId}.json`), "utf8")),
       data: { kind: "failed", processes: [{ pid: process.pid, pidBirth: "exited-shell" }] } });
   extraPanes.push(pane("w1:new"));
   await assert.rejects(retireUnstarted(), /still open/, "a never-started child retires only once its pane is gone");
   extraPanes.length = 0;
-  const unstartedResult = JSON.parse((await retireUnstarted()).content[0].text);
+  const unstartedResult = JSON.parse(toolText(await retireUnstarted()));
   assert.equal(unstartedResult.state, "retired");
   assert.equal(existsSync(join(state, "locks", `launch-${unstarted}`)), false, "retiring a never-started child releases its claim");
   assert.ok(existsSync(unstartedResult.evidencePath));
-  assert.equal(JSON.parse((await retireUnstarted()).content[0].text).evidencePath, unstartedResult.evidencePath, "a repeat returns the recorded retirement");
+  assert.equal(JSON.parse(toolText(await retireUnstarted())).evidencePath, unstartedResult.evidencePath, "a repeat returns the recorded retirement");
   await startupFault.stop();
 
   const liveExit = fixture({ workerId: "live-exit", parentId: "lead", role: "judgment", launchFault: "child-exits-live" });
   await liveExit.start();
   await assert.rejects(liveExit.tools.get("spawn_agent").execute("spawn-live", { role: "implement", thinking: "medium", task: "complete brief" }, undefined, undefined, liveExit.ctx),
     /Worker startup failed: fixture cwd mismatch.*launch claim retained/);
-  const liveChild = liveExit.commands.find(args => args[2] === "tab" && args[3] === "create").find(value => value.startsWith("DS_HERDR_WORKER_ID=")).split("=")[1];
+  const liveChild = present(present(liveExit.commands.find(args => args[2] === "tab" && args[3] === "create"), "tab command").find(value => value.startsWith("DS_HERDR_WORKER_ID=")), "worker environment").split("=")[1];
   assert.ok(existsSync(join(state, "locks", `launch-${liveChild}`)), "a failure record naming a live process keeps the claim");
   rmSync(join(state, "locks", `launch-${liveChild}`), { recursive: true });
   await liveExit.stop();
@@ -330,7 +345,7 @@ try {
   await assert.rejects(childExit.tools.get("spawn_agent").execute("spawn-exit", { role: "implement", thinking: "medium", task: "complete brief" }, undefined, undefined, childExit.ctx),
     /Worker startup failed: fixture cwd mismatch.*process cleanup proven/);
   assert.ok(Date.now() - began < 5000, "the child's failure record ends the readiness wait");
-  const exitedChild = childExit.commands.find(args => args[2] === "tab" && args[3] === "create").find(value => value.startsWith("DS_HERDR_WORKER_ID=")).split("=")[1];
+  const exitedChild = present(present(childExit.commands.find(args => args[2] === "tab" && args[3] === "create"), "tab command").find(value => value.startsWith("DS_HERDR_WORKER_ID=")), "worker environment").split("=")[1];
   assert.equal(existsSync(join(state, "locks", `launch-${exitedChild}`)), false, "a recorded and proven-dead child releases its claim");
   await childExit.stop();
 
@@ -342,7 +357,7 @@ try {
 
   const duplicate = fixture({ workerId: "lead", restart: lead.generation });
   await assert.rejects(duplicate.start(), /still live/);
-  assert.equal(JSON.parse(readFileSync(join(state, "workers", "lead.json"))).generation, lead.generation);
+  assert.equal(JSON.parse(readFileSync(join(state, "workers", "lead.json"), "utf8")).generation, lead.generation);
   verifySession(lead);
   assert.throws(() => verifySession({ ...lead, piSessionId: "wrong" }), /UUID mismatch/);
   await root.stop();
@@ -374,16 +389,20 @@ try {
   assert.notEqual(newLead.generation, previous.generation);
   assert.equal((await selfRequest(newLead, { kind: "wait", submissionId: "interrupted-old", timeoutMs: 10 })).kind, "unavailable");
   const oldRejected = await selfRequest(newLead, { kind: "wait", submissionId: "noauth", timeoutMs: 10 });
+  if (oldRejected.kind !== "unavailable") throw new Error(`expected unavailable, got ${oldRejected.kind}`);
   assert.equal(oldRejected.generation, previous.generation, "old results keep original generation");
-  assert.equal(revived.widgets.get("ds-plan")[0], "[ ]   exact step  ");
+  const revivedWidget = present(revived.widgets.get("ds-plan"), "plan widget");
+  if (!Array.isArray(revivedWidget)) throw new Error("expected plan widget lines");
+  assert.equal(revivedWidget[0], "[ ]   exact step  ");
   await selfRequest(newLead, { kind: "submit", submissionId: "new", task: "only new task" });
   const oldAgain = await selfRequest(newLead, { kind: "wait", submissionId: "noauth", timeoutMs: 10 });
+  if (oldAgain.kind !== "unavailable") throw new Error(`expected unavailable, got ${oldAgain.kind}`);
   assert.equal(oldAgain.generation, previous.generation);
-  assert.equal((await selfRequest(newLead, { kind: "status" })).active.submissionId, "new", "historical wait does not mask or settle current task");
+  assert.equal(present((await status(newLead)).active, "new task").submissionId, "new", "historical wait does not mask or settle current task");
   assert.equal(revived.sends, 1);
   await revived.settle();
   // Claude workers route through the same tools; ownership, one-shot follow-up, and effort validation hold at the tool layer.
-  const plantClaude = (id, parentId, stop) => {
+  const plantClaude = (id: string, parentId: string, stop?: string) => {
     const dir = join(state, "claude", id);
     mkdirSync(join(dir, "hooks"), { recursive: true, mode: 0o700 });
     writeFileSync(join(dir, "hooks", "UserPromptSubmit-1-1.json"), JSON.stringify({ session_id: "cs", transcript_path: join(dir, "transcript.jsonl") }));
@@ -396,7 +415,7 @@ try {
   };
   plantClaude("cowned", "lead", "planted review");
   plantClaude("cstranger", "stranger", "not yours");
-  const tool = async (name, params) => JSON.parse((await revived.tools.get(name).execute(name, params, undefined, undefined, revived.ctx)).content[0].text);
+  const tool = async (name: string, params: unknown) => JSON.parse(toolText(await revived.tools.get(name).execute(name, params, undefined, undefined, revived.ctx)));
   const claudeResult = await tool("wait_agent", { agent_id: "cowned", submission_id: "sub-cowned", timeout_ms: 120000 });
   assert.equal(claudeResult.sessionGrowth, undefined, "a settled wait carries no progress fields");
   assert.match(revived.tools.get("wait_agent").description, /Two consecutive timeouts with zero sessionGrowth and empty pending mean a stall/);
@@ -409,7 +428,7 @@ try {
   assert.deepEqual(waitProgress(state, "lead", "cprogress", "sub-p", transcript), { sessionBytes: 25, sessionGrowth: 0 }, "no growth is a stall window");
   assert.deepEqual(waitProgress(state, "owner", "cprogress", "sub-p", transcript), { sessionBytes: 25, sessionGrowth: null }, "each caller keeps its own baseline");
   // A Pi tool call that started and has not ended is pending: a long command writes nothing to the session.
-  const auditLine = (generation, event, data) => JSON.stringify({ at: "2026-09-27T00:00:00.000Z", workerId: "piworker", generation, submissionId: null, event, data }) + "\n";
+  const auditLine = (generation: string, event: string, data: Record<string, unknown>) => JSON.stringify({ at: "2026-09-27T00:00:00.000Z", workerId: "piworker", generation, submissionId: null, event, data }) + "\n";
   writeFileSync(join(state, "audit", "piworker.ndjson"), auditLine("g1", "tool_start", { toolName: "bash", toolCallId: "t1" }) +
     auditLine("g1", "tool_end", { toolName: "bash", toolCallId: "t1", isError: false }) + auditLine("g1", "tool_start", { toolName: "bash", toolCallId: "t2" }) +
     auditLine("g0", "tool_start", { toolName: "read", toolCallId: "t0" }) + "not json\n");
@@ -431,7 +450,7 @@ try {
   assert.equal(claudeResult.runtime, "claude");
   assert.equal(claudeResult.outcome, "completed");
   assert.equal(claudeResult.finalText, "planted review");
-  const listed = await tool("list_agents", {});
+  const listed: { kind: string; workerId: string }[] = await tool("list_agents", {});
   assert.ok(listed.some((row) => row.kind === "claude_status" && row.workerId === "cowned"));
   assert.ok(!listed.some((row) => row.workerId === "cstranger"), "another parent's Claude worker is not listed");
   await assert.rejects(tool("wait_agent", { agent_id: "cstranger", submission_id: "sub-cstranger", timeout_ms: 120000 }), /not this caller's descendant/);
