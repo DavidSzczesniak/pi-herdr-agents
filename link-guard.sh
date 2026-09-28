@@ -38,8 +38,9 @@ function command(json,    i, j, c, previous, depth, inToolInput, key, raw) {
 function flush() {
   if (started && waiting) {
     delimiters[++pending] = word; strip[pending] = waitingStrip; waiting = 0
-  } else if (word != "") words[++n] = word
-  word = ""; started = 0
+  } else if (started && hereString) hereString = 0
+  else if (word != "") words[++n] = word
+  word = ""; started = 0; unquoted = 1
 }
 function classify(    i, w, j, c, end, symbolic, targetDirectory, count, first, last, dir) {
   i = 1
@@ -76,7 +77,7 @@ function classify(    i, w, j, c, end, symbolic, targetDirectory, count, first, 
 }
 function segment() { flush(); if (n && classify()) found = 1; n = 0 }
 function scan(text,    i, c, q, sq, k, start, rest, end, line, closed) {
-  sq = sprintf("%c", 39); q = ""; n = 0; word = ""; started = 0; waiting = 0; pending = 0
+  sq = sprintf("%c", 39); q = ""; n = 0; word = ""; started = 0; unquoted = 1; hereString = 0; waiting = 0; pending = 0
   for (i = 1; i <= length(text); i++) {
     c = substr(text, i, 1)
     if (q == sq) { if (c == sq) q = ""; else word = word c }
@@ -85,13 +86,14 @@ function scan(text,    i, c, q, sq, k, start, rest, end, line, closed) {
       else if (c == "\\" && index("$`\"\\\n", substr(text, i + 1, 1))) word = word substr(text, ++i, 1)
       else word = word c
     }
-    else if (c == sq || c == "\"") { q = c; started = 1 }
+    else if (c == sq || c == "\"") { q = c; started = 1; unquoted = 0 }
     else if (c == "<" && substr(text, i + 1, 1) == "<") {
-      flush()
-      if (substr(text, i + 2, 1) == "<") i += 2
+      if (started && unquoted && word ~ /^[0-9]+$/) { word = ""; started = 0 }
+      else flush()
+      if (substr(text, i + 2, 1) == "<") { hereString = 1; i += 2 }
       else { waiting = 1; waitingStrip = substr(text, i + 2, 1) == "-"; i += waitingStrip ? 2 : 1 }
     }
-    else if (c == "\\") { c = substr(text, ++i, 1); if (c != "\n") { word = word c; started = 1 } }
+    else if (c == "\\") { c = substr(text, ++i, 1); if (c != "\n") { word = word c; started = 1; unquoted = 0 } }
     else if (c == "#" && !started) { while (i < length(text) && substr(text, i + 1, 1) != "\n") i++ }
     else if (c == " " || c == "\t") flush()
     else if (c == "\n") {

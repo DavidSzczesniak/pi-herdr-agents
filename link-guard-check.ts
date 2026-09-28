@@ -41,6 +41,22 @@ for (const { command, file, stdout } of examples) {
     assert.equal(existsSync(join(directory, "node_modules")), false);
   } finally { rmSync(directory, { recursive: true, force: true }); }
 }
+for (const { command, destination } of [
+  { command: "ln -s ../main/node_modules backup <<< node_modules", destination: "backup" },
+  { command: "ln -s ../main/node_modules node_modules <<< ignored", destination: "node_modules" },
+  { command: "ln -s ../main/node_modules node_modules 3<<< ignored", destination: "node_modules" },
+  { command: "ln -s ../main/node_modules node_modules 2<<EOF\nignored\nEOF", destination: "node_modules" },
+]) {
+  assert.equal(spawnSync("bash", ["-n"], { input: command }).status, 0, `real redirection syntax: ${command}`);
+  const directory = mkdtempSync(join(tmpdir(), "piha-redirection-"));
+  try {
+    const safe = command.replace(`ln -s ../main/node_modules ${destination}`, "printf executed > marker");
+    const result = spawnSync("bash", ["-c", safe], { cwd: directory, encoding: "utf8" });
+    assert.equal(result.status, 0, `real redirection execution: ${command} ${result.stderr}`);
+    assert.equal(readFileSync(join(directory, "marker"), "utf8"), "executed");
+    assert.equal(existsSync(join(directory, "node_modules")), false);
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+}
 for (const input of [
   JSON.stringify(body(link), null, 2),
   JSON.stringify({ tool_input: { description: "x", command: link }, command: "npm ci", note: { command: "npm ci" } }),

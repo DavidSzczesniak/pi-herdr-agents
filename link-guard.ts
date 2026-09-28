@@ -40,15 +40,17 @@ function linksNodeModules(words: string[]): boolean {
 function simpleCommands(text: string): string[][] {
   const segments: string[][] = [];
   const pending: { delimiter: string; stripTabs: boolean }[] = [];
-  let words: string[] = [], word = "", started = false, quote: "'" | '"' | undefined;
+  let words: string[] = [], word = "", started = false, unquoted = true, hereString = false, quote: "'" | '"' | undefined;
   let waitingStripTabs: boolean | undefined;
   const flush = () => {
     if (started && waitingStripTabs !== undefined) {
       pending.push({ delimiter: word, stripTabs: waitingStripTabs });
       waitingStripTabs = undefined;
-    } else if (word) words.push(word);
+    } else if (started && hereString) hereString = false;
+    else if (word) words.push(word);
     word = "";
     started = false;
+    unquoted = true;
   };
   const segment = () => { flush(); if (words.length) segments.push(words); words = []; };
   for (let i = 0; i < text.length; i++) {
@@ -59,13 +61,14 @@ function simpleCommands(text: string): string[][] {
       else if (c === "\\" && i + 1 < text.length && "$`\"\\\n".includes(text[i + 1]!)) word += text[++i];
       else word += c;
     }
-    else if (c === "'" || c === '"') { quote = c; started = true; }
+    else if (c === "'" || c === '"') { quote = c; started = true; unquoted = false; }
     else if (c === "<" && text[i + 1] === "<") {
-      flush();
-      if (text[i + 2] === "<") i += 2;
+      if (started && unquoted && /^[0-9]+$/.test(word)) { word = ""; started = false; }
+      else flush();
+      if (text[i + 2] === "<") { hereString = true; i += 2; }
       else { waitingStripTabs = text[i + 2] === "-"; i += waitingStripTabs ? 2 : 1; }
     }
-    else if (c === "\\") { const next = text[++i] ?? ""; if (next !== "\n") { word += next; started = true; } }
+    else if (c === "\\") { const next = text[++i] ?? ""; if (next !== "\n") { word += next; started = true; unquoted = false; } }
     else if (c === "#" && !started) { while (i + 1 < text.length && text[i + 1] !== "\n") i++; }
     else if (c === " " || c === "\t") flush();
     else if (c === "\n") {
