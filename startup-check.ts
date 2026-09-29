@@ -155,8 +155,6 @@ try {
   assert.deepEqual(await child.emit({ type: "tool_call", toolCallId: "fixture", toolName: "bash", input: { command: "" } }), [undefined], "review role has no shell ban");
   borrow();
   assert.deepEqual(await child.emit(bashResult), removal, "a Pi worker removes a borrowed dependency link after Bash");
-  git("worktree", "remove", borrower);
-  for (const entry of [".git", "node_modules"]) rmSync(join(project, entry), { recursive: true });
   const duplicate = fixture();
   await duplicate.start();
   assert.match(present(duplicate.notifications[0], "duplicate notification"), /still live/);
@@ -165,6 +163,10 @@ try {
   assert.equal(a.identity().generation, original.generation);
   assert.ok(existsSync(original.socketPath));
   await a.stop();
+  borrow();
+  assert.deepEqual(await a.emit(bashResult), [undefined], "a stopped lead adapter leaves links alone");
+  git("worktree", "remove", "--force", borrower);
+  for (const entry of [".git", "node_modules"]) rmSync(join(project, entry), { recursive: true });
   const restored = fixture();
   // Native Pi leaves an empty session unflushed, even though getSessionFile returns its path.
   rmSync(present(restored.ctx.sessionManager.getSessionFile(), "restored session file"));

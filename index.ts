@@ -430,7 +430,7 @@ function createRuntime(pi: ExtensionAPI, config: StartupConfig) {
     return shuttingDown && role !== "lead" ? { block: true, reason: "Runtime shutting down" } : undefined;
   });
   pi.on("tool_result", (event, ctx) => {
-    const removed = identity && isBashToolResult(event) ? removeBorrowedDependencies(ctx.cwd) : undefined;
+    const removed = identity && !shuttingDown && isBashToolResult(event) ? removeBorrowedDependencies(ctx.cwd) : undefined;
     return removed ? { content: [...event.content, { type: "text" as const, text: removed }] } : undefined;
   });
   pi.on("agent_start", async (_event, ctx) => {
