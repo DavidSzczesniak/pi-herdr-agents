@@ -1,4 +1,12 @@
 {
+  "launch-race": {
+    "helpers": ["test-support/launch-contender.ts"],
+    "mechanical": [{
+      "before": "fork(file, ['contender']) with cwd derived from that file",
+      "after": "fork(test-support/launch-contender.ts, []) with explicit RACE_PACKAGE_DIR and execArgv: []",
+      "reason": "The child must be a plain Node entry without Vitest. Its original package cwd is passed explicitly. Every case repeats the real two-process race and both exit-code assertions."
+    }]
+  },
   "fixture-isolation": {
     "mechanical": [
       {

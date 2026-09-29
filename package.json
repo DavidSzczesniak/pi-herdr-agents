@@ -14,7 +14,7 @@
     "check": "tsc -p .",
     "transport-check": "vitest run transport.test.ts",
     "adapter-check": "node adapter-check.ts",
-    "launch-race-check": "node launch-race-check.ts",
+    "launch-race-check": "vitest run launch-race.test.ts",
     "fixture-isolation-check": "vitest run fixture-isolation.test.ts",
     "startup-check": "vitest run startup.test.ts",
     "selection-check": "node selection-check.ts",
