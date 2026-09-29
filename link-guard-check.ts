@@ -17,6 +17,9 @@ try {
   git("worktree", "add", "-q", "--detach", local);
   git("worktree", "add", "-q", "--detach", taken);
   rmSync(join(taken, ".git"));
+  mkdirSync(join(main, "nested"));
+  symlinkSync("../node_modules", join(main, "nested", "node_modules"));
+  git("worktree", "add", "-q", "--detach", join(main, "nested\nsplit"));
   execFileSync("git", ["init", "-q", taken]);
   mkdirSync(join(main, "node_modules"));
   writeFileSync(join(main, "node_modules", "package.json"), "{}");
@@ -32,6 +35,7 @@ try {
   assert.ok(existsSync(join(main, "node_modules", "package.json")), "the link target is untouched");
   assert.ok(lstatSync(join(local, "node_modules")).isSymbolicLink(), "a link inside its own worktree stays");
   assert.ok(lstatSync(join(taken, "node_modules")).isSymbolicLink(), "a stale worktree path now owned by another repository is left alone");
+  assert.ok(lstatSync(join(main, "nested", "node_modules")).isSymbolicLink(), "a newline-split worktree path cannot name a subdirectory");
   assert.ok(lstatSync(join(main, "node_modules")).isDirectory(), "an installed directory stays");
   assert.equal(removeBorrowedDependencies(main), undefined, "nothing left to remove");
   assert.equal(removeBorrowedDependencies(plain), undefined, "outside git, nothing is checked");
