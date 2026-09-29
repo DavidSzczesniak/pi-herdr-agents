@@ -1,23 +1,33 @@
 import assert from "node:assert/strict";
-import { createServer } from "node:net";
+import { createServer, type Socket } from "node:net";
+import { test } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join } from "node:path";
 import { parse, RequestSchema, request, socketAlive } from "./protocol.ts";
 
 const base = { callerId: "lead", callerGeneration: "g1", generation: "g2" };
-assert.throws(() => parse(RequestSchema, { ...base, kind: "wait", submissionId: "s1", timeoutMs: 0 }));
-assert.throws(() => parse(RequestSchema, { ...base, kind: "submit", submissionId: "../escape", task: "x" }));
-assert.throws(() => parse(RequestSchema, { ...base, generation: undefined, kind: "status" }));
-assert.equal(parse(RequestSchema, { ...base, kind: "wait", submissionId: "s1", timeoutMs: 1 }).kind, "wait");
+test("rejects wait deadlines below one millisecond", () => {
+  assert.throws(() => parse(RequestSchema, { ...base, kind: "wait", submissionId: "s1", timeoutMs: 0 }));
+});
+test("rejects unsafe submission IDs", () => {
+  assert.throws(() => parse(RequestSchema, { ...base, kind: "submit", submissionId: "../escape", task: "x" }));
+});
+test("requires a target generation", () => {
+  assert.throws(() => parse(RequestSchema, { ...base, generation: undefined, kind: "status" }));
+});
+test("accepts the minimum wait deadline", () => {
+  assert.equal(parse(RequestSchema, { ...base, kind: "wait", submissionId: "s1", timeoutMs: 1 }).kind, "wait");
+});
 
-// Short UDS path is necessary; all check files remain beneath prototype/.
-const directory = mkdtempSync(join(dirname(fileURLToPath(import.meta.url)), ".transport-"));
-const originalCwd = process.cwd();
-process.chdir(directory);
-const socketPath = "check.sock";
+test("exchanges four correlated requests and excludes liveness from the count", async () => {
+const directory = mkdtempSync("/tmp/pha-");
+const socketPath = join(directory, "check.sock");
+const sockets = new Set<Socket>();
+let abortTimer: ReturnType<typeof setTimeout> | undefined;
 let requests = 0;
 const server = createServer((socket) => {
+  sockets.add(socket);
+  socket.once("close", () => sockets.delete(socket));
   socket.on("error", () => {});
   socket.setEncoding("utf8");
   let buffer = "";
@@ -49,12 +59,14 @@ try {
   await assert.rejects(request(socketPath, { ...base, kind: "status" }), /deliberate transport rejection/);
   const controller = new AbortController();
   const pending = request(socketPath, { ...base, kind: "wait", submissionId: "s1", timeoutMs: 1000 }, controller.signal);
-  setTimeout(() => controller.abort(), 25);
+  abortTimer = setTimeout(() => controller.abort(), 25);
   await assert.rejects(pending, /Caller cancelled/);
   assert.equal(requests, 4);
-  process.stdout.write("PASS schema validation, real UDS request/response, deadline response, rejection, abort cleanup. Not Pi lifecycle evidence.\n");
+
 } finally {
+  clearTimeout(abortTimer);
+  for (const socket of sockets) socket.destroy();
   await new Promise<void>((resolve) => server.close(() => resolve()));
-  process.chdir(originalCwd);
   rmSync(directory, { recursive: true, force: true });
 }
+});
