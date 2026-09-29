@@ -1,33 +1,46 @@
 {
   "retirement": {
-    "helpers": ["test-support/retirement-native.ts", "test-support/retirement-child.ts"],
-    "mechanical": [{
-      "before": "parent and child branches share retirement-check.ts module state",
-      "after": "a case owns retirementNative; a plain Node child entry parses mode and receives the private directory",
-      "reason": "Real process and socket contracts remain in each case. All original assertions and loop inputs survive. Exit observation is registered immediately and cleanup awaits every owned child."
-    }]
+    "helpers": [
+      "test-support/retirement-native.ts",
+      "test-support/retirement-child.ts"
+    ],
+    "mechanical": [
+      {
+        "before": "parent and child branches share retirement-check.ts module state",
+        "after": "a case owns retirementNative; a plain Node child entry parses mode and receives the private directory",
+        "reason": "Real process and socket contracts remain in each case. All original assertions and loop inputs survive. Exit observation is registered immediately and cleanup awaits every owned child."
+      }
+    ]
   },
   "selection": {
-    "loops": [{
-      "before": "for (replyMode of [\"legacy\", \"mismatch\", \"invalid\", \"disconnect\"])",
-      "after": "for (const replyMode of [\"legacy\", \"mismatch\", \"invalid\", \"disconnect\"])",
-      "reason": "Each registration closes over its own replyMode instead of mutating one server across rows. The four inputs and all row assertions are unchanged."
-    }]
+    "loops": [
+      {
+        "before": "for (replyMode of [\"legacy\", \"mismatch\", \"invalid\", \"disconnect\"])",
+        "after": "for (const replyMode of [\"legacy\", \"mismatch\", \"invalid\", \"disconnect\"])",
+        "reason": "Each registration closes over its own replyMode instead of mutating one server across rows. The four inputs and all row assertions are unchanged."
+      }
+    ]
   },
   "adapter": {
-    "mechanical": [{
-      "before": "four unowned spawn calls and a SIGKILLed Perl zombie holder",
-      "after": "ownProbe records every spawn; exitOf observes at spawn; finally stops every probe; the Perl TERM handler waitpid reaps its child",
-      "reason": "Case failure must reap direct children and the deliberately held zombie. Four disposable failure probes verify exact PID absence and directory removal. Assertions and loop domains are unchanged."
-    }]
+    "mechanical": [
+      {
+        "before": "four unowned spawn calls and a SIGKILLed Perl zombie holder",
+        "after": "ownProbe records every spawn; exitOf observes at spawn; finally stops every probe; the Perl TERM handler waitpid reaps its child",
+        "reason": "Case failure must reap direct children and the deliberately held zombie. Four disposable failure probes verify exact PID absence and directory removal. Assertions and loop domains are unchanged."
+      }
+    ]
   },
   "launch-race": {
-    "helpers": ["test-support/launch-contender.ts"],
-    "mechanical": [{
-      "before": "fork(file, ['contender']) with cwd derived from that file",
-      "after": "fork(test-support/launch-contender.ts, []) with explicit RACE_PACKAGE_DIR and execArgv: []",
-      "reason": "The child must be a plain Node entry without Vitest. Its original package cwd is passed explicitly. Every case repeats the real two-process race and both exit-code assertions."
-    }]
+    "helpers": [
+      "test-support/launch-contender.ts"
+    ],
+    "mechanical": [
+      {
+        "before": "fork(file, ['contender']) with cwd derived from that file",
+        "after": "fork(test-support/launch-contender.ts, []) with explicit RACE_PACKAGE_DIR and execArgv: []",
+        "reason": "The child must be a plain Node entry without Vitest. Its original package cwd is passed explicitly. Every case repeats the real two-process race and both exit-code assertions."
+      }
+    ]
   },
   "fixture-isolation": {
     "mechanical": [
@@ -35,6 +48,45 @@
         "before": "spawn(process.execPath, [file]) and once(child, 'exit')",
         "after": "spawn('npm', ['run', file.replace(/\\.ts$/, '')]) and owned.wait(165_000)",
         "reason": "Stable exact-file aliases permit one suite migration per commit. Code and signal assertions are unchanged. The disposable nested Vitest failure probe proves nonzero propagation. Each row now owns its sentinels and subprocess group."
+      }
+    ]
+  },
+  "claude": {
+    "helpers": [
+      "test-support/fake-claude.cjs"
+    ],
+    "expressions": [
+      {
+        "before": "assert.deepEqual(readTranscript(\"wa\", partialPath), [])",
+        "after": "assert.deepEqual(readTranscript(readerA, partialPath), [])",
+        "reason": "Each case uses fresh reader IDs because the runtime caches continuity per worker. The same readerA still spans both reads and the shrink; readerB remains independent."
+      },
+      {
+        "before": "assert.equal((() => { const rows = readTranscript(\"wa\", partialPath); if (rows === \"unreadable\")\n    throw new Error(\"partial transcript unreadable\"); return present(rows[0], \"transcript row\").message?.content; })(), \"\u00e9\", \"a split multibyte character survives\")",
+        "after": "assert.equal((() => { const rows = readTranscript(readerA, partialPath); if (rows === \"unreadable\")\n    throw new Error(\"partial transcript unreadable\"); return present(rows[0], \"transcript row\").message?.content; })(), \"\u00e9\", \"a split multibyte character survives\")",
+        "reason": "Each case uses fresh reader IDs because the runtime caches continuity per worker. The same readerA still spans both reads and the shrink; readerB remains independent."
+      },
+      {
+        "before": "assert.equal(readTranscript(\"wa\", partialPath), \"unreadable\", \"a shrunk transcript breaks continuity\")",
+        "after": "assert.equal(readTranscript(readerA, partialPath), \"unreadable\", \"a shrunk transcript breaks continuity\")",
+        "reason": "Each case uses fresh reader IDs because the runtime caches continuity per worker. The same readerA still spans both reads and the shrink; readerB remains independent."
+      },
+      {
+        "before": "assert.equal(readTranscript(\"wa\", partialPath), \"unreadable\", \"and stays broken for that worker\")",
+        "after": "assert.equal(readTranscript(readerA, partialPath), \"unreadable\", \"and stays broken for that worker\")",
+        "reason": "Each case uses fresh reader IDs because the runtime caches continuity per worker. The same readerA still spans both reads and the shrink; readerB remains independent."
+      },
+      {
+        "before": "assert.deepEqual(readTranscript(\"wb\", partialPath), [], \"another worker's reader is unaffected\")",
+        "after": "assert.deepEqual(readTranscript(readerB, partialPath), [], \"another worker's reader is unaffected\")",
+        "reason": "Each case uses fresh reader IDs because the runtime caches continuity per worker. The same readerA still spans both reads and the shrink; readerB remains independent."
+      }
+    ],
+    "mechanical": [
+      {
+        "before": "writeFileSync(fakeClaude, inline executable template)",
+        "after": "writeFileSync(fakeClaude, Node shebang plus test-support/fake-claude.cjs bytes)",
+        "reason": "Plain executable source remains byte-identical after evaluating the old template. The audit separately compares all generated program bytes, including throwing validations."
       }
     ]
   }

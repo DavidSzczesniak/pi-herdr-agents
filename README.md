@@ -121,7 +121,19 @@ npm ci --ignore-scripts --no-audit --no-fund
 npm test
 ```
 
-Transport checks use real Unix sockets. Adapter and startup checks use real files, sockets, and process identities but stub TUI events and Herdr commands. The Claude check runs the real launch script, settings, and hook against a fake `claude` executable with Herdr stubbed. Startup checks also exercise real Pi package discovery and headless SDK binding. The launch-race check uses two real processes with a stubbed native session-open boundary. Selection checks use Pi's installed catalog, capability helpers, and SDK model/thinking events and empty-history reload, with Herdr controls and provider turns stubbed. The retirement check uses separate real processes and Unix sockets with stubbed Pi and Herdr controls. It covers original-conversation cold continuation and retained historical results without a provider turn. These checks launch neither Herdr nor models. `npm test` runs the launch-race, adapter, selection, and retirement checks once, through the fixture-isolation check, with disposable inherited adapter state and socket sentinels, and verifies that the sentinels stay untouched. Native lifecycle verification requires a disposable Herdr server and ordinary package autoload.
+Transport checks use real Unix sockets. Adapter and startup checks use real files, sockets, and process identities but stub TUI events and Herdr commands. The Claude check runs the real launch script, settings, and hook against a fake `claude` executable with Herdr stubbed. Startup checks also exercise real Pi package discovery and headless SDK binding. The launch-race check uses two real processes with a stubbed native session-open boundary. Selection checks use Pi's installed catalog, capability helpers, and SDK model/thinking events and empty-history reload, with Herdr controls and provider turns stubbed. The retirement check uses separate real processes and Unix sockets with stubbed Pi and Herdr controls. It covers original-conversation cold continuation and retained historical results without a provider turn. These checks launch neither Herdr nor models. `npm test` typechecks the package, then runs all nine Vitest files in parallel isolated forks. Cases within each file run sequentially and own their temporary directories. The fixture-isolation cases also rerun launch-race, adapter, selection, and retirement through exact-file aliases with poisoned inherited adapter paths. They verify successful child exits and untouched state and socket sentinels.
+
+Run one file or one named case directly:
+
+```sh
+npx vitest run selection.test.ts
+npx vitest run selection.test.ts -t 'real SDK'
+scripts/check-test-assertions.sh --locations
+```
+
+The assertion audit compares each old suite at `7a24052` with its test and helper files. It checks assertion and throwing-guard multiplicity, loop domains, and generated fake-Claude program bytes. `scripts/test-assertion-mappings.json` records mechanical adaptations. The audit installs TypeScript 5.9.3 in a disposable directory for parsing. It does not replace the package's TypeScript 7 typechecker.
+
+Native lifecycle verification requires a disposable Herdr server and ordinary package autoload.
 
 ## Limits and evidence
 
