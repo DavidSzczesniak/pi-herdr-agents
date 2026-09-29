@@ -1,5 +1,6 @@
 // Real files/sockets/process identities and Pi discovery/headless binding. TUI/Herdr controls are stubbed.
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, readFileSync, realpathSync, symlinkSync, writeFileSync, existsSync, rmSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -20,7 +21,8 @@ const navigationEvents = [
   { type: "session_before_fork", entryId: "", position: "at" },
   { type: "session_before_tree", preparation: { targetId: "", oldLeafId: null, commonAncestorId: null, entriesToSummarize: [], userWantsSummary: false }, signal: new AbortController().signal },
 ] satisfies ExtensionEvent[];
-const inertEvents = [{ type: "input", source: "extension", text: "" }, { type: "tool_call", toolCallId: "fixture", toolName: "bash", input: { command: "ln -s ../other/node_modules node_modules" } }, ...navigationEvents, { type: "cache_warming_decision", warmCost: 0, missCost: 0, continuationProbability: 0, action: "warm" }] satisfies ExtensionEvent[];
+const bashResult = { type: "tool_result", toolCallId: "fixture", toolName: "bash", input: { command: "" }, content: [{ type: "text", text: "ok" }], details: undefined, isError: false } satisfies ExtensionEvent;
+const inertEvents = [{ type: "input", source: "extension", text: "" }, { type: "tool_call", toolCallId: "fixture", toolName: "bash", input: { command: "" } }, bashResult, ...navigationEvents, { type: "cache_warming_decision", warmCost: 0, missCost: 0, continuationProbability: 0, action: "warm" }] satisfies ExtensionEvent[];
 function fixture({ id = "session-a", mode = "tui", persistent = true, env = {}, fail = false }: { id?: string; mode?: string; persistent?: boolean; env?: Record<string, string | undefined>; fail?: boolean | "report" } = {}) {
   const sessionFile = join(root, `${id}.jsonl`);
   if (!existsSync(sessionFile)) writeFileSync(sessionFile, JSON.stringify({ type: "session", id }) + "\n");
@@ -102,13 +104,6 @@ try {
   const b = fixture({ id: "session-b", env: { HERDR_SOCKET_PATH: "/exact/named.sock", HERDR_SESSION: "named" } });
   await a.start(); await b.start();
   assert.equal(a.tools.size, 7);
-  const bash = (command: string) => ({ type: "tool_call" as const, toolCallId: "fixture", toolName: "bash", input: { command } });
-  const link = bash("ln -s ../other/node_modules node_modules");
-  const refusal = [{ block: true, reason: "Refused: this links another checkout's node_modules. Install dependencies in this worktree instead (for example `npm ci`)." }];
-  assert.deepEqual(await a.emit(link), refusal, "lead refuses a borrowed dependency directory");
-  for (const command of ["npm ci", "ln -s a b", "ln -s ../other/node_modules backup"])
-    assert.deepEqual(await a.emit(bash(command)), [undefined], `lead permits ${command}`);
-  assert.deepEqual(await a.emit({ type: "tool_call", toolCallId: "fixture", toolName: "read", input: { path: "ln -s ../other/node_modules node_modules" } }), [undefined]);
   assert.ok(a.tools.has("retire_agent"), "ordinary autoload discovers retirement without changing root tool selection");
   assert.equal(a.changes, 0, "root preserves user-selected tools");
   assert.notEqual(a.config.stateDir, b.config.stateDir);
@@ -116,6 +111,19 @@ try {
   assert.ok(Buffer.byteLength(a.identity().socketPath) <= 103);
   assert.ok(a.config.stateDir.length > 200);
   assert.deepEqual(readdirSync(project), [], "runtime state never enters project");
+  // A second worktree of the project borrows the project's dependencies until a Bash result removes the link.
+  const borrower = join(root, "borrower");
+  const git = (...args: string[]) => execFileSync("git", ["-C", project, ...args], { stdio: "ignore" });
+  git("init", "-q");
+  git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "init");
+  git("worktree", "add", "-q", "--detach", borrower);
+  mkdirSync(join(project, "node_modules"));
+  const borrow = () => symlinkSync(join(project, "node_modules"), join(borrower, "node_modules"));
+  const removal = [{ content: [{ type: "text", text: "ok" }, { type: "text", text: `Removed node_modules links to another checkout: ${join(realpathSync(borrower), "node_modules")}. Install dependencies in each worktree instead (for example \`npm ci\`).` }] }];
+  borrow();
+  assert.deepEqual(await a.emit(bashResult), removal, "the lead removes a borrowed dependency link after Bash");
+  assert.equal(existsSync(join(borrower, "node_modules")), false);
+  assert.deepEqual(await a.emit(bashResult), [undefined], "nothing is reported once no link remains");
   assert.equal(a.config.herdrSession, "", "default server needs no invented session name");
   assert.equal(b.config.herdrSession, "named");
   assert.equal(fixture({ id: "session-legacy", env: { HERDR_SESSION_NAME: "legacy" } }).config.herdrSession, "legacy", "Herdr 0.8 session name still read");
@@ -144,10 +152,11 @@ try {
   await linkedChild.stop();
   for (const event of navigationEvents)
     assert.deepEqual(await child.emit(event), [{ cancel: true }], "worker retains assigned conversation history");
-  assert.deepEqual(await child.emit(bash("")), [undefined], "review role has no shell ban");
-  assert.deepEqual(await child.emit(link), refusal, "Pi worker refuses a borrowed dependency directory");
-  for (const command of ["npm ci", "ln -s a b"])
-    assert.deepEqual(await child.emit(bash(command)), [undefined], `Pi worker permits ${command}`);
+  assert.deepEqual(await child.emit({ type: "tool_call", toolCallId: "fixture", toolName: "bash", input: { command: "" } }), [undefined], "review role has no shell ban");
+  borrow();
+  assert.deepEqual(await child.emit(bashResult), removal, "a Pi worker removes a borrowed dependency link after Bash");
+  git("worktree", "remove", borrower);
+  for (const entry of [".git", "node_modules"]) rmSync(join(project, entry), { recursive: true });
   const duplicate = fixture();
   await duplicate.start();
   assert.match(present(duplicate.notifications[0], "duplicate notification"), /still live/);
@@ -156,7 +165,6 @@ try {
   assert.equal(a.identity().generation, original.generation);
   assert.ok(existsSync(original.socketPath));
   await a.stop();
-  assert.deepEqual(await a.emit(link), [undefined], "stopped lead adapter is inert");
   const restored = fixture();
   // Native Pi leaves an empty session unflushed, even though getSessionFile returns its path.
   rmSync(present(restored.ctx.sessionManager.getSessionFile(), "restored session file"));
@@ -170,8 +178,6 @@ try {
   assert.equal(listed[0].identity.generation, childIdentity.generation, "root reload preserves live descendants");
   assert.equal(listed[0].kind, "status");
   assert.equal(restored.shutdowns, 0);
-  assert.deepEqual(await restored.emit(link), refusal, "empty-history reload keeps one effective guard");
-  assert.deepEqual(await restored.emit(bash("npm ci")), [undefined]);
   writeFileSync(present(restored.ctx.sessionManager.getSessionFile(), "restored session file"), JSON.stringify({ type: "session", id: "session-a" }) + "\n");
   await restored.stop();
   // A crashed previous generation must pass death proof, never merely available:false.
@@ -222,9 +228,7 @@ try {
   assert.equal(fault.changes, 0);
   assert.equal(fault.tools.size, 0);
   assert.deepEqual(await fault.emit({ type: "input", source: "extension", text: "" }), [undefined]);
-  assert.deepEqual(await fault.emit(link), [undefined], "faulted lead adapter is inert");
-  await child.stop();
-  assert.deepEqual(await child.emit(link), [{ block: true, reason: "Runtime shutting down" }], "shutdown takes precedence over link refusal");
+  assert.deepEqual(await fault.emit({ type: "tool_call", toolCallId: "fixture", toolName: "bash", input: { command: "" } }), [undefined]);
   const guidelines = { type: "before_agent_start" as const, prompt: "", systemPrompt: "", systemPromptOptions: { cwd: project, selectedTools: [], toolSnippets: {}, toolGuidelines: {}, promptGuidelines: [], appendSystemPrompt: "", sections: {}, contextFiles: [], skills: [] } };
   await fault.emit(guidelines);
   assert.deepEqual(guidelines.systemPromptOptions.promptGuidelines, []);

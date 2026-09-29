@@ -1,4 +1,4 @@
-import { getAgentDir, isToolCallEventType, type ExtensionAPI, type ExtensionContext, type SessionStartEvent } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, isBashToolResult, type ExtensionAPI, type ExtensionContext, type SessionStartEvent } from "@earendil-works/pi-coding-agent";
 import { StringEnum, type AssistantMessage } from "@earendil-works/pi-ai";
 import { Type, type Static } from "typebox";
 import { createServer, type Server, type Socket } from "node:net";
@@ -6,7 +6,7 @@ import { randomUUID } from "node:crypto";
 import { appendFileSync, chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { extensionPath, herdrCommand, privateDirectory, startupConfig, type StartupConfig } from "./startup.ts";
-import { dependencyLinkRefusal } from "./link-guard.ts";
+import { removeBorrowedDependencies } from "./link-guard.ts";
 import { atomicWrite, errorText, ModelSchema, ThinkingSchema, parse, readIdentityRecord, readRecord, RequestSchema, request, SafeId, socketAlive, TaskSchema, type Identity, type Request, type Result, type Selection, type Task } from "./protocol.ts";
 import { ClaudeEffort, ClaudeModel, claudeCommand, defaultClaudeModel, interruptClaude, isClaudeWorker, listClaude, readClaudeWorker, retireClaude, spawnClaude, unresolvedClaudeChild, waitClaude, type ClaudeHost, type ClaudeWorker } from "./claude.ts";
 import { assertNoRetirement, claimLaunch, LaunchClaimSchema, isOriginalProcessLive, PaneResponse, PlanRecordSchema, PlanSchema, planLines, processIdentity, readStartupFailure, recordedThinking, retirementFence, roleBrief, selectWorker, waitProgress, runningTools, recordSubmittedSize, startupFailurePath, takeClaim, unstartedRetirement, PaneSchema, tabPane, verifySession, workingDirectory, existingDirectory, type Pane } from "./runtime.ts";
@@ -426,10 +426,12 @@ function createRuntime(pi: ExtensionAPI, config: StartupConfig) {
     // The addendum renders even with a SYSTEM.md custom prompt, unlike prompt guidelines.
     if (identity.role !== "lead") event.systemPromptOptions.appendSystemPrompt = [event.systemPromptOptions.appendSystemPrompt, roleBrief(identity.role)].filter(Boolean).join("\n\n");
   });
-  pi.on("tool_call", (event) => {
-    if (shuttingDown) return role !== "lead" ? { block: true, reason: "Runtime shutting down" } : undefined;
-    const reason = identity && isToolCallEventType("bash", event) ? dependencyLinkRefusal(event.input.command) : undefined;
-    return reason ? { block: true, reason } : undefined;
+  pi.on("tool_call", () => {
+    return shuttingDown && role !== "lead" ? { block: true, reason: "Runtime shutting down" } : undefined;
+  });
+  pi.on("tool_result", (event, ctx) => {
+    const removed = identity && isBashToolResult(event) ? removeBorrowedDependencies(ctx.cwd) : undefined;
+    return removed ? { content: [...event.content, { type: "text" as const, text: removed }] } : undefined;
   });
   pi.on("agent_start", async (_event, ctx) => {
     context = ctx;

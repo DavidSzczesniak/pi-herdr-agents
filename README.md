@@ -56,7 +56,7 @@ All Herdr commands target the captured `HERDR_SOCKET_PATH`. Startup verifies the
 
 Workers start fresh conversations and own their descendants. Children receive their complete task brief, not parent conversation history. They use the installed extension's actual path and normal tools, including Bash, Git through Bash, edits, writes, and nested delegation. A read-only review is an assignment, not a reduced tool profile. The lead retains its selected tools and thinking level.
 
-A Bash command that symlinks a whole `node_modules` directory into a link named `node_modules` is refused with a prompt to install in the worktree instead, for example with `npm ci`. The Pi lead and workers use a `tool_call` guard. Claude workers use a `PreToolUse` hook. The check is syntactic, not a sandbox; ordinary links and installs pass. Claude's hook needs `awk` on `PATH` and allows the command if that check fails.
+After every Bash call, the adapter removes each `node_modules` symlink in the repository's worktrees that points outside its own worktree, and tells the agent to install dependencies there instead, for example with `npm ci`. Removing the link never touches its target. The Pi lead and workers run the check from a `tool_result` handler, and Claude workers from `PostToolUse` and `PostToolUseFailure` hooks, through the same `link-guard.sh`.
 
 ### Worker model and thinking
 
