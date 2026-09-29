@@ -16,5 +16,5 @@
     "exactOptionalPropertyTypes": true,
     "erasableSyntaxOnly": true
   },
-  "include": ["*.ts"]
+  "include": ["*.ts", "test-support/*.ts"]
 }

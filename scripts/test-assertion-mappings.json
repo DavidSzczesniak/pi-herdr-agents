@@ -1,0 +1,11 @@
+{
+  "fixture-isolation": {
+    "mechanical": [
+      {
+        "before": "spawn(process.execPath, [file]) and once(child, 'exit')",
+        "after": "spawn('npm', ['run', file.replace(/\\.ts$/, '')]) and owned.wait(165_000)",
+        "reason": "Stable exact-file aliases permit one suite migration per commit. Code and signal assertions are unchanged. The disposable nested Vitest failure probe proves nonzero propagation. Each row now owns its sentinels and subprocess group."
+      }
+    ]
+  }
+}
