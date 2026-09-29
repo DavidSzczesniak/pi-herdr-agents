@@ -8,7 +8,7 @@ import { once } from "node:events";
 import adapter from "./index.ts";
 import { atomicWrite, request } from "./protocol.ts";
 import { socketDirectory } from "./startup.ts";
-import { fakeApi, fakeContext, fakeModel, fakeRegistry, fakeSessions, fakeUi, hookRegistry, toolRegistry, present, toolText, installFixtureEnvironment } from "./fakes.ts";
+import { fakeApi, fakeContext, fakeModel, fakeModelRegistry, fakeSessions, fakeUi, hookRegistry, toolRegistry, present, toolText, installFixtureEnvironment, fakePane as pane, herdrArgs, herdrResult, execOk, execFailure, beforeAgentStart, completedSettle, replaceEnvironment } from "./fakes.ts";
 import type { ExtensionEvent } from "@earendil-works/pi-coding-agent";
 import type { Request, Result } from "./protocol.ts";
 import { Type } from "typebox";
@@ -23,7 +23,6 @@ let processProbe: ChildProcess | undefined;
 const extraPanes: ReturnType<typeof pane>[] = [];
 let panePids: number[] = [];
 let closeKills = false;
-const pane = (id = "w1:p1") => ({ pane_id: id, workspace_id: "w1", terminal_id: `term-${id}`, tab_id: `tab-${id}` });
 const header = { type: "session", version: 3, id: "session-lead", timestamp: new Date().toISOString(), cwd: directory };
 
 function fixture(options: { workerId?: string; role?: string; thinking?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"; parentId?: string; auth?: boolean; mode?: string; restart?: string; sessionId?: string; failReport?: boolean; launchFault?: string; launchId?: string } = {}) {
@@ -50,8 +49,7 @@ function fixture(options: { workerId?: string; role?: string; thinking?: "off" |
   const ctx = fakeContext({
     cwd: directory, mode: "tui", hasUI: true, get signal() { return runSignal; },
     model: fakeModel("fixture", "no-network"),
-    modelRegistry: fakeRegistry({ find: (provider, id) => fakeModel(provider, id),
-      hasConfiguredAuth: () => auth, getProviderAuthStatus: () => ({ configured: auth }) }),
+    modelRegistry: fakeModelRegistry({ auth }),
     sessionManager: fakeSessions({ getSessionFile: () => sessionFile, getSessionId: () => sessionId }),
     isIdle: () => idle, hasPendingMessages: () => false,
     abort: () => abortController?.abort(), shutdown: () => { shutdowns++; },
@@ -68,31 +66,31 @@ function fixture(options: { workerId?: string; role?: string; thinking?: "off" |
     async exec(_command, args, options) {
       assert.equal(_command, "env");
       assert.ok(args.includes("HERDR_SOCKET_PATH=/fixture/herdr.sock"));
-      const op = args.slice(args.indexOf("herdr") + 1);
+      const op = herdrArgs(args);
       commands.push(["--session", "slice", ...op]);
       if (op[0] === "tab" && op[1] === "create") {
         spawned = pane("w1:new");
         launched = Object.fromEntries(op.filter(value => /^DS_HERDR_(LAUNCH|WORKER)_ID=/.test(value)).map(value => value.split("=")));
-        if (launchFault === "unknown-create") return { code: 1, killed: true, stderr: "fixture receipt lost", stdout: "" };
+        if (launchFault === "unknown-create") return execFailure("fixture receipt lost", { killed: true });
         if (launchFault === "abort-after-create") present(abortController, "launch abort controller").abort();
-        return { code: 0, killed: false, stderr: "", stdout: JSON.stringify({ result: { root_pane: spawned } }) };
+        return herdrResult({ root_pane: spawned });
       }
       if (op[0] === "pane" && op[1] === "process-info")
-        return { code: 0, killed: false, stderr: "", stdout: JSON.stringify({ result: { process_info: { pane_id: op[3], shell_pid: panePids[0] ?? null,
-          foreground_process_group_id: panePids[0] ?? null, foreground_processes: panePids.map(pid => ({ pid, name: "pi" })) } } }) };
+        return herdrResult({ process_info: { pane_id: op[3], shell_pid: panePids[0] ?? null,
+          foreground_process_group_id: panePids[0] ?? null, foreground_processes: panePids.map(pid => ({ pid, name: "pi" })) } });
       if (op[0] === "agent" && op[1] === "start" && launchFault.startsWith("child-exits")) {
         // The child fails its own startup and exits; Herdr would keep waiting for readiness.
         atomicWrite(join(state, "operations", `startup-failed-${present(launched, "launched environment").DS_HERDR_LAUNCH_ID}.json`), { launchId: present(launched, "launched environment").DS_HERDR_LAUNCH_ID,
           workerId: present(launched, "launched environment").DS_HERDR_WORKER_ID, error: "fixture cwd mismatch", pid: process.pid,
           pidBirth: launchFault === "child-exits-live" ? present(processIdentity(process.pid), "process identity").birth : "exited-child" });
-        return new Promise(resolve => present(options?.signal, "exec signal").addEventListener("abort", () => resolve({ code: 1, killed: true, stderr: "", stdout: "" })));
+        return new Promise(resolve => present(options?.signal, "exec signal").addEventListener("abort", () => resolve(execFailure("", { killed: true }))));
       }
-      if (op[0] === "agent" && op[1] === "start") return { code: 1, killed: false, stderr: "fixture startup failure", stdout: "" };
-      if (op[0] === "pane" && op[1] === "list") return { code: 0, killed: false, stderr: "", stdout: JSON.stringify({ result: { panes: [...["w1:cowned", "w1:cstranger", "w1:cwaiting"].map(id => pane(id)), ...extraPanes] } }) };
-      if (op[0] === "pane" && op[1] === "get") return { code: 0, killed: false, stderr: "", stdout: JSON.stringify({ result: { pane: op[2] === "w1:new" ? spawned : pane(op[2]) } }) };
+      if (op[0] === "agent" && op[1] === "start") return execFailure("fixture startup failure");
+      if (op[0] === "pane" && op[1] === "list") return herdrResult({ panes: [...["w1:cowned", "w1:cstranger", "w1:cwaiting"].map(id => pane(id)), ...extraPanes] });
+      if (op[0] === "pane" && op[1] === "get") return herdrResult({ pane: op[2] === "w1:new" ? spawned : pane(op[2]) });
       if (op[0] === "pane" && op[1] === "close" && closeKills) for (const pid of panePids) process.kill(pid, "SIGHUP");
       if (failReport && op[1] === "release-agent") throw new Error("fixture report failure");
-      return { code: 0, killed: false, stderr: "", stdout: "" };
+      return execOk();
     },
     sendUserMessage(text) {
       if (typeof text !== "string") throw new Error("expected user text");
@@ -100,7 +98,7 @@ function fixture(options: { workerId?: string; role?: string; thinking?: "off" |
       void (async () => {
         await emit({ type: "input", source: "extension", text });
         if (mode !== "started") return;
-        await emit({ type: "before_agent_start", prompt: text, systemPrompt: "", systemPromptOptions: { cwd: directory, selectedTools: [], toolSnippets: {}, toolGuidelines: {}, promptGuidelines: [], appendSystemPrompt: "", sections: {}, contextFiles: [], skills: [] } });
+        await emit(beforeAgentStart({ cwd: directory, prompt: text }));
         idle = false;
         abortController = new AbortController();
         runSignal = abortController.signal;
@@ -114,7 +112,7 @@ function fixture(options: { workerId?: string; role?: string; thinking?: "off" |
     get sends() { return sends; }, get shutdowns() { return shutdowns; }, get effort() { return effort; }, get activeTools() { return selectedTools; },
     setAbort(controller: AbortController) { abortController = controller; },
     async start(reason: "startup" | "reload" = "startup") { await emit({ type: "session_start", reason }); if (startupError) throw new Error(startupError); return JSON.parse(readFileSync(join(state, "workers", `${workerId}.json`), "utf8")); },
-    async settle() { await emit({ type: "agent_before_settle", outcome: "completed", entries: [], continue: false, context: { contextEntries: [], contextMessages: [], llmMessages: [], pendingMessages: [], canContinue: false } }); idle = true; await emit({ type: "agent_settled" }); },
+    async settle() { await emit(completedSettle()); idle = true; await emit({ type: "agent_settled" }); },
     async stop() { await emit({ type: "session_shutdown", reason: "quit" }); },
   };
   fixtures.push(instance);
@@ -469,8 +467,7 @@ try {
 } finally {
   if (processProbe && processProbe.exitCode === null && processProbe.signalCode === null) processProbe.kill("SIGKILL");
   for (const fixture of fixtures.reverse()) { try { await fixture.stop(); } catch {} }
-  for (const key of Object.keys(process.env)) if (!(key in originalEnv)) delete process.env[key];
-  Object.assign(process.env, originalEnv);
+  replaceEnvironment(originalEnv);
   rmSync(socketDirectory(state, originalEnv.XDG_RUNTIME_DIR || "/tmp"), { recursive: true, force: true });
   rmSync(directory, { recursive: true, force: true });
 }

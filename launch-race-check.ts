@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url";
 import adapter from "./index.ts";
 import { atomicWrite } from "./protocol.ts";
 import { runtimeSocket, socketDirectory } from "./startup.ts";
-import { fakeApi, fakeContext, fakeModel, fakeRegistry, fakeSessions, fakeUi, hookRegistry, toolRegistry, present, fixtureEnvironment } from "./fakes.ts";
+import { fakeApi, fakeContext, fakeModel, fakeModelRegistry, fakeSessions, fakeUi, hookRegistry, toolRegistry, present, fixtureEnvironment, fakePane as pane, herdrArgs, herdrResult, execOk, execFailure } from "./fakes.ts";
 
 type RaceMessage = { kind: "ready"; worker: string } | { kind: "opened"; worker: string; model: string; thinking: string } | { kind: "result"; worker: string; error: string };
 
@@ -24,7 +24,6 @@ if (process.argv[2] === "contender") {
   const worker = required(process.env.RACE_WORKER, "RACE_WORKER");
   const hooks = hookRegistry();
   const tools = toolRegistry();
-  const pane = (id: string) => ({ pane_id: id, terminal_id: `term-${id}`, workspace_id: "w1", tab_id: `tab-${id}` });
   const ownSession = join(state, `${worker}.jsonl`);
   writeFileSync(ownSession, sessionHeader(`session-${worker}`));
   Object.assign(process.env, { HERDR_ENV: "1", HERDR_SESSION: "slice", HERDR_SOCKET_PATH: "/fixture/herdr.sock", HERDR_WORKSPACE_ID: "w1", HERDR_PANE_ID: `w1:${worker}`, DS_HERDR_WORKER_ID: worker,
@@ -35,8 +34,7 @@ if (process.argv[2] === "contender") {
   let release = () => {};
   const held = new Promise(resolve => { release = () => resolve(undefined); });
   const ctx = fakeContext({ cwd: dirname(file), mode: "tui", hasUI: false, signal: undefined, model: fakeModel("caller", "wrong-default"),
-    modelRegistry: fakeRegistry({ find: (provider, id) => fakeModel(provider, id),
-      hasConfiguredAuth: () => true, getProviderAuthStatus: () => ({ configured: true }) }),
+    modelRegistry: fakeModelRegistry({ auth: true }),
     sessionManager: fakeSessions({ getSessionFile: () => ownSession, getSessionId: () => `session-${worker}` }),
     isIdle: () => true, hasPendingMessages: () => false, shutdown() {}, ui: fakeUi({ notify() {}, setWidget() {} }) });
   adapter(fakeApi({
@@ -45,7 +43,7 @@ if (process.argv[2] === "contender") {
     registerCommand() {},
     getAllTools: () => [], getActiveTools: () => [], setActiveTools() {}, setThinkingLevel() {}, getThinkingLevel: () => "medium",
     async exec(_command, args) {
-      const op = args.slice(args.indexOf("herdr") + 1);
+      const op = herdrArgs(args);
       let result;
       if (op[0] === "tab") result = { root_pane: pane(`w1:new-${worker}`) };
       else if (op[1] === "get") result = { pane: pane(required(op[2], "pane id")) };
@@ -56,9 +54,9 @@ if (process.argv[2] === "contender") {
         writeFileSync(path, JSON.stringify({ type: "model_change", provider: "selected", modelId: model, opener: worker }) + "\n", { flag: "a" });
         send({ kind: "opened", worker, model, thinking: required(op[op.indexOf("--thinking") + 1], "--thinking") });
         await held;
-        return { code: 1, killed: false, stderr: "fixture readiness unknown", stdout: "" };
-      } else if (op[1] === "close") return { code: 1, killed: false, stderr: "fixture cleanup uncertain", stdout: "" };
-      return { code: 0, killed: false, stderr: "", stdout: result ? JSON.stringify({ result }) : "" };
+        return execFailure("fixture readiness unknown");
+      } else if (op[1] === "close") return execFailure("fixture cleanup uncertain");
+      return result ? herdrResult(result) : execOk();
     },
   }));
   process.on("message", async message => {

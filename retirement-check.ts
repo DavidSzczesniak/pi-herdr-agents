@@ -10,7 +10,7 @@ import { request } from "./protocol.ts";
 import { socketDirectory } from "./startup.ts";
 import { claimLaunch, isOriginalProcessLive, processIdentity } from "./runtime.ts";
 import { atomicWrite } from "./protocol.ts";
-import { fakeApi, fakeContext, fakeModel, fakeRegistry, fakeSessions, fakeUi, hookRegistry, toolRegistry, present, toolText, fixtureEnvironment, installFixtureEnvironment } from "./fakes.ts";
+import { fakeApi, fakeContext, fakeModel, fakeModelRegistry, fakeSessions, fakeUi, hookRegistry, toolRegistry, present, toolText, fixtureEnvironment, installFixtureEnvironment, herdrArgs, herdrResult, execOk, execFailure, beforeAgentStart, replaceEnvironment } from "./fakes.ts";
 import type { ExtensionEvent } from "@earendil-works/pi-coding-agent";
 import type { ChildProcess } from "node:child_process";
 import type { Request } from "./protocol.ts";
@@ -56,8 +56,7 @@ function native() {
   let queued = mode === "queued";
   const ctx = fakeContext({ cwd: process.env.RETIRE_STATE || directory, mode: "tui", hasUI: true, signal: undefined,
     model: mode === "noauth" ? undefined : fakeModel("fixture", "model"),
-    modelRegistry: fakeRegistry({ find: (provider, name) => fakeModel(provider, name),
-      hasConfiguredAuth: () => true, getProviderAuthStatus: () => ({ configured: true }) }),
+    modelRegistry: fakeModelRegistry({ auth: true }),
     sessionManager: fakeSessions({ getSessionFile: () => file, getSessionId: () => `pi-${id}` }),
     isIdle: () => !active, hasPendingMessages: () => queued,
     shutdown: () => { if (inChild && mode !== "no-shutdown") void emit({ type: "session_shutdown", reason: "quit" }).then(() => process.exit(0)); },
@@ -68,26 +67,26 @@ function native() {
   const api = fakeApi({ on: hooks.on, registerTool: tools.register,
     registerCommand() {}, getActiveTools: () => ["read", "bash"], setActiveTools() {}, getThinkingLevel: () => "medium",
     async exec(_command, args) {
-      const op = args.slice(args.indexOf("herdr") + 1);
+      const op = herdrArgs(args);
       if (op[0] === "tab" && op[1] === "create") {
         createdId = present(present(op.find(value => value.startsWith("DS_HERDR_WORKER_ID=")), "worker environment").split("=")[1], "created worker id");
-        return response({ result: { root_pane: pane(`${createdId}-new`) } });
+        return herdrResult({ root_pane: pane(`${createdId}-new`) });
       }
       if (op[0] === "agent" && op[1] === "start") {
         await startResumed?.(op);
-        return response({});
+        return execOk("{}");
       }
-      if (op[0] === "pane" && op[1] === "get") return response({ result: { pane: pane(present(op[2], "pane id").slice(4)) } });
+      if (op[0] === "pane" && op[1] === "get") return herdrResult({ pane: pane(present(op[2], "pane id").slice(4)) });
       if (op[0] === "pane" && op[1] === "list") {
         if (abortPoint === "after-close-list" && closed.has("abort-after-close")) present(cleanupAbort, "cleanup abort controller").abort();
-        return response({ result: { panes: [...identities.keys()].filter(key => !closed.has(key))
+        return herdrResult({ panes: [...identities.keys()].filter(key => !closed.has(key))
           .filter(key => faults.get(key) !== "absent" || isOriginalProcessLive(identity(key)))
           .map(key => faults.get(key) === "moved" && !isOriginalProcessLive(identity(key)) ? { ...pane(key), tab_id: "other-tab" } :
             faults.get(key) === "terminal" && !isOriginalProcessLive(identity(key)) ? { ...pane(key), terminal_id: "replacement" } :
               faults.get(key) === "workspace-move" && !isOriginalProcessLive(identity(key)) ? { ...pane(key), workspace_id: "other-workspace" } :
-                faults.get(key) === "pane-id-move" && !isOriginalProcessLive(identity(key)) ? { ...pane(key), pane_id: "w:p-relocated" } : pane(key)) } });
+                faults.get(key) === "pane-id-move" && !isOriginalProcessLive(identity(key)) ? { ...pane(key), pane_id: "w:p-relocated" } : pane(key)) });
       }
-      if (op[0] === "tab" && op[1] === "get") return response({ result: { tab: { tab_id: present(op[2], "pane id"), workspace_id: "w", pane_count: 1 } } });
+      if (op[0] === "tab" && op[1] === "get") return herdrResult({ tab: { tab_id: present(op[2], "pane id"), workspace_id: "w", pane_count: 1 } });
       if (op[0] === "pane" && op[1] === "process-info") {
         const key = present(op[3], "pane id").slice(4);
         if (abortPoint === "process-info" && key === "cleanup-abort") present(cleanupAbort, "cleanup abort controller").abort();
@@ -98,25 +97,24 @@ function native() {
         const rawInfo: Record<string, unknown> = { ...info };
         if (fault === "missing-group") delete rawInfo.foreground_process_group_id;
         if (fault === "missing-foreground") delete rawInfo.foreground_processes;
-        return response({ result: { process_info: rawInfo } });
+        return herdrResult({ process_info: rawInfo });
       }
       if (op[0] === "pane" && op[1] === "close") {
         closed.add(present(op[2], "pane id").slice(4));
         if (abortPoint === "close" && present(op[2], "pane id") === "w:p-abort-after-close") present(cleanupAbort, "cleanup abort controller").abort();
-        if (present(op[2], "pane id") === "w:p-close-error") return { code: 1, killed: false, stdout: "", stderr: "fixture close response lost" };
-        return response(null);
+        if (present(op[2], "pane id") === "w:p-close-error") return execFailure("fixture close response lost");
+        return execOk();
       }
-      return response(null);
+      return execOk();
     },
     sendUserMessage(text) { if (typeof text !== "string") throw new Error("expected user text"); active = true;
       if (mode === "resume") void (async () => {
         await emit({ type: "input", source: "extension", text });
-        await emit({ type: "before_agent_start", prompt: text, systemPrompt: "", systemPromptOptions: { cwd: directory, selectedTools: [], toolSnippets: {}, toolGuidelines: {}, promptGuidelines: [], appendSystemPrompt: "", sections: {}, contextFiles: [], skills: [] } });
+        await emit(beforeAgentStart({ cwd: directory, prompt: text }));
         await emit({ type: "agent_start" });
       })();
     }, appendEntry() {},
   });
-  function response(value: unknown) { return { code: 0, killed: false, stdout: value ? JSON.stringify(value) : "", stderr: "" }; }
   adapter(api);
   return { tools, ctx, emit, setQueued(value: boolean) { queued = value; } };
 }
@@ -375,8 +373,7 @@ if (inChild) {
     for (const proc of children) if (proc.exitCode === null) proc.kill("SIGTERM");
     await Promise.all(exits);
     await fixture.emit({ type: "session_shutdown", reason: "quit" });
-    for (const key of Object.keys(process.env)) if (!(key in originalEnv)) delete process.env[key];
-    Object.assign(process.env, originalEnv);
+    replaceEnvironment(originalEnv);
     rmSync(socketDirectory(directory, originalEnv.XDG_RUNTIME_DIR || "/tmp"), { recursive: true, force: true });
     rmSync(directory, { recursive: true, force: true });
   }

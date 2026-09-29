@@ -10,14 +10,12 @@ import adapter from "./index.ts";
 import { atomicWrite, parseIdentity, request } from "./protocol.ts";
 import { recordedThinking, selectWorker } from "./runtime.ts";
 import { socketDirectory } from "./startup.ts";
-import { fakeApi, fakeContext, fakeRegistry, fakeSessions, fakeUi, hookRegistry, toolRegistry, present, toolText, installFixtureEnvironment } from "./fakes.ts";
+import { fakeApi, fakeContext, fakeRegistry, fakeSessions, fakeUi, hookRegistry, toolRegistry, present, toolText, installFixtureEnvironment, fakePane as pane, beforeAgentStart, completedSettle, herdrArgs, herdrResult, execOk, replaceEnvironment } from "./fakes.ts";
 import type { ExtensionEvent, ExtensionError } from "@earendil-works/pi-coding-agent";
 import type { Model, Api, ModelThinkingLevel } from "@earendil-works/pi-ai";
 import type { Request } from "./protocol.ts";
 
-const settleEvent = () => ({ type: "agent_before_settle", outcome: "completed", entries: [], continue: false, context: { contextEntries: [], contextMessages: [], llmMessages: [], pendingMessages: [], canContinue: false } }) satisfies ExtensionEvent;
 const root = mkdtempSync(join(tmpdir(), "piha-selection-"));
-const beforeEvent = (prompt: string) => ({ type: "before_agent_start", prompt, systemPrompt: "", systemPromptOptions: { cwd: root, selectedTools: [], toolSnippets: {}, toolGuidelines: {}, promptGuidelines: [], appendSystemPrompt: "", sections: {}, contextFiles: [], skills: [] } }) satisfies ExtensionEvent;
 const originalEnv = { ...process.env };
 type SelectionFixture = { id: string; ctx: ReturnType<typeof fakeContext>; tools: ReturnType<typeof toolRegistry>; sessionFile: string;
   emit(event: ExtensionEvent): Promise<unknown[]>; emitNow(event: ExtensionEvent): Promise<unknown[]>; onSend: ((text: string) => void) | undefined;
@@ -39,7 +37,6 @@ const thinkingLevel = (value: string): ModelThinkingLevel => {
   }
 };
 const key = (model: Model<Api>) => ({ provider: model.provider, id: model.id });
-const pane = (id: string) => ({ pane_id: id, terminal_id: `term-${id}`, workspace_id: "w1", tab_id: `tab-${id}` });
 const readIdentity = (id: string) => JSON.parse(readFileSync(join(root, "workers", `${id}.json`), "utf8"));
 type OwnRequest = Request extends infer R ? R extends Request ? Omit<R, "callerId" | "callerGeneration" | "generation"> : never : never;
 const self = (identity: { socketPath: string; workerId: string; generation: string }, operation: OwnRequest) => request(identity.socketPath, { callerId: identity.workerId, callerGeneration: identity.generation,
@@ -71,11 +68,11 @@ function fixture(options: { id?: string; parent?: string; role?: string; model?:
     registerCommand() {}, getActiveTools: () => ["read", "bash"], setActiveTools() {},
     getThinkingLevel: () => level, setThinkingLevel(value) { level = clampThinkingLevel(present(ctx.model, "selected model"), value); },
     async exec(_command, argv) {
-      const args = argv.slice(argv.indexOf("herdr") + 1); commands.push(args);
+      const args = herdrArgs(argv); commands.push(args);
       if (args[0] === "pane" && args[1] === "get") await onPaneGet?.(args);
       if (args[0] === "tab") {
         created = Object.fromEntries(args.filter(arg => arg.startsWith("DS_HERDR_")).map(arg => { const i = arg.indexOf("="); return [arg.slice(0, i), arg.slice(i + 1)]; }));
-        return { code: 0, killed: false, stderr: "", stdout: JSON.stringify({ result: { root_pane: pane(present(present(created, "tab environment").DS_HERDR_WORKER_ID, "worker id")) } }) };
+        return herdrResult({ root_pane: pane(present(present(created, "tab environment").DS_HERDR_WORKER_ID, "worker id")) });
       }
       if (args[0] === "agent") {
         const selected = present(args[args.indexOf("--model") + 1], "child model");
@@ -88,15 +85,15 @@ function fixture(options: { id?: string; parent?: string; role?: string; model?:
           model: present(childModel, "child model"), thinking: thinkingLevel(childThinking), sessionFile: path, sessionId: savedId,
           launchId: present(present(created, "tab environment").DS_HERDR_LAUNCH_ID, "DS_HERDR_LAUNCH_ID"), restart: present(present(created, "tab environment").DS_HERDR_RESTART_GENERATION, "DS_HERDR_RESTART_GENERATION") });
         await child.start();
-        return { code: 0, killed: false, stderr: "", stdout: "{}" };
+        return execOk("{}");
       }
-      return { code: 0, killed: false, stderr: "", stdout: args[1] === "get" ? JSON.stringify({ result: { pane: pane(present(args[2], "pane id")) } }) : "" };
+      return args[1] === "get" ? herdrResult({ pane: pane(present(args[2], "pane id")) }) : execOk();
     },
     sendUserMessage(text) { if (typeof text !== "string") throw new Error("expected user text"); selectionsAtSend.push({ id, model: key(present(ctx.model, "selected model")), thinking: level }); sends++;
       if (onSend) return onSend(text);
       void (async () => {
       await emit({ type: "input", source: "extension", text });
-      await emit(beforeEvent(text));
+      await emit(beforeAgentStart({ cwd: root, prompt: text }));
       idle = false; await emit({ type: "agent_start" });
     })(); },
   });
@@ -107,7 +104,7 @@ function fixture(options: { id?: string; parent?: string; role?: string; model?:
     get sends() { return sends; }, get level() { return level; },
     async start(reason: "startup" | "reload" = "startup") { await emit({ type: "session_start", reason }); if (error) throw Error(error); return readIdentity(id); },
     async stop() { await emit({ type: "session_shutdown", reason: "quit" }); },
-    async settle() { idle = true; await emit(settleEvent()); await emit({ type: "agent_settled" }); },
+    async settle() { idle = true; await emit(completedSettle()); await emit({ type: "agent_settled" }); },
     async changeThinking(value: ModelThinkingLevel) { level = clampThinkingLevel(present(ctx.model, "selected model"), value); await emit({ type: "thinking_level_select", level, previousLevel: level }); },
     async changeModel(value: Model<Api>) { const previousModel = ctx.model; ctx.model = value; level = clampThinkingLevel(value, level); await emit({ type: "thinking_level_select", level, previousLevel: level }); await emit({ type: "model_select", model: value, previousModel, source: "set" }); },
     async tool(name: string, params: Record<string, ReturnType<typeof JSON.parse>>) {
@@ -187,7 +184,7 @@ try {
     await boundaryChild.changeThinking("low");
     boundaryChild.onSend = text => { void (async () => {
       await boundaryChild.emit({ type: "input", source: "extension", text });
-      await boundaryChild.emit(beforeEvent(text));
+      await boundaryChild.emit(beforeAgentStart({ cwd: root, prompt: text }));
       if (change === "thinking") await boundaryChild.changeThinking("high");
       else await boundaryChild.changeModel(plain);
       await boundaryChild.emit({ type: "agent_start" });
@@ -203,10 +200,10 @@ try {
   // Synchronous fixture settlement and a later model change before the submit handler reads its task.
   boundaryChild.onSend = text => {
     void boundaryChild.emitNow({ type: "input", source: "extension", text });
-    void boundaryChild.emitNow(beforeEvent(text));
+    void boundaryChild.emitNow(beforeAgentStart({ cwd: root, prompt: text }));
     void boundaryChild.emitNow({ type: "agent_start" });
     void boundaryChild.emitNow({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "x".repeat(100000) }], api: reasoning.api, provider: reasoning.provider, model: reasoning.id, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, stopReason: "stop", timestamp: Date.now() } });
-    void boundaryChild.emitNow(settleEvent());
+    void boundaryChild.emitNow(completedSettle());
     void boundaryChild.emitNow({ type: "agent_settled" });
     void boundaryChild.changeModel(plain);
   };
@@ -234,7 +231,7 @@ try {
   assert.equal(pending.selection, null);
   const pendingText = `[ds-task ${pending.nonce}]\n${pending.task}`;
   await boundaryChild.emit({ type: "input", source: "extension", text: pendingText });
-  await boundaryChild.emit(beforeEvent(pendingText));
+  await boundaryChild.emit(beforeAgentStart({ cwd: root, prompt: pendingText }));
   await boundaryChild.emit({ type: "agent_start" });
   assert.equal(boundaryChild.sends, beforeLateStart, "late observation does not replay submission");
   assert.equal(JSON.parse(readFileSync(pendingPath, "utf8")).selection.thinking, "off");
@@ -393,8 +390,8 @@ try {
   const loader = new DefaultResourceLoader({ cwd: root, agentDir, settingsManager, noExtensions: true,
     noSkills: true, noPromptTemplates: true, noThemes: true, agentsFilesOverride: () => ({ agentsFiles: [] }),
     extensionFactories: [pi => adapter({ ...pi, exec: async (_command, args) => {
-      const op = args.slice(args.indexOf("herdr") + 1);
-      return { code: 0, killed: false, stderr: "", stdout: op[1] === "get" ? JSON.stringify({ result: { pane: pane(present(op[2], "SDK pane id")) } }) : "" };
+      const op = herdrArgs(args);
+      return op[1] === "get" ? herdrResult({ pane: pane(present(op[2], "SDK pane id")) }) : execOk();
     } }), pi => pi.on("before_agent_start", event => { renderedPrompts.push(event.systemPrompt); })] });
   Object.assign(process.env, { DS_HERDR_WORKER_ID: "sdk-worker", DS_HERDR_PARENT_ID: "lead", DS_HERDR_ROLE: "review",
     HERDR_PANE_ID: "sdk-worker", DS_HERDR_LAUNCH_ID: "", DS_HERDR_RESTART_GENERATION: "" });
@@ -447,8 +444,7 @@ try {
   process.stdout.write("PASS worker selection: real Pi catalog and SDK events/reload; required thinking/optional model, role-independent levels, schema and pre-allocation rejection, nested inheritance, native-change persistence, empty reload, cold continuation, legacy recovery/refusal, thinking fence. Herdr and provider turns stubbed.\n");
 } finally {
   for (const instance of instances.reverse()) await instance.stop().catch(() => {});
-  for (const name of Object.keys(process.env)) if (!(name in originalEnv)) delete process.env[name];
-  Object.assign(process.env, originalEnv);
+  replaceEnvironment(originalEnv);
   rmSync(socketDirectory(root, originalEnv.XDG_RUNTIME_DIR || "/tmp"), { recursive: true, force: true });
   rmSync(root, { recursive: true, force: true });
 }

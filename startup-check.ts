@@ -8,7 +8,7 @@ import adapter from "./index.ts";
 import { startupConfig, extensionPath, privateDirectory } from "./startup.ts";
 import { atomicWrite, request } from "./protocol.ts";
 import type { ExtensionEvent, ExtensionError } from "@earendil-works/pi-coding-agent";
-import { fakeApi, fakeContext, fakeModel, fakeRegistry, fakeSessions, fakeUi, hookRegistry, toolRegistry, toolText, present } from "./fakes.ts";
+import { fakeApi, fakeContext, fakeModel, fakeModelRegistry, fakeSessions, fakeUi, hookRegistry, toolRegistry, toolText, present, beforeAgentStart, herdrResult, execOk, execFailure, replaceEnvironment } from "./fakes.ts";
 
 // Root doubles as XDG_RUNTIME_DIR. macOS tmpdir() is too long for the 103-byte socket limit.
 const root = mkdtempSync("/tmp/pha-");
@@ -32,8 +32,7 @@ function fixture({ id = "session-a", mode = "tui", persistent = true, env = {}, 
   const commands: { command: string; args: string[] }[] = [], notifications: string[] = [];
   let selected = ["read", "bash", "my-selected-tool"], changes = 0, shutdowns = 0;
   const ctx = fakeContext({ mode: "tui", hasUI: mode === "tui" || mode === "rpc", cwd: project, model: fakeModel("fixture", "no-network"),
-    modelRegistry: fakeRegistry({ find: (provider, id) => fakeModel(provider, id),
-      hasConfiguredAuth: () => true, getProviderAuthStatus: () => ({ configured: true }) }),
+    modelRegistry: fakeModelRegistry({ auth: true }),
     sessionManager: fakeSessions({ getSessionFile: () => persistent ? sessionFile : undefined, getSessionId: () => id }),
     isIdle: () => true, hasPendingMessages: () => false, shutdown() { shutdowns++; },
     ui: fakeUi({ notify(message) { notifications.push(message); }, setWidget(key, value) { widgets.set(key, value); } }) });
@@ -48,11 +47,11 @@ function fixture({ id = "session-a", mode = "tui", persistent = true, env = {}, 
       assert.equal(command, "env");
       assert.deepEqual(args.slice(0, 6), ["-u", "HERDR_SESSION", "-u", "HERDR_SESSION_NAME", `HERDR_SOCKET_PATH=${environment.HERDR_SOCKET_PATH}`, "herdr"]);
       const op = args.slice(6);
-      if (fail === true || (fail === "report" && op[1] === "report-agent")) return { code: 1, killed: false, stderr: "fixture startup fault", stdout: "" };
-      if (op[0] === "agent") return { code: 1, killed: false, stderr: "fixture child failure", stdout: "" };
+      if (fail === true || (fail === "report" && op[1] === "report-agent")) return execFailure("fixture startup fault");
+      if (op[0] === "agent") return execFailure("fixture child failure");
       const pane = { pane_id: op[2], workspace_id: "w1", terminal_id: "terminal-1", tab_id: "w1:t1" };
       const result = op[0] === "tab" ? { root_pane: { ...pane, pane_id: "w1:p-new" } } : { pane };
-      return { code: 0, killed: false, stderr: "", stdout: op[1] === "get" || op[0] === "tab" ? JSON.stringify({ result }) : "" };
+      return op[1] === "get" || op[0] === "tab" ? herdrResult(result) : execOk();
     },
   });
   const saved = { ...process.env };
@@ -65,8 +64,7 @@ function fixture({ id = "session-a", mode = "tui", persistent = true, env = {}, 
     }
     adapter(api);
   } finally {
-    for (const key of Object.keys(process.env)) if (!(key in saved)) delete process.env[key];
-    Object.assign(process.env, saved);
+    replaceEnvironment(saved);
   }
   const config = startupConfig(ctx, environment);
   const emit = (name: Parameters<typeof hooks.emit>[0]) => hooks.emit(name, ctx);
@@ -82,7 +80,7 @@ async function inert(instance: ReturnType<typeof fixture>) {
   await instance.start();
   await instance.emit({ type: "agent_start" });
   await instance.emit({ type: "agent_settled" });
-  const event = { type: "before_agent_start" as const, prompt: "hello", systemPrompt: "", systemPromptOptions: { cwd: project, selectedTools: [], toolSnippets: {}, toolGuidelines: {}, promptGuidelines: [], appendSystemPrompt: "", sections: {}, contextFiles: [], skills: [] } };
+  const event = beforeAgentStart({ cwd: project, prompt: "hello" });
   await instance.emit(event);
   assert.deepEqual(event.systemPromptOptions.promptGuidelines, []);
   for (const event of inertEvents)
@@ -231,7 +229,7 @@ try {
   assert.equal(fault.tools.size, 0);
   assert.deepEqual(await fault.emit({ type: "input", source: "extension", text: "" }), [undefined]);
   assert.deepEqual(await fault.emit({ type: "tool_call", toolCallId: "fixture", toolName: "bash", input: { command: "" } }), [undefined]);
-  const guidelines = { type: "before_agent_start" as const, prompt: "", systemPrompt: "", systemPromptOptions: { cwd: project, selectedTools: [], toolSnippets: {}, toolGuidelines: {}, promptGuidelines: [], appendSystemPrompt: "", sections: {}, contextFiles: [], skills: [] } };
+  const guidelines = beforeAgentStart({ cwd: project, prompt: "" });
   await fault.emit(guidelines);
   assert.deepEqual(guidelines.systemPromptOptions.promptGuidelines, []);
   const reportFault = fixture({ id: "report-fault", fail: "report" });
