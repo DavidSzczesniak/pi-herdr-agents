@@ -1,7 +1,8 @@
-import type { AgentToolResult, ExtensionAPI, ExtensionContext, ExtensionEvent, ExtensionHandler, ExtensionUIContext, ModelRegistry, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { AgentToolResult, ExtensionAPI, ExtensionContext, ExtensionEvent, ExtensionHandler, ExtensionUIContext, ModelRegistry, ToolDefinition, ExecResult } from "@earendil-works/pi-coding-agent";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import type { TSchema } from "typebox";
 import { Check } from "typebox/value";
+import type { Pane } from "./runtime.ts";
 
 type EventName = ExtensionEvent["type"];
 type EventMap = { [E in ExtensionEvent as E["type"]]: E };
@@ -23,6 +24,24 @@ export const fakeRegistry = (members: Partial<ModelRegistry>) => fake<ModelRegis
 export const fakeSessions = (members: Partial<ExtensionContext["sessionManager"]>) => fake<ExtensionContext["sessionManager"]>(members);
 export const fakeModel = (provider: string, id: string, extra: Partial<Model<Api>> = {}): Model<Api> => ({ id, name: id, api: "openai-completions",
   provider, baseUrl: "", reasoning: true, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 0, maxTokens: 0, ...extra });
+
+export const fakeModelRegistry = ({ auth }: { auth: boolean }): ModelRegistry => fakeRegistry({
+  find: (provider, id) => fakeModel(provider, id),
+  hasConfiguredAuth: () => auth,
+  getProviderAuthStatus: () => ({ configured: auth }),
+});
+export const beforeAgentStart = ({ cwd, prompt }: { cwd: string; prompt: string }): EventOf<"before_agent_start"> => ({
+  type: "before_agent_start", prompt, systemPrompt: "", systemPromptOptions: { cwd, selectedTools: [], toolSnippets: {}, toolGuidelines: {}, promptGuidelines: [], appendSystemPrompt: "", sections: {}, contextFiles: [], skills: [] },
+}) satisfies ExtensionEvent;
+export const completedSettle = (): EventOf<"agent_before_settle"> => ({
+  type: "agent_before_settle", outcome: "completed", entries: [], continue: false,
+  context: { contextEntries: [], contextMessages: [], llmMessages: [], pendingMessages: [], canContinue: false },
+}) satisfies ExtensionEvent;
+export const herdrArgs = (argv: readonly string[]): string[] => argv.slice(argv.indexOf("herdr") + 1);
+export const execOk = (stdout = ""): ExecResult => ({ code: 0, killed: false, stderr: "", stdout });
+export const execFailure = (stderr: string, { killed = false }: { killed?: boolean } = {}): ExecResult => ({ code: 1, killed, stderr, stdout: "" });
+export const herdrResult = (result: unknown): ExecResult => execOk(JSON.stringify({ result }));
+export const fakePane = (id = "w1:p1"): Pane => ({ pane_id: id, workspace_id: "w1", terminal_id: `term-${id}`, tab_id: `tab-${id}` });
 
 const is = <K extends EventName>(event: ExtensionEvent, name: K): event is EventOf<K> => event.type === name;
 export function hookRegistry() {
@@ -86,10 +105,13 @@ export function fixtureEnvironment(overrides: NodeJS.ProcessEnv, inherited: Node
   return env;
 }
 
-export function installFixtureEnvironment(overrides: NodeJS.ProcessEnv): void {
-  const env = fixtureEnvironment(overrides);
+export function replaceEnvironment(env: NodeJS.ProcessEnv): void {
   for (const key of Object.keys(process.env)) if (!(key in env)) delete process.env[key];
   Object.assign(process.env, env);
+}
+
+export function installFixtureEnvironment(overrides: NodeJS.ProcessEnv): void {
+  replaceEnvironment(fixtureEnvironment(overrides));
 }
 
 export function present<T>(value: T | null | undefined, what: string): T {
