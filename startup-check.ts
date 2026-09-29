@@ -1,5 +1,6 @@
 // Real files/sockets/process identities and Pi discovery/headless binding. TUI/Herdr controls are stubbed.
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, readFileSync, realpathSync, symlinkSync, writeFileSync, existsSync, rmSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -20,7 +21,8 @@ const navigationEvents = [
   { type: "session_before_fork", entryId: "", position: "at" },
   { type: "session_before_tree", preparation: { targetId: "", oldLeafId: null, commonAncestorId: null, entriesToSummarize: [], userWantsSummary: false }, signal: new AbortController().signal },
 ] satisfies ExtensionEvent[];
-const inertEvents = [{ type: "input", source: "extension", text: "" }, { type: "tool_call", toolCallId: "fixture", toolName: "bash", input: { command: "" } }, ...navigationEvents, { type: "cache_warming_decision", warmCost: 0, missCost: 0, continuationProbability: 0, action: "warm" }] satisfies ExtensionEvent[];
+const bashResult = { type: "tool_result", toolCallId: "fixture", toolName: "bash", input: { command: "" }, content: [{ type: "text", text: "ok" }], details: undefined, isError: false } satisfies ExtensionEvent;
+const inertEvents = [{ type: "input", source: "extension", text: "" }, { type: "tool_call", toolCallId: "fixture", toolName: "bash", input: { command: "" } }, bashResult, ...navigationEvents, { type: "cache_warming_decision", warmCost: 0, missCost: 0, continuationProbability: 0, action: "warm" }] satisfies ExtensionEvent[];
 function fixture({ id = "session-a", mode = "tui", persistent = true, env = {}, fail = false }: { id?: string; mode?: string; persistent?: boolean; env?: Record<string, string | undefined>; fail?: boolean | "report" } = {}) {
   const sessionFile = join(root, `${id}.jsonl`);
   if (!existsSync(sessionFile)) writeFileSync(sessionFile, JSON.stringify({ type: "session", id }) + "\n");
@@ -109,6 +111,19 @@ try {
   assert.ok(Buffer.byteLength(a.identity().socketPath) <= 103);
   assert.ok(a.config.stateDir.length > 200);
   assert.deepEqual(readdirSync(project), [], "runtime state never enters project");
+  // A second worktree of the project borrows the project's dependencies until a Bash result removes the link.
+  const borrower = join(root, "borrower");
+  const git = (...args: string[]) => execFileSync("git", ["-C", project, ...args], { stdio: "ignore" });
+  git("init", "-q");
+  git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "init");
+  git("worktree", "add", "-q", "--detach", borrower);
+  mkdirSync(join(project, "node_modules"));
+  const borrow = () => symlinkSync(join(project, "node_modules"), join(borrower, "node_modules"));
+  const removal = [{ content: [{ type: "text", text: "ok" }, { type: "text", text: `Removed node_modules links to another checkout: ${join(realpathSync(borrower), "node_modules")}. Install dependencies in each worktree instead (for example \`npm ci\`).` }] }];
+  borrow();
+  assert.deepEqual(await a.emit(bashResult), removal, "the lead removes a borrowed dependency link after Bash");
+  assert.equal(existsSync(join(borrower, "node_modules")), false);
+  assert.deepEqual(await a.emit(bashResult), [undefined], "nothing is reported once no link remains");
   assert.equal(a.config.herdrSession, "", "default server needs no invented session name");
   assert.equal(b.config.herdrSession, "named");
   assert.equal(fixture({ id: "session-legacy", env: { HERDR_SESSION_NAME: "legacy" } }).config.herdrSession, "legacy", "Herdr 0.8 session name still read");
@@ -138,6 +153,8 @@ try {
   for (const event of navigationEvents)
     assert.deepEqual(await child.emit(event), [{ cancel: true }], "worker retains assigned conversation history");
   assert.deepEqual(await child.emit({ type: "tool_call", toolCallId: "fixture", toolName: "bash", input: { command: "" } }), [undefined], "review role has no shell ban");
+  borrow();
+  assert.deepEqual(await child.emit(bashResult), removal, "a Pi worker removes a borrowed dependency link after Bash");
   const duplicate = fixture();
   await duplicate.start();
   assert.match(present(duplicate.notifications[0], "duplicate notification"), /still live/);
@@ -146,6 +163,10 @@ try {
   assert.equal(a.identity().generation, original.generation);
   assert.ok(existsSync(original.socketPath));
   await a.stop();
+  borrow();
+  assert.deepEqual(await a.emit(bashResult), [undefined], "a stopped lead adapter leaves links alone");
+  git("worktree", "remove", "--force", borrower);
+  for (const entry of [".git", "node_modules"]) rmSync(join(project, entry), { recursive: true });
   const restored = fixture();
   // Native Pi leaves an empty session unflushed, even though getSessionFile returns its path.
   rmSync(present(restored.ctx.sessionManager.getSessionFile(), "restored session file"));

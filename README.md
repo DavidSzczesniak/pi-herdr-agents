@@ -56,6 +56,8 @@ All Herdr commands target the captured `HERDR_SOCKET_PATH`. Startup verifies the
 
 Workers start fresh conversations and own their descendants. Children receive their complete task brief, not parent conversation history. They use the installed extension's actual path and normal tools, including Bash, Git through Bash, edits, writes, and nested delegation. A read-only review is an assignment, not a reduced tool profile. The lead retains its selected tools and thinking level.
 
+After every Bash call, the adapter removes each `node_modules` symlink in the repository's worktrees that points outside its own worktree, and tells the agent to install dependencies there instead, for example with `npm ci`. Removing the link never touches its target. The Pi lead and workers run the check from a `tool_result` handler, and Claude workers from `PostToolUse` and `PostToolUseFailure` hooks, through the same `link-guard.sh`.
+
 ### Worker model and thinking
 
 `spawn_agent` requires `role`, `thinking`, and `task`. Optional `model: {provider, id}` must match Pi's registry exactly. Omitted model inherits the immediate caller's current native model, including on nested spawns. The runtime does not map roles to thinking levels. ds-mode's profile table supplies the explicit levels.

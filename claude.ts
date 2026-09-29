@@ -7,6 +7,7 @@ import { Type, type Static } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { atomicWrite, errorText, parse, readRecord, Role, SafeId } from "./protocol.ts";
 import { privateDirectory } from "./startup.ts";
+import { dependencyLinkScript } from "./link-guard.ts";
 import { recordSubmittedSize, roleBrief, tabPane, type Pane } from "./runtime.ts";
 
 // Claude Code workers cannot host this adapter, so the caller owns their whole state. They are one-shot leaf workers.
@@ -367,8 +368,12 @@ export async function spawnClaude(host: ClaudeHost, spec: { role: Static<typeof 
   privateDirectory(join(dir, "hooks"));
   const brief = join(dir, "brief.md");
   writeFileSync(brief, spec.task, { mode: 0o600 });
-  const hooks = Object.fromEntries(hookEvents.map((event) => [event, [{ hooks: [{ type: "command",
-    command: ["/bin/sh", hookScript, event, join(dir, "hooks")].map(quote).join(" ") }] }]]));
+  const hooks = {
+    ...Object.fromEntries(hookEvents.map((event) => [event, [{ hooks: [{ type: "command",
+      command: ["/bin/sh", hookScript, event, join(dir, "hooks")].map(quote).join(" ") }] }]])),
+    ...Object.fromEntries(["PostToolUse", "PostToolUseFailure"].map((event) => [event, [{ matcher: "Bash", hooks: [{ type: "command",
+      command: ["/bin/sh", dependencyLinkScript, spec.cwd].map(quote).join(" "), timeout: 5 }] }]])),
+  };
   writeFileSync(join(dir, "settings.json"), JSON.stringify({ hooks }), { mode: 0o600 });
   const prompt = Buffer.byteLength(spec.task) > argumentLimit
     ? quote(`Your complete task brief is in ${brief}. Read all of it first, then follow it exactly.`)

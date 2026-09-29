@@ -5,6 +5,7 @@ import { spawn } from "node:child_process";
 import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { present } from "./fakes.ts";
+import { dependencyLinkScript } from "./link-guard.ts";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import type { ClaudeHost } from "./claude.ts";
 import { claudeCommand, interruptClaude, listClaude, pendingWork, readClaudeWorker, readTranscript, retireClaude, spawnClaude, unresolvedClaudeChild, waitClaude } from "./claude.ts";
@@ -206,6 +207,9 @@ try {
   assert.match(settled.finalText, /^done model=claude-opus-5-5 effort=high apiKey=unset bedrock=unset /, "credentials and provider routing are unset");
   assert.equal(readFileSync(present(settled.artifactPath, "settled artifact"), "utf8"), settled.finalText);
   assert.equal(settled.transcriptPath, join(stateDir, "claude", done.workerId, "transcript.jsonl"));
+  const { hooks } = JSON.parse(readFileSync(join(stateDir, "claude", done.workerId, "settings.json"), "utf8"));
+  const linkCheck = [{ matcher: "Bash", hooks: [{ type: "command", command: `'/bin/sh' '${dependencyLinkScript}' '${cwd}'`, timeout: 5 }] }];
+  assert.deepEqual([hooks.PostToolUse, hooks.PostToolUseFailure], [linkCheck, linkCheck], "Bash results, failed or not, run the dependency-link check in the worker's cwd");
   assert.ok(Buffer.byteLength(present(present(herdrCalls.find((args) => args[1] === "run"), "run command")[3], "exec line")) < 1024, "Herdr types only a short exec line");
   await assert.rejects(waitClaude(host, done.workerId, "other-submission", 1000), /Unknown submission/);
 
