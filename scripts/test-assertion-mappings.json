@@ -1,4 +1,11 @@
 {
+  "adapter": {
+    "mechanical": [{
+      "before": "four unowned spawn calls and a SIGKILLed Perl zombie holder",
+      "after": "ownProbe records every spawn; exitOf observes at spawn; finally stops every probe; the Perl TERM handler waitpid reaps its child",
+      "reason": "Case failure must reap direct children and the deliberately held zombie. Four disposable failure probes verify exact PID absence and directory removal. Assertions and loop domains are unchanged."
+    }]
+  },
   "launch-race": {
     "helpers": ["test-support/launch-contender.ts"],
     "mechanical": [{

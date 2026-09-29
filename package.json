@@ -13,7 +13,7 @@
   "scripts": {
     "check": "tsc -p .",
     "transport-check": "vitest run transport.test.ts",
-    "adapter-check": "node adapter-check.ts",
+    "adapter-check": "vitest run adapter.test.ts",
     "launch-race-check": "vitest run launch-race.test.ts",
     "fixture-isolation-check": "vitest run fixture-isolation.test.ts",
     "startup-check": "vitest run startup.test.ts",
