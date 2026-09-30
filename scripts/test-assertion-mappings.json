@@ -1,4 +1,16 @@
 {
+  "launch-race": {
+    "helpers": ["test-support/launch-contender.ts"],
+    "mechanical": [{
+      "before": "fork(file, ['contender']) with cwd derived from that file",
+      "after": "fork(test-support/launch-contender.ts, []) with explicit RACE_PACKAGE_DIR and execArgv: []",
+      "reason": "The child must be a plain Node entry without Vitest. Its original package cwd is passed explicitly. Every case repeats the real two-process race and both exit-code assertions."
+    }, {
+      "before": "Opened-selection, claim, losing-result, and session-entry assertions run before contender release.",
+      "after": "Each independently owned race releases and reaps both contenders before its case inspects those observations.",
+      "reason": "Independent review measured equal pre-release and post-release state in twelve races. This is a timing adaptation, not a claim that expression preservation alone proves equivalent execution."
+    }]
+  },
   "fixture-isolation": {
     "mechanical": [
       {
