@@ -1,4 +1,12 @@
 {
+  "retirement": {
+    "helpers": ["test-support/retirement-native.ts", "test-support/retirement-child.ts"],
+    "mechanical": [{
+      "before": "parent and child branches share retirement-check.ts module state",
+      "after": "a case owns retirementNative; a plain Node child entry parses mode and receives the private directory",
+      "reason": "Real process and socket contracts remain in each case. All original assertions and loop inputs survive. Exit observation is registered immediately and cleanup awaits every owned child."
+    }]
+  },
   "selection": {
     "loops": [{
       "before": "for (replyMode of [\"legacy\", \"mismatch\", \"invalid\", \"disconnect\"])",
