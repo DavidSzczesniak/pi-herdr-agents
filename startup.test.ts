@@ -9,9 +9,9 @@ import { atomicWrite, request } from "./protocol.ts";
 import type { ExtensionEvent, ExtensionError } from "@earendil-works/pi-coding-agent";
 import { fakeApi, fakeContext, fakeModel, fakeModelRegistry, fakeSessions, fakeUi, hookRegistry, toolRegistry, toolText, present, beforeAgentStart, herdrResult, execOk, execFailure, replaceEnvironment } from "./fakes.ts";
 import { test } from "vitest";
+import { finishCleanup, finishCleanupSync } from "./test-support/cleanup.ts";
 
-function startupFixture() {
-  const root = mkdtempSync("/tmp/pha-");
+function startupFixture(root: string) {
   const stateRoot = join(root, "long-durable-state-" + "x".repeat(140));
   const project = join(root, "project");
   mkdirSync(project);
@@ -55,6 +55,7 @@ function startupFixture() {
       },
     });
     const saved = { ...process.env };
+    const constructionErrors: unknown[] = [];
     try {
       // Factory snapshots only. Runtime instances cannot use each other's environment.
       for (const key of Object.keys(process.env)) if (key.startsWith("DS_HERDR_") || key.startsWith("HERDR_")) delete process.env[key];
@@ -63,8 +64,10 @@ function startupFixture() {
         else process.env[key] = value;
       }
       adapter(api);
+    } catch (error) {
+      constructionErrors.push(error);
     } finally {
-      replaceEnvironment(saved);
+      finishCleanupSync(constructionErrors, [() => replaceEnvironment(saved)]);
     }
     const config = startupConfig(ctx, environment);
     const emit = (name: Parameters<typeof hooks.emit>[0]) => hooks.emit(name, ctx);
@@ -92,24 +95,31 @@ function startupFixture() {
   }
   return { root, stateRoot, project, fixture, inert, navigationEvents, bashResult,
     async close() {
-      const results = await Promise.allSettled(fixtures.reverse().map(fixture => fixture.stop()));
-      rmSync(root, { recursive: true, force: true });
-      const errors = results.filter(result => result.status === "rejected").map(result => result.reason);
-      if (errors.length) throw new AggregateError(errors, "startup fixture cleanup failed");
+      await finishCleanup([], fixtures.reverse().map(fixture => () => fixture.stop()));
     },
   };
 }
 async function withStartup(check: (suite: ReturnType<typeof startupFixture>) => Promise<void>) {
-  const suite = startupFixture();
-  try { await check(suite); } finally { await suite.close(); }
+  // Root doubles as XDG_RUNTIME_DIR. macOS tmpdir() is too long for the 103-byte socket limit.
+  const root = mkdtempSync("/tmp/pha-");
+  let suite: ReturnType<typeof startupFixture> | undefined;
+  const errors: unknown[] = [];
+  try {
+    suite = startupFixture(root);
+    await check(suite);
+  } catch (error) {
+    errors.push(error);
+  } finally {
+    await finishCleanup(errors, [() => suite?.close(), () => rmSync(root, { recursive: true, force: true })]);
+  }
 }
 
 for (const mode of ["rpc", "json", "print", undefined]) {
-test(`is inert in ${mode ?? "sdk"}`, () => withStartup(async ({ fixture, inert, stateRoot }) => {
+  test(`is inert in ${mode ?? "sdk"}`, () => withStartup(async ({ fixture, inert, stateRoot }) => {
     const instance = fixture({ mode: mode ?? "sdk" });
     await inert(instance);
-  assert.equal(existsSync(stateRoot), false, "inert startup performs no runtime writes");
-}));
+    assert.equal(existsSync(stateRoot), false, "inert startup performs no runtime writes");
+  }));
 }
 
 test("is inert outside Herdr", { timeout: 30000 }, () => withStartup(async ({ fixture, inert, stateRoot }) => {
@@ -188,6 +198,7 @@ test("workers retain assigned history and normal review tools", { timeout: 30000
 test("accepts a symlinked child workspace as the same directory", { timeout: 30000 }, () => withStartup(async ({ fixture, root, project }) => {
   const a = fixture();
   await a.start();
+  // macOS /tmp is a symlink to /private/tmp: Pi reports the real path while the launch may name the link.
   const linked = join(root, "linked-project");
   symlinkSync(project, linked);
   const linkedChild = fixture({ id: "linked-session", env: {
@@ -242,7 +253,7 @@ test("empty-history reload restores plan and preserves live descendants", { time
   await restored.stop();
 }));
 
-test("cold root recovery requires death proof and serves its new socket", { timeout: 30000 }, () => withStartup(async ({ fixture }) => {
+test("cold root recovery proves death, serves its socket, and launches with captured configuration", { timeout: 30000 }, () => withStartup(async ({ fixture, root, project }) => {
   const restored = fixture();
   await restored.start();
   await restored.stop();
@@ -256,11 +267,6 @@ test("cold root recovery requires death proof and serves its new socket", { time
   const status = await request(recovered.identity().socketPath, { kind: "status", generation: recovered.identity().generation,
     callerId: "lead", callerGeneration: recovered.identity().generation });
   assert.equal(status.kind, "status");
-}));
-
-test("launch uses installed extension and captured config and canonicalizes cwd", { timeout: 30000 }, () => withStartup(async ({ fixture, root, project }) => {
-  const recovered = fixture();
-  await recovered.start();
   const linked = join(root, "linked-project");
   symlinkSync(project, linked);
   await assert.rejects(recovered.tools.get("spawn_agent").execute("child", { role: "implement", thinking: "medium", task: "new task" }, undefined, undefined, recovered.ctx), /fixture child failure/);
@@ -282,6 +288,8 @@ test("launch uses installed extension and captured config and canonicalizes cwd"
 }));
 
 test("rejects an overlong launch before tab or claim allocation", { timeout: 30000 }, () => withStartup(async ({ fixture, root }) => {
+  // Herdr may type the launch command into a shell still in canonical mode; macOS truncates canonical input at 1024 bytes.
+  // Four 200-byte segments exceed the limit whatever the checkout path; each stays under the 255-byte name limit.
   const deep = fixture({ id: "deep-state", env: { XDG_STATE_HOME: join(root, "a".repeat(200), "b".repeat(200), "c".repeat(200), "d".repeat(200)) } });
   await deep.start();
   await assert.rejects(deep.tools.get("spawn_agent").execute("child", { role: "implement", thinking: "medium", task: "t" }, undefined, undefined, deep.ctx), /launch command too long/);
@@ -344,12 +352,15 @@ test("real Pi discovery and headless SDK binding preserve selected tools", { tim
     const errors: ExtensionError[] = [];
     const { session } = await createAgentSession({ cwd: project, agentDir, resourceLoader: loader, modelRuntime,
       settingsManager, tools: ["read"], sessionManager: SessionManager.create(project, join(root, "sdk-sessions")) });
+    const failures: unknown[] = [];
     try {
       await session.bindExtensions({ ...(mode ? { mode } : {}), onError: error => { errors.push(error); } });
       assert.deepEqual(errors, []);
       assert.deepEqual(session.getActiveToolNames(), ["read"], "real headless binding preserves tools");
       assert.ok(!session.getAllTools().some(tool => tool.name === "spawn_agent"));
-    } finally { session.dispose(); }
+    } catch (error) {
+      failures.push(error);
+    } finally { await finishCleanup(failures, [() => session.dispose()]); }
     await loader.reload();
   }
 }));
