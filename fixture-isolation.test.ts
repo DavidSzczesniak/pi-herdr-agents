@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { test } from "vitest";
+import { onTestFinished, test } from "vitest";
 import { fileURLToPath } from "node:url";
 import { ownChild } from "./test-support/process.ts";
 import { finishCleanup } from "./test-support/cleanup.ts";
+import { ownTestCleanup } from "./test-support/ownership.ts";
 import { watch, mkdtempSync, mkdirSync, readdirSync, rmSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -31,6 +32,22 @@ test("cleanup retains the body failure and attempts every closer", async () => {
   assert.deepEqual(closed, ["first", "middle", "last"]);
 });
 
+test("runner lifecycle owns cleanup independently of body finally", () => {
+  let closed = 0;
+  onTestFinished(() => { assert.equal(closed, 1); });
+  ownTestCleanup(() => [() => { closed++; }], []);
+});
+
+test("overlapping cleanup calls share one operation", async () => {
+  let closed = 0;
+  const cleanup = ownTestCleanup(() => [async () => {
+    closed++;
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }], []);
+  await Promise.all([cleanup.finish([]), cleanup.finish([])]);
+  assert.equal(closed, 1);
+});
+
 const checks = ["launch-race-check.ts", "adapter-check.ts", "selection-check.ts", "retirement-check.ts"] as const;
 for (const file of checks) {
   const check = file.replace(/\.ts$/, "");
@@ -41,6 +58,7 @@ for (const file of checks) {
     const changes: string[] = [];
     const errors: unknown[] = [];
     const cleanup: (() => unknown)[] = [() => rmSync(root, { recursive: true, force: true })];
+    const ownedCleanup = ownTestCleanup(() => cleanup, [() => rmSync(root, { recursive: true, force: true })]);
     try {
       mkdirSync(socketDir, { mode: 0o700 });
       mkdirSync(stateDir, { mode: 0o700 });
@@ -74,7 +92,7 @@ for (const file of checks) {
     } catch (error) {
       errors.push(error);
     } finally {
-      await finishCleanup(errors, cleanup);
+      await ownedCleanup.finish(errors);
     }
   });
 }
