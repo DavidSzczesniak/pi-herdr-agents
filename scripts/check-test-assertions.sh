@@ -53,12 +53,10 @@ function inventory(file, text) {
   visit(source);
   return entries;
 }
-const baseline = {};
 for (const suite of suites) {
   const oldFile = `${suite}-check.ts`;
   const oldText = execFileSync('git', ['show', `${base}:${oldFile}`], { encoding: 'utf8' });
   const before = inventory(oldFile, oldText);
-  baseline[suite] = before;
   const files = fs.existsSync(oldFile) ? [oldFile] : [`${suite}.test.ts`, ...(mappings[suite]?.helpers ?? [])];
   const inventories = files.map(file => inventory(file, fs.readFileSync(file, 'utf8')));
   const after = inventories.flat();
@@ -98,6 +96,5 @@ for (const suite of suites) {
   }
   console.log(`${suite}: preserved ${before.length} assertions/guards and enclosing loop domains; ${remaining.length} additional assertions/guards`);
 }
-if (process.argv.includes('--capture')) fs.writeFileSync('/tmp/piha-issue10/assertion-baseline.json', JSON.stringify(baseline, null, 2) + '\n');
 console.log(`PASS assertion preservation against ${base}`);
 JS

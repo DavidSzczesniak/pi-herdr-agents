@@ -121,6 +121,8 @@ npm ci --ignore-scripts --no-audit --no-fund
 npm test
 ```
 
+Run checks without inherited `GIT_DIR`, `GIT_WORK_TREE`, `GIT_COMMON_DIR`, or `GIT_INDEX_FILE`. Git fixture commands can otherwise target a real repository instead of their temporary directories. In particular, do not run these checks through `git rebase --exec` in a linked worktree. See [issue 45](https://github.com/DavidSzczesniak/pi-herdr-agents/issues/45).
+
 Transport checks use real Unix sockets. Adapter and startup checks use real files, sockets, and process identities but stub TUI events and Herdr commands. The Claude check runs the real launch script, settings, and hook against a fake `claude` executable with Herdr stubbed. Startup checks also exercise real Pi package discovery and headless SDK binding. The launch-race check uses two real processes with a stubbed native session-open boundary. Selection checks use Pi's installed catalog, capability helpers, and SDK model/thinking events and empty-history reload, with Herdr controls and provider turns stubbed. The retirement check uses separate real processes and Unix sockets with stubbed Pi and Herdr controls. It covers original-conversation cold continuation and retained historical results without a provider turn. These checks launch neither Herdr nor models. `npm test` typechecks the package, then runs all nine Vitest files in parallel isolated forks. Cases within each file run sequentially and own their temporary directories. The fixture-isolation cases also rerun launch-race, adapter, selection, and retirement through exact-file aliases with poisoned inherited adapter paths. They verify successful child exits and untouched state and socket sentinels.
 
 Run one file or one named case directly:
@@ -131,7 +133,7 @@ npx vitest run selection.test.ts -t 'real SDK'
 scripts/check-test-assertions.sh --locations
 ```
 
-The assertion audit compares each old suite at `7a24052` with its test and helper files. It checks assertion and throwing-guard multiplicity, loop domains, and generated fake-Claude program bytes. `scripts/test-assertion-mappings.json` records mechanical adaptations. The audit installs TypeScript 5.9.3 in a disposable directory for parsing. It does not replace the package's TypeScript 7 typechecker.
+The migration-only assertion audit requires the original base commit `7a240528980f386f87f93c90d1078c2c9df253eb` in the local Git object database. It checks assertion and throwing-guard multiplicity, loop domains, and generated fake-Claude program bytes, not execution reachability or fixture prerequisites. The `mechanical` records in `scripts/test-assertion-mappings.json` are human-reviewed documentation, not executable checks. The audit installs the pinned TypeScript 5.9.3 parser in a temporary directory, so it needs npm registry access or a populated npm cache. It does not replace the package's TypeScript 7 typechecker.
 
 Native lifecycle verification requires a disposable Herdr server and ordinary package autoload.
 
