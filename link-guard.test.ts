@@ -5,11 +5,13 @@ import { existsSync, lstatSync, mkdirSync, mkdtempSync, realpathSync, rmSync, sy
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { removeBorrowedDependencies } from "./link-guard.ts";
-import { finishCleanup } from "./test-support/cleanup.ts";
+import { ownTestCleanup } from "./test-support/ownership.ts";
 
 async function topology(check: (paths: { main: string; linked: string; local: string; plain: string; taken: string; reason: string | undefined }) => void) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "link-guard-")));
   const errors: unknown[] = [];
+  const remove = () => rmSync(root, { recursive: true, force: true });
+  const ownedCleanup = ownTestCleanup(() => [remove], [remove]);
   try {
     const main = join(root, "main"), linked = join(root, "linked"), local = join(root, "local"), plain = join(root, "plain"), taken = join(root, "taken");
     const git = (...args: string[]) => execFileSync("git", ["-C", main, ...args], { stdio: "ignore" });
@@ -36,7 +38,7 @@ async function topology(check: (paths: { main: string; linked: string; local: st
   } catch (error) {
     errors.push(error);
   } finally {
-    await finishCleanup(errors, [() => rmSync(root, { recursive: true, force: true })]);
+    await ownedCleanup.finish(errors);
   }
 }
 

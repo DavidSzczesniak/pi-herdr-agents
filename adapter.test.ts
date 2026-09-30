@@ -15,6 +15,7 @@ import { claimLaunch, isOriginalProcessLive, processIdentity, planLines, tabPane
 import { test } from "vitest";
 import { ownChild } from "./test-support/process.ts";
 import { finishCleanup } from "./test-support/cleanup.ts";
+import { ownTestCleanup } from "./test-support/ownership.ts";
 
 type OwnRequest = Request extends infer R ? R extends Request ? Omit<R, "callerId" | "callerGeneration" | "generation"> : never : never;
 const selfRequest = (identity: { socketPath: string; workerId: string; generation: string }, operation: OwnRequest) => request(identity.socketPath, { callerId: identity.workerId, callerGeneration: identity.generation, generation: identity.generation, ...operation });
@@ -147,8 +148,12 @@ function adapterFixture() {
 async function withAdapter(check: (suite: ReturnType<typeof adapterFixture>) => Promise<void>) {
   const suite = adapterFixture();
   const errors: unknown[] = [];
+  const ownedCleanup = ownTestCleanup(() => [() => suite.close()], [
+    () => rmSync(suite.directory, { recursive: true, force: true }),
+    () => rmSync(socketDirectory(suite.state, suite.directory), { recursive: true, force: true }),
+  ]);
   try { await check(suite); } catch (error) { errors.push(error); }
-  finally { await finishCleanup(errors, [() => suite.close()]); }
+  finally { await ownedCleanup.finish(errors); }
 }
 
 test("distinguishes PID birth and validates pane workspace and verbatim plans", () => {
