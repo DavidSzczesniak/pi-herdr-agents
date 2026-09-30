@@ -14,6 +14,7 @@ import type { ChildProcess } from "node:child_process";
 import { claimLaunch, isOriginalProcessLive, processIdentity, planLines, tabPane, takeClaim, verifySession, waitProgress, recordSubmittedSize, runningTools } from "./runtime.ts";
 import { test } from "vitest";
 import { ownChild } from "./test-support/process.ts";
+import { finishCleanup } from "./test-support/cleanup.ts";
 
 type OwnRequest = Request extends infer R ? R extends Request ? Omit<R, "callerId" | "callerGeneration" | "generation"> : never : never;
 const selfRequest = (identity: { socketPath: string; workerId: string; generation: string }, operation: OwnRequest) => request(identity.socketPath, { callerId: identity.workerId, callerGeneration: identity.generation, generation: identity.generation, ...operation });
@@ -133,22 +134,24 @@ function adapterFixture() {
   return { directory, state, fixture, extraPanes, ownProbe, exitOf, stopProbe,
     controls: { set panePids(value: number[]) { panePids = value; }, set closeKills(value: boolean) { closeKills = value; } },
     async close() {
-      const errors: unknown[] = [];
-      for (const fixture of fixtures.reverse()) { try { await fixture.stop(); } catch (error) { errors.push(error); } }
-      for (const probe of probes.values()) { try { await probe.stop(); } catch (error) { errors.push(error); } }
-      replaceEnvironment(originalEnv);
-      rmSync(socketDirectory(state, directory), { recursive: true, force: true });
-      rmSync(directory, { recursive: true, force: true });
-      if (errors.length) throw new AggregateError(errors, "adapter fixture cleanup failed");
+      await finishCleanup([], [
+        ...fixtures.reverse().map(fixture => () => fixture.stop()),
+        ...[...probes.values()].map(probe => () => probe.stop()),
+        () => replaceEnvironment(originalEnv),
+        () => rmSync(socketDirectory(state, directory), { recursive: true, force: true }),
+        () => rmSync(directory, { recursive: true, force: true }),
+      ]);
     },
   };
 }
 async function withAdapter(check: (suite: ReturnType<typeof adapterFixture>) => Promise<void>) {
   const suite = adapterFixture();
-  try { await check(suite); } finally { await suite.close(); }
+  const errors: unknown[] = [];
+  try { await check(suite); } catch (error) { errors.push(error); }
+  finally { await finishCleanup(errors, [() => suite.close()]); }
 }
 
-test("distinguishes PID birth and validates pane workspace and verbatim plans", { timeout: 30_000 }, () => withAdapter(async ({  }) => {
+test("distinguishes PID birth and validates pane workspace and verbatim plans", () => {
   const current = processIdentity(process.pid);
   assert.ok(current);
   assert.equal(isOriginalProcessLive({ pid: process.pid, pidBirth: current.birth }), true);
@@ -156,7 +159,7 @@ test("distinguishes PID birth and validates pane workspace and verbatim plans", 
   assert.throws(() => tabPane({ result: { root_pane: pane() } }, "other"), /workspace/);
   assert.deepEqual(tabPane({ result: { root_pane: pane() } }, "w1"), pane());
   assert.equal(planLines({ plan: [{ step: "  Verbatim\nstep.  ", status: "in_progress" }] })[0], "[>]   Verbatim\nstep.  ");
-}));
+});
 
 test("missing auth refuses submission without sending and fences duplicate IDs", { timeout: 30_000 }, () => withAdapter(async ({ fixture }) => {
   const root = fixture({ auth: false });
