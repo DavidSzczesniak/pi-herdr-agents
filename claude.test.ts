@@ -11,6 +11,7 @@ import { test } from "vitest";
 import { randomUUID } from "node:crypto";
 import { ownChild } from "./test-support/process.ts";
 import { finishCleanup } from "./test-support/cleanup.ts";
+import { ownTestCleanup } from "./test-support/ownership.ts";
 
 const completeWait = (result: Awaited<ReturnType<typeof waitClaude>>) => { if (result.kind === "timeout") throw new Error(`Claude wait timed out: ${JSON.stringify(result)}`); return result; };
 const timedOut = (result: Awaited<ReturnType<typeof waitClaude>>) => { if (result.kind !== "timeout") throw new Error(`expected Claude timeout, got ${result.kind}`); return result; };
@@ -97,13 +98,15 @@ async function withClaude(check: (suite: ReturnType<typeof claudeFixture>) => Pr
   const root = mkdtempSync("/tmp/pha-");
   let suite: ReturnType<typeof claudeFixture> | undefined;
   const errors: unknown[] = [];
+  const remove = () => rmSync(root, { recursive: true, force: true });
+  const ownedCleanup = ownTestCleanup(() => [() => suite?.close(), remove], [remove]);
   try {
     suite = claudeFixture(root);
     await check(suite);
   } catch (error) {
     errors.push(error);
   } finally {
-    await finishCleanup(errors, [() => suite?.close(), () => rmSync(root, { recursive: true, force: true })]);
+    await ownedCleanup.finish(errors);
   }
 }
 
