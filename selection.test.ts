@@ -13,6 +13,7 @@ import type { ExtensionEvent, ExtensionError } from "@earendil-works/pi-coding-a
 import type { Model, Api, ModelThinkingLevel } from "@earendil-works/pi-ai";
 import type { Request } from "./protocol.ts";
 import { test } from "vitest";
+import { finishCleanup } from "./test-support/cleanup.ts";
 
 async function selectionFixture(root: string) {
   type SelectionFixture = { id: string; ctx: ReturnType<typeof fakeContext>; tools: ReturnType<typeof toolRegistry>; sessionFile: string;
@@ -121,9 +122,7 @@ async function selectionFixture(root: string) {
       set nextChildThinking(value: ModelThinkingLevel | undefined) { nextChildThinking = value; },
     },
     async close() {
-      const errors: unknown[] = [];
-      for (const instance of instances.reverse()) { try { await instance.stop(); } catch (error) { errors.push(error); } }
-      if (errors.length) throw new AggregateError(errors, "selection fixture cleanup failed");
+      await finishCleanup([], instances.reverse().map(instance => () => instance.stop()));
     },
   };
 }
@@ -131,16 +130,19 @@ async function withSelection(check: (suite: Awaited<ReturnType<typeof selectionF
   const root = mkdtempSync("/tmp/pha-");
   const originalEnv = { ...process.env };
   let suite: Awaited<ReturnType<typeof selectionFixture>> | undefined;
+  const errors: unknown[] = [];
   try {
     suite = await selectionFixture(root);
     await check(suite);
+  } catch (error) {
+    errors.push(error);
   } finally {
-    try { await suite?.close(); }
-    finally {
-      replaceEnvironment(originalEnv);
-      rmSync(socketDirectory(root, root), { recursive: true, force: true });
-      rmSync(root, { recursive: true, force: true });
-    }
+    await finishCleanup(errors, [
+      () => suite?.close(),
+      () => replaceEnvironment(originalEnv),
+      () => rmSync(socketDirectory(root, root), { recursive: true, force: true }),
+      () => rmSync(root, { recursive: true, force: true }),
+    ]);
   }
 }
 
@@ -309,13 +311,24 @@ test(`legacy endpoint ${replyMode} preserves unknown selection and correlation`,
       else socket.end(JSON.stringify({ ok: true, result }) + "\n");
     });
   });
-  await new Promise<void>(resolve => legacyServer.listen(legacyEndpointIdentity.socketPath, () => resolve()));
+  const legacyFailures: unknown[] = [];
   try {
+    await new Promise<void>((resolve, reject) => {
+      legacyServer.once("error", reject);
+      legacyServer.listen(legacyEndpointIdentity.socketPath, () => resolve());
+    });
       const result = await lead.tool("followup_task", { agent_id: boundaryChild.id, task: replyMode });
       assert.equal(result.kind, replyMode === "legacy" ? "accepted" : "ambiguous");
       assert.equal(result.selection, null); assert.equal(result.identity.model, null); assert.equal(result.identity.thinking, null);
       assert.notEqual(result.submissionId, "different-task");
-  } finally { for (const socket of sockets) socket.destroy(); await new Promise(resolve => legacyServer.close(resolve)); }
+  } catch (error) {
+    legacyFailures.push(error);
+  } finally {
+    await finishCleanup(legacyFailures, [
+      ...[...sockets].map(socket => () => socket.destroy()),
+      () => new Promise<void>((resolve, reject) => legacyServer.close(error => error ? reject(error) : resolve())),
+    ]);
+  }
   atomicWrite(join(root, "workers", `${boundaryChild.id}.json`), { ...legacyEndpointIdentity, available: false });
 }));
 
@@ -377,7 +390,7 @@ test(`missing thinking for ${role} allocates nothing`, { timeout: 30_000 }, () =
 }
 
   for (const thinking of [undefined, null, "", "invented", 42]) {
-test(`invalid thinking ${String(thinking)} is rejected`, { timeout: 30_000 }, () => withSelection(async ({ fixture }) => {
+test(`invalid thinking ${JSON.stringify(thinking)} is rejected`, { timeout: 30_000 }, () => withSelection(async ({ fixture }) => {
   const lead = fixture(); await lead.start();
     await assert.rejects(lead.tool("spawn_agent", { role: "review", task: "brief", thinking }), /Validation failed[\s\S]*thinking/);
 }));
@@ -510,6 +523,7 @@ test("real SDK events, empty-history reload, and cold continuation preserve sele
   await catalog.setRuntimeApiKey("openai", "fixture-not-a-real-key");
   const { session } = await createAgentSession({ cwd: root, agentDir, settingsManager, resourceLoader: loader,
     modelRuntime: catalog, model: reasoning, thinkingLevel: "high", sessionManager: SessionManager.create(root, join(root, "sdk-sessions")) });
+  const sdkFailures: unknown[] = [];
   try {
     await session.bindExtensions({ mode: "tui", onError: error => { errors.push(error); } });
     assert.deepEqual(errors, []);
@@ -529,10 +543,15 @@ test("real SDK events, empty-history reload, and cold continuation preserve sele
     assert.notEqual(afterReload.generation, beforeReload.generation);
     assert.equal(afterReload.piSessionId, beforeReload.piSessionId);
     assert.deepEqual(afterReload.model, key(plain)); assert.equal(afterReload.thinking, "off");
+  } catch (error) {
+    sdkFailures.push(error);
   } finally {
-    Object.assign(process.env, { HERDR_ENV: "0" });
-    await session.reload(); session.dispose();
-    Object.assign(process.env, { HERDR_ENV: "1" });
+    await finishCleanup(sdkFailures, [
+      () => { Object.assign(process.env, { HERDR_ENV: "0" }); },
+      () => session.reload(),
+      () => session.dispose(),
+      () => { Object.assign(process.env, { HERDR_ENV: "1" }); },
+    ]);
   }
 
   const nativeSaved = readIdentity("sdk-worker");
