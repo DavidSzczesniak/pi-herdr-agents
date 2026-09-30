@@ -1,5 +1,6 @@
 import { type ChildProcess } from "node:child_process";
 import { setTimeout as delay } from "node:timers/promises";
+import { onProcessExit } from "./exit.ts";
 
 export function ownChild(child: ChildProcess, processGroup = false) {
   const exited = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
@@ -16,14 +17,19 @@ export function ownChild(child: ChildProcess, processGroup = false) {
       if (!(error instanceof Error && "code" in error && error.code === "ESRCH")) throw error;
     }
   }
+  const release = onProcessExit(() => signal("SIGTERM"));
+  let stopping: Promise<void> | undefined;
   return {
     child,
     exited,
-    async stop() {
-      signal("SIGTERM");
-      await Promise.race([exited.catch(() => {}), delay(1_000)]);
-      signal("SIGKILL");
-      await exited.catch(() => {});
+    stop() {
+      stopping ??= (async () => {
+        signal("SIGTERM");
+        await Promise.race([exited.catch(() => {}), delay(1_000)]);
+        signal("SIGKILL");
+        await exited.catch(() => {});
+      })().then(release);
+      return stopping;
     },
     async wait(timeoutMs: number) {
       let timer: ReturnType<typeof setTimeout> | undefined;
