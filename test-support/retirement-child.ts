@@ -15,11 +15,11 @@ const id = present(process.argv[2], "child id");
 const mode = parseMode(process.argv[3]);
 const parent = present(process.argv[4], "child parent");
 const { native, identity } = retirementNative(directory, { kind: "child", id, mode, parent });
-  const fixture = native();
-  await fixture.emit({ type: "session_start", reason: "startup" });
-  if (mode === "busy" || mode === "pending") {
-    await request(identity(id).socketPath, { kind: "submit", callerId: id, callerGeneration: identity(id).generation,
-      generation: identity(id).generation, submissionId: `task-${id}`, task: "do not retire" });
-  }
-  writeFileSync(join(present(process.env.RETIRE_STATE, "retirement state"), `${id}.ready`), "ready");
-  setInterval(() => {}, 1000);
+const fixture = native();
+await fixture.emit({ type: "session_start", reason: "startup" });
+if (mode === "busy" || mode === "pending") {
+  await request(identity(id).socketPath, { kind: "submit", callerId: id, callerGeneration: identity(id).generation,
+    generation: identity(id).generation, submissionId: `task-${id}`, task: "do not retire" });
+}
+writeFileSync(join(present(process.env.RETIRE_STATE, "retirement state"), `${id}.ready`), "ready");
+setInterval(() => {}, 1000);
