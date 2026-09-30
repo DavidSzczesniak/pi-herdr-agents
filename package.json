@@ -15,23 +15,24 @@
     "transport-check": "node transport-check.ts",
     "adapter-check": "node adapter-check.ts",
     "launch-race-check": "node launch-race-check.ts",
-    "fixture-isolation-check": "node fixture-isolation-check.ts",
+    "fixture-isolation-check": "vitest run fixture-isolation.test.ts",
     "startup-check": "node startup-check.ts",
     "selection-check": "node selection-check.ts",
     "retirement-check": "node retirement-check.ts",
-    "test": "npm run check && npm run transport-check && npm run fixture-isolation-check && npm run startup-check && npm run claude-check && node link-guard-check.ts",
+    "test": "npm run check && vitest run && npm run transport-check && npm run startup-check && npm run claude-check && node link-guard-check.ts",
     "claude-check": "node claude-check.ts"
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
     "typebox": "*"
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "0.87.0",
     "@earendil-works/pi-ai": "0.87.0",
+    "@earendil-works/pi-coding-agent": "0.87.0",
+    "@types/node": "24.13.3",
     "typebox": "1.1.38",
     "typescript": "7.0.2",
-    "@types/node": "24.13.3"
+    "vitest": "5.0.2"
   }
 }
