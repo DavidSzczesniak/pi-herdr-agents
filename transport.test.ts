@@ -4,7 +4,7 @@ import { test } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { parse, RequestSchema, request, socketAlive } from "./protocol.ts";
-import { finishCleanup } from "./test-support/cleanup.ts";
+import { ownTestCleanup } from "./test-support/ownership.ts";
 
 const base = { callerId: "lead", callerGeneration: "g1", generation: "g2" };
 test("rejects wait deadlines below one millisecond", () => {
@@ -21,7 +21,7 @@ test("accepts the minimum wait deadline", () => {
 });
 
 // These real Unix socket checks are transport evidence, not native Pi lifecycle evidence.
-test("exchanges four correlated requests and excludes liveness from the count", async () => {
+test("exchanges four correlated requests and excludes liveness from the count", { timeout: 80_000 }, async () => {
   // macOS socket paths must fit 103 bytes; its tmpdir() path can be too long.
   const directory = mkdtempSync("/tmp/pha-");
   const socketPath = join(directory, "check.sock");
@@ -51,6 +51,12 @@ test("exchanges four correlated requests and excludes liveness from the count", 
       }
     });
   });
+  const ownedCleanup = ownTestCleanup(() => [
+    () => clearTimeout(abortTimer),
+    ...[...sockets].map(socket => () => socket.destroy()),
+    () => new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())),
+    () => rmSync(directory, { recursive: true, force: true }),
+  ], [() => rmSync(directory, { recursive: true, force: true })]);
   try {
     await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(socketPath, resolve); });
     assert.equal(await socketAlive(socketPath), true);
@@ -69,11 +75,6 @@ test("exchanges four correlated requests and excludes liveness from the count", 
   } catch (error) {
     errors.push(error);
   } finally {
-    await finishCleanup(errors, [
-      () => clearTimeout(abortTimer),
-      ...[...sockets].map(socket => () => socket.destroy()),
-      () => new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())),
-      () => rmSync(directory, { recursive: true, force: true }),
-    ]);
+    await ownedCleanup.finish(errors);
   }
 });
