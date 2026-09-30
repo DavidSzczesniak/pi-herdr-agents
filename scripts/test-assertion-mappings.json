@@ -92,6 +92,11 @@
         "before": "writeFileSync(fakeClaude, inline executable template)",
         "after": "writeFileSync(fakeClaude, Node shebang plus test-support/fake-claude.cjs bytes)",
         "reason": "Plain executable source remains byte-identical after evaluating the old template. The audit separately compares all generated program bytes, including throwing validations."
+      },
+      {
+        "before": "Listing and cleanup observe the script's accumulated worker states.",
+        "after": "One independent lifecycle case creates completed, error, unavailable, interrupted, active, restored changed/moved-pane, cleaned failed-launch, lost-pane, and already-retired records through fixture operations before the original listing assertions and retirement/interrupt loops.",
+        "reason": "The prerequisite state matrix matters beyond assertion text. Explicit row-state checks, separate error/interrupted retirement checks, and a non-settled-retirement mutation probe verify that coverage without cross-case dependence."
       }
     ]
   }

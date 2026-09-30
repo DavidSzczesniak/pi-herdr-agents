@@ -10,6 +10,7 @@ import { claudeCommand, interruptClaude, listClaude, pendingWork, readClaudeWork
 import { test } from "vitest";
 import { randomUUID } from "node:crypto";
 import { ownChild } from "./test-support/process.ts";
+import { finishCleanup } from "./test-support/cleanup.ts";
 
 const completeWait = (result: Awaited<ReturnType<typeof waitClaude>>) => { if (result.kind === "timeout") throw new Error(`Claude wait timed out: ${JSON.stringify(result)}`); return result; };
 const timedOut = (result: Awaited<ReturnType<typeof waitClaude>>) => { if (result.kind !== "timeout") throw new Error(`expected Claude timeout, got ${result.kind}`); return result; };
@@ -88,21 +89,21 @@ function claudeFixture(root: string) {
       set detached(value: boolean) { detached = value; },
     },
     async close() {
-      const results = await Promise.allSettled([...processes.values()].map(process => process.stop()));
-      const errors = results.filter(result => result.status === "rejected").map(result => result.reason);
-      if (errors.length) throw new AggregateError(errors, "Claude process cleanup failed");
+      await finishCleanup([], [...processes.values()].map(process => () => process.stop()));
     },
   };
 }
 async function withClaude(check: (suite: ReturnType<typeof claudeFixture>) => Promise<void>) {
   const root = mkdtempSync("/tmp/pha-");
   let suite: ReturnType<typeof claudeFixture> | undefined;
+  const errors: unknown[] = [];
   try {
     suite = claudeFixture(root);
     await check(suite);
+  } catch (error) {
+    errors.push(error);
   } finally {
-    try { await suite?.close(); }
-    finally { rmSync(root, { recursive: true, force: true }); }
+    await finishCleanup(errors, [() => suite?.close(), () => rmSync(root, { recursive: true, force: true })]);
   }
 }
 
@@ -173,18 +174,21 @@ test("other-session Stop cannot settle accepted work", { timeout: 30000 }, () =>
   assert.equal((completeWait(await waitClaude(host, other.workerId, other.submissionId, 10000))).finalText, "own session");
 }));
 
-test("StopFailure is an error", { timeout: 30000 }, () => withClaude(async ({ host, spec }) => {
+test("StopFailure is an error and can be retired", { timeout: 30000 }, () => withClaude(async ({ host, spec, stateDir }) => {
   const failed = await spawnClaude(host, spec("SCENARIO:fail"));
   const failure = completeWait(await waitClaude(host, failed.workerId, failed.submissionId, 10000));
   assert.equal(failure.outcome, "error");
   assert.equal(failure.reason, "rate_limit");
+  assert.equal((await retireClaude(host, failed.workerId)).state, "retired");
+  assert.equal(readClaudeWorker(stateDir, failed.workerId).task.outcome, "error");
 }));
 
-test("SessionEnd without result is unavailable", { timeout: 30000 }, () => withClaude(async ({ host, spec }) => {
+test("SessionEnd without result is unavailable and can be retired", { timeout: 30000 }, () => withClaude(async ({ host, spec }) => {
   const ended = await spawnClaude(host, spec("SCENARIO:end"));
   const end = completeWait(await waitClaude(host, ended.workerId, ended.submissionId, 10000));
   assert.equal(end.kind, "unavailable");
   assert.match(present(end.reason, "session end reason"), /ended without a result \(logout\)/);
+  assert.equal((await retireClaude(host, ended.workerId)).state, "retired");
 }));
 
 test("trust dialog fails fast without answering and closes exact new pane", { timeout: 30000 }, () => withClaude(async ({ host, spec }) => {
@@ -261,7 +265,7 @@ test("active timeout remains active and cannot be retired", { timeout: 30000 }, 
   assert.equal(unresolvedClaudeChild(stateDir, (parentId) => parentId === "someone-else"), undefined);
 }));
 
-test("interrupt in split tab closes only the owned pane", { timeout: 30000 }, () => withClaude(async ({ host, spec, stateDir, cwd, panes }) => {
+test("interrupt in split tab closes only the owned pane and permits retirement", { timeout: 30000 }, () => withClaude(async ({ host, spec, stateDir, cwd, panes }) => {
   const hung = await spawnClaude(host, spec("SCENARIO:hang"));
   const hungPane = readClaudeWorker(stateDir, hung.workerId);
   panes.set("w1:split", { pane_id: "w1:split", workspace_id: "w1", tab_id: hungPane.tabId, terminal_id: "term-split", cwd, output: "" });
@@ -269,6 +273,8 @@ test("interrupt in split tab closes only the owned pane", { timeout: 30000 }, ()
   assert.equal(interrupted.outcome, "interrupted");
   assert.ok(!panes.has(hungPane.paneId) && panes.has("w1:split"), "only the exact Claude pane closed");
   assert.equal(readClaudeWorker(stateDir, hung.workerId).state, "closed");
+  assert.equal((await retireClaude(host, hung.workerId)).state, "retired");
+  assert.equal(readClaudeWorker(stateDir, hung.workerId).task.outcome, "interrupted");
 }));
 
 test("result arriving during interrupt close wins and clears intent", { timeout: 30000 }, () => withClaude(async ({ host, spec, stateDir, controls, paneOf }) => {
@@ -345,7 +351,6 @@ test("changed terminal refuses retirement", { timeout: 30000 }, () => withClaude
   present(panes.get(paneOf(moved.workerId)), "pane").terminal_id = "someone-else";
   await assert.rejects(retireClaude(host, moved.workerId), /identity changed; close refused/);
   assert.equal(readClaudeWorker(stateDir, moved.workerId).state, "open");
-  present(panes.get(paneOf(moved.workerId)), "pane").terminal_id = readClaudeWorker(stateDir, moved.workerId).terminalId;
 }));
 
 test("moved pane ID is neither absent nor closable", { timeout: 30000 }, () => withClaude(async ({ host, spec, panes, paneOf }) => {
@@ -355,8 +360,6 @@ test("moved pane ID is neither absent nor closable", { timeout: 30000 }, () => w
   panes.delete(movedPane.pane_id);
   panes.set("w2:p99", { ...movedPane, pane_id: "w2:p99", workspace_id: "w2" });
   await assert.rejects(retireClaude(host, moved.workerId), /moved or identity changed; close refused/);
-  panes.delete("w2:p99");
-  panes.set(movedPane.pane_id, movedPane);
 }));
 
 test("background job and wake-up hold completion until first empty Stop", { timeout: 30000 }, () => withClaude(async ({ host, spec, tpath }) => {
@@ -437,7 +440,7 @@ test("ordinary SessionEnd while deferred is unavailable", { timeout: 30000 }, ()
   await new Promise((resolve) => setTimeout(resolve, 300));
   writeFileSync(join(stateDir, "claude", ended2.workerId, "hooks", "SessionEnd-9999999999-2.json"), JSON.stringify({ session_id: "s1", reason: "other" }));
   assert.equal((completeWait(await waitClaude(host, ended2.workerId, ended2.submissionId, 10000))).kind, "unavailable");
-  await interruptClaude(host, ended2.workerId, ended2.submissionId).catch(() => {});
+  await interruptClaude(host, ended2.workerId, ended2.submissionId);
 }));
 
 test("unreadable transcript prevents Stop settlement and explains pane loss", { timeout: 30000 }, () => withClaude(async ({ host, spec, tpath, panes, paneOf }) => {
@@ -604,29 +607,73 @@ test("incremental reader preserves split UTF-8 and isolates shrink by worker", {
   assert.deepEqual(readTranscript(readerB, partialPath), [], "another worker's reader is unaffected");
 }));
 
-test("listing hides final text and parent filter excludes foreign workers", { timeout: 60000 }, () => withClaude(async ({ host, spec }) => {
-  for (let i = 0; i < 10; i++) {
-    const seeded = await spawnClaude(host, spec("SCENARIO:complete"));
-    completeWait(await waitClaude(host, seeded.workerId, seeded.submissionId, 10000));
-  }
-  const foreignHost = { ...host, workerId: "stranger" };
-  await spawnClaude(foreignHost, spec("SCENARIO:complete"));
-  const rows = await listClaude(host, (parentId) => parentId === "lead");
-  assert.ok(rows.length >= 10 && rows.every((row) => row.kind === "claude_status" && row.task?.finalText === ""));
-  assert.deepEqual(await listClaude(host, (parentId) => parentId === "someone-else"), []);
-}));
-
-test("cleanup clears settled and active children except uncertain launch", { timeout: 30000 }, () => withClaude(async ({ host, spec, controls, herdr, cwd, stateDir }) => {
+test("listing and cleanup preserve mixed worker states and uncertain launch", { timeout: 60000 }, () => withClaude(async ({ host, spec, controls, herdr, cwd, stateDir, panes, paneOf }) => {
   const done = await spawnClaude(host, spec("Review this. SCENARIO:complete"));
   const settled = completeWait(await waitClaude(host, done.workerId, done.submissionId, 10000));
+  const failed = await spawnClaude(host, spec("SCENARIO:fail"));
+  assert.equal(completeWait(await waitClaude(host, failed.workerId, failed.submissionId, 10000)).outcome, "error");
+  const ended = await spawnClaude(host, spec("SCENARIO:end"));
+  assert.equal(completeWait(await waitClaude(host, ended.workerId, ended.submissionId, 10000)).kind, "unavailable");
+  const interrupted = await spawnClaude(host, spec("SCENARIO:hang"));
+  assert.equal((await interruptClaude(host, interrupted.workerId, interrupted.submissionId)).outcome, "interrupted");
+  const active = await spawnClaude(host, spec("SCENARIO:hang"));
+
+  const changed = await spawnClaude(host, spec("SCENARIO:complete"));
+  completeWait(await waitClaude(host, changed.workerId, changed.submissionId, 10000));
+  const changedPane = present(panes.get(paneOf(changed.workerId)), "changed pane");
+  changedPane.terminal_id = "someone-else";
+  await assert.rejects(retireClaude(host, changed.workerId), /identity changed; close refused/);
+  changedPane.terminal_id = readClaudeWorker(stateDir, changed.workerId).terminalId;
+
+  const moved = await spawnClaude(host, spec("SCENARIO:complete"));
+  completeWait(await waitClaude(host, moved.workerId, moved.submissionId, 10000));
+  const movedPane = present(panes.get(paneOf(moved.workerId)), "moved pane");
+  panes.delete(movedPane.pane_id);
+  panes.set("w2:p99", { ...movedPane, pane_id: "w2:p99", workspace_id: "w2" });
+  await assert.rejects(retireClaude(host, moved.workerId), /moved or identity changed; close refused/);
+  panes.delete("w2:p99");
+  panes.set(movedPane.pane_id, movedPane);
+
+  const abort = new AbortController();
+  controls.onCreate = () => { controls.onCreate = undefined; const result = herdr(["tab", "create", "--cwd", cwd]); abort.abort(); return result; };
+  await assert.rejects(spawnClaude(host, spec("SCENARIO:complete"), abort.signal), /Cleanup exact new pane closed/);
+  const cleanFailedId = present(readdirSync(join(stateDir, "claude")).find(id =>
+    JSON.parse(readFileSync(join(stateDir, "claude", id, "launch.json"), "utf8")).cleanup === "exact new pane closed"), "cleaned failed launch");
+
+  const lost = await spawnClaude(host, spec("SCENARIO:hang"));
+  await herdr(["pane", "close", paneOf(lost.workerId)]);
+  assert.equal(completeWait(await waitClaude(host, lost.workerId, lost.submissionId, 10000)).kind, "unavailable");
+  const retired = await spawnClaude(host, spec("SCENARIO:complete"));
+  completeWait(await waitClaude(host, retired.workerId, retired.submissionId, 10000));
+  assert.equal((await retireClaude(host, retired.workerId)).state, "retired");
+
   controls.onCreate = async () => { controls.onCreate = undefined; await herdr(["tab", "create", "--cwd", cwd]); throw new Error("fixture: response lost after creation"); };
   await assert.rejects(spawnClaude(host, spec("SCENARIO:complete")), /Cleanup uncertain: tab creation outcome unknown/);
   const uncertainId = readdirSync(join(stateDir, "claude")).find((id) => {
     try { return JSON.parse(readFileSync(join(stateDir, "claude", id, "launch.json"), "utf8")).cleanup?.startsWith("uncertain: tab creation"); } catch { return false; }
   });
   assert.ok(uncertainId);
-  await spawnClaude(host, spec("SCENARIO:hang"));
+  const foreignHost = { ...host, workerId: "stranger" };
+  const foreign = await spawnClaude(foreignHost, spec("SCENARIO:complete"));
   const rows = await listClaude(host, (parentId) => parentId === "lead");
+  assert.ok(rows.length >= 10 && rows.every((row) => row.kind === "claude_status" && row.task?.finalText === ""));
+  assert.deepEqual(await listClaude(host, (parentId) => parentId === "someone-else"), []);
+  assert.ok(rows.every(row => row.workerId !== foreign.workerId));
+  for (const { workerId, state, kind, outcome } of [
+    { workerId: done.workerId, state: "open", kind: "settled", outcome: "completed" },
+    { workerId: failed.workerId, state: "open", kind: "settled", outcome: "error" },
+    { workerId: ended.workerId, state: "open", kind: "unavailable", outcome: null },
+    { workerId: interrupted.workerId, state: "closed", kind: "settled", outcome: "interrupted" },
+    { workerId: active.workerId, state: "open", kind: "active", outcome: null },
+    { workerId: changed.workerId, state: "open", kind: "settled", outcome: "completed" },
+    { workerId: moved.workerId, state: "open", kind: "settled", outcome: "completed" },
+    { workerId: cleanFailedId, state: "closed", kind: "unavailable", outcome: null },
+    { workerId: lost.workerId, state: "closed", kind: "unavailable", outcome: null },
+    { workerId: retired.workerId, state: "closed", kind: "settled", outcome: "completed" },
+  ]) {
+    const row = present(rows.find(row => row.workerId === workerId), "mixed-state listing row");
+    assert.deepEqual({ state: row.state, kind: row.task?.kind, outcome: row.task?.outcome }, { state, kind, outcome });
+  }
   for (const row of rows) if (row.state === "open" && row.task.kind !== "active") await retireClaude(host, row.workerId);
   for (const row of rows) if (row.task?.kind === "active") await interruptClaude(host, row.workerId, row.task.submissionId);
   assert.equal(unresolvedClaudeChild(stateDir, (parentId) => parentId === "lead"), uncertainId, "only the uncertain launch still blocks");
