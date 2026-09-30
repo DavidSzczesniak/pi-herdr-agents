@@ -8,6 +8,7 @@ import { atomicWrite } from "./protocol.ts";
 import { runtimeSocket, socketDirectory } from "./startup.ts";
 import { present, fixtureEnvironment } from "./fakes.ts";
 import { ownChild } from "./test-support/process.ts";
+import { finishCleanup } from "./test-support/cleanup.ts";
 import type { RaceMessage } from "./test-support/launch-contender.ts";
 
 const file = fileURLToPath(import.meta.url);
@@ -29,6 +30,7 @@ async function withRace(check: (race: { state: string; originalSession: string; 
   const owned: ReturnType<typeof ownChild>[] = [];
   const messages: RaceMessage[] = [];
   const messageErrors: unknown[] = [];
+  const errors: unknown[] = [];
   async function waitFor(predicate: () => boolean) {
     const deadline = Date.now() + 10000;
     while (!predicate()) {
@@ -69,12 +71,14 @@ async function withRace(check: (race: { state: string; originalSession: string; 
       assert.equal(child.exitCode, 0, "contender completed lifecycle cleanup");
     }
     check({ state, originalSession, messages });
+  } catch (error) {
+    errors.push(error);
   } finally {
-    const results = await Promise.allSettled(owned.map(child => child.stop()));
-    rmSync(socketDirectory(state, directory), { recursive: true, force: true });
-    rmSync(directory, { recursive: true, force: true });
-    const errors = results.filter(result => result.status === "rejected").map(result => result.reason);
-    if (errors.length) throw new AggregateError(errors, "contender cleanup failed");
+    await finishCleanup(errors, [
+      ...owned.map(child => () => child.stop()),
+      () => rmSync(socketDirectory(state, directory), { recursive: true, force: true }),
+      () => rmSync(directory, { recursive: true, force: true }),
+    ]);
   }
 }
 
