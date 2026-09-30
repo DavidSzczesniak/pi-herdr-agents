@@ -19,8 +19,8 @@
     "startup-check": "vitest run startup.test.ts",
     "selection-check": "vitest run selection.test.ts",
     "retirement-check": "vitest run retirement.test.ts",
-    "test": "npm run check && vitest run && npm run claude-check",
-    "claude-check": "node claude-check.ts"
+    "test": "npm run check && vitest run",
+    "claude-check": "vitest run claude.test.ts"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
