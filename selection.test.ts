@@ -14,6 +14,7 @@ import type { Model, Api, ModelThinkingLevel } from "@earendil-works/pi-ai";
 import type { Request } from "./protocol.ts";
 import { test } from "vitest";
 import { finishCleanup } from "./test-support/cleanup.ts";
+import { ownTestCleanup } from "./test-support/ownership.ts";
 
 async function selectionFixture(root: string) {
   type SelectionFixture = { id: string; ctx: ReturnType<typeof fakeContext>; tools: ReturnType<typeof toolRegistry>; sessionFile: string;
@@ -131,18 +132,17 @@ async function withSelection(check: (suite: Awaited<ReturnType<typeof selectionF
   const originalEnv = { ...process.env };
   let suite: Awaited<ReturnType<typeof selectionFixture>> | undefined;
   const errors: unknown[] = [];
+  const restore = () => replaceEnvironment(originalEnv);
+  const removeSockets = () => rmSync(socketDirectory(root, root), { recursive: true, force: true });
+  const removeRoot = () => rmSync(root, { recursive: true, force: true });
+  const ownedCleanup = ownTestCleanup(() => [() => suite?.close(), restore, removeSockets, removeRoot], [removeRoot, removeSockets, restore]);
   try {
     suite = await selectionFixture(root);
     await check(suite);
   } catch (error) {
     errors.push(error);
   } finally {
-    await finishCleanup(errors, [
-      () => suite?.close(),
-      () => replaceEnvironment(originalEnv),
-      () => rmSync(socketDirectory(root, root), { recursive: true, force: true }),
-      () => rmSync(root, { recursive: true, force: true }),
-    ]);
+    await ownedCleanup.finish(errors);
   }
 }
 
@@ -312,6 +312,10 @@ test(`legacy endpoint ${replyMode} preserves unknown selection and correlation`,
     });
   });
   const legacyFailures: unknown[] = [];
+  const legacyCleanup = ownTestCleanup(() => [
+    ...[...sockets].map(socket => () => socket.destroy()),
+    () => new Promise<void>((resolve, reject) => legacyServer.close(error => error ? reject(error) : resolve())),
+  ], []);
   try {
     await new Promise<void>((resolve, reject) => {
       legacyServer.once("error", reject);
@@ -324,10 +328,7 @@ test(`legacy endpoint ${replyMode} preserves unknown selection and correlation`,
   } catch (error) {
     legacyFailures.push(error);
   } finally {
-    await finishCleanup(legacyFailures, [
-      ...[...sockets].map(socket => () => socket.destroy()),
-      () => new Promise<void>((resolve, reject) => legacyServer.close(error => error ? reject(error) : resolve())),
-    ]);
+    await legacyCleanup.finish(legacyFailures);
   }
   atomicWrite(join(root, "workers", `${boundaryChild.id}.json`), { ...legacyEndpointIdentity, available: false });
 }));
@@ -524,6 +525,12 @@ test("real SDK events, empty-history reload, and cold continuation preserve sele
   const { session } = await createAgentSession({ cwd: root, agentDir, settingsManager, resourceLoader: loader,
     modelRuntime: catalog, model: reasoning, thinkingLevel: "high", sessionManager: SessionManager.create(root, join(root, "sdk-sessions")) });
   const sdkFailures: unknown[] = [];
+  const ownedSession = ownTestCleanup(() => [
+    () => { Object.assign(process.env, { HERDR_ENV: "0" }); },
+    () => session.reload(),
+    () => session.dispose(),
+    () => { Object.assign(process.env, { HERDR_ENV: "1" }); },
+  ], []);
   try {
     await session.bindExtensions({ mode: "tui", onError: error => { errors.push(error); } });
     assert.deepEqual(errors, []);
@@ -546,12 +553,7 @@ test("real SDK events, empty-history reload, and cold continuation preserve sele
   } catch (error) {
     sdkFailures.push(error);
   } finally {
-    await finishCleanup(sdkFailures, [
-      () => { Object.assign(process.env, { HERDR_ENV: "0" }); },
-      () => session.reload(),
-      () => session.dispose(),
-      () => { Object.assign(process.env, { HERDR_ENV: "1" }); },
-    ]);
+    await ownedSession.finish(sdkFailures);
   }
 
   const nativeSaved = readIdentity("sdk-worker");

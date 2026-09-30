@@ -1,5 +1,6 @@
 import { type ChildProcess } from "node:child_process";
 import { setTimeout as delay } from "node:timers/promises";
+import { onProcessExit } from "./exit.ts";
 
 type ProcessExit = { code: number; signal: null } | { code: null; signal: NodeJS.Signals };
 
@@ -32,6 +33,7 @@ export function ownChild(child: ChildProcess, processGroup = false) {
       clearTimeout(timer);
     }
   }
+  const release = onProcessExit(() => signal("SIGTERM"));
   let stopping: Promise<void> | undefined;
   return {
     child,
@@ -44,7 +46,7 @@ export function ownChild(child: ChildProcess, processGroup = false) {
         await Promise.race([exited.catch(() => {}), delay(1_000, undefined, { ref: false })]);
         signal("SIGKILL");
         await wait(5_000);
-      })();
+      })().then(release);
       return stopping;
     },
   };

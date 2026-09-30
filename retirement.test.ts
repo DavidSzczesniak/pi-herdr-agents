@@ -11,6 +11,7 @@ import { present, toolText, fixtureEnvironment, replaceEnvironment } from "./fak
 import { retirementNative, type RetirementMode } from "./test-support/retirement-native.ts";
 import { ownChild } from "./test-support/process.ts";
 import { finishCleanup } from "./test-support/cleanup.ts";
+import { ownTestCleanup } from "./test-support/ownership.ts";
 
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 async function retirementFixture(directory: string, originalEnv: NodeJS.ProcessEnv) {
@@ -51,6 +52,10 @@ async function withRetirement(check: (suite: Awaited<ReturnType<typeof retiremen
   const originalEnv = { ...process.env };
   let suite: Awaited<ReturnType<typeof retirementFixture>> | undefined;
   const errors: unknown[] = [];
+  const restore = () => replaceEnvironment(originalEnv);
+  const removeSockets = () => rmSync(socketDirectory(directory, directory), { recursive: true, force: true });
+  const removeRoot = () => rmSync(directory, { recursive: true, force: true });
+  const ownedCleanup = ownTestCleanup(() => [() => suite?.close(), restore, removeSockets, removeRoot], [removeRoot, removeSockets, restore]);
   try {
     suite = await retirementFixture(directory, originalEnv);
     const { fixture } = suite;
@@ -60,12 +65,7 @@ async function withRetirement(check: (suite: Awaited<ReturnType<typeof retiremen
   } catch (error) {
     errors.push(error);
   } finally {
-    await finishCleanup(errors, [
-      () => suite?.close(),
-      () => replaceEnvironment(originalEnv),
-      () => rmSync(socketDirectory(directory, directory), { recursive: true, force: true }),
-      () => rmSync(directory, { recursive: true, force: true }),
-    ]);
+    await ownedCleanup.finish(errors);
   }
 }
 

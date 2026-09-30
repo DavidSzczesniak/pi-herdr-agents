@@ -8,7 +8,7 @@ import { atomicWrite } from "./protocol.ts";
 import { runtimeSocket, socketDirectory } from "./startup.ts";
 import { present, fixtureEnvironment } from "./fakes.ts";
 import { ownChild } from "./test-support/process.ts";
-import { finishCleanup } from "./test-support/cleanup.ts";
+import { ownTestCleanup } from "./test-support/ownership.ts";
 import type { RaceMessage } from "./test-support/launch-contender.ts";
 
 const file = fileURLToPath(import.meta.url);
@@ -31,6 +31,11 @@ async function withRace(check: (race: { state: string; originalSession: string; 
   const messages: RaceMessage[] = [];
   const messageErrors: unknown[] = [];
   const errors: unknown[] = [];
+  const removeSockets = () => rmSync(socketDirectory(state, directory), { recursive: true, force: true });
+  const removeRoot = () => rmSync(directory, { recursive: true, force: true });
+  const ownedCleanup = ownTestCleanup(() => [
+    ...owned.map(child => () => child.stop()), removeSockets, removeRoot,
+  ], [removeRoot, removeSockets]);
   async function waitFor(predicate: () => boolean) {
     const deadline = Date.now() + 10000;
     while (!predicate()) {
@@ -74,11 +79,7 @@ async function withRace(check: (race: { state: string; originalSession: string; 
   } catch (error) {
     errors.push(error);
   } finally {
-    await finishCleanup(errors, [
-      ...owned.map(child => () => child.stop()),
-      () => rmSync(socketDirectory(state, directory), { recursive: true, force: true }),
-      () => rmSync(directory, { recursive: true, force: true }),
-    ]);
+    await ownedCleanup.finish(errors);
   }
 }
 
