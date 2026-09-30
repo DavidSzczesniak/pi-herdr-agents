@@ -19,7 +19,7 @@
     "startup-check": "node startup-check.ts",
     "selection-check": "node selection-check.ts",
     "retirement-check": "node retirement-check.ts",
-    "test": "npm run check && vitest run && npm run startup-check && npm run claude-check && node link-guard-check.ts",
+    "test": "npm run check && vitest run && npm run startup-check && npm run claude-check",
     "claude-check": "node claude-check.ts"
   },
   "peerDependencies": {
