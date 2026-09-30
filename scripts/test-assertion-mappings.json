@@ -1,4 +1,11 @@
 {
+  "selection": {
+    "loops": [{
+      "before": "for (replyMode of [\"legacy\", \"mismatch\", \"invalid\", \"disconnect\"])",
+      "after": "for (const replyMode of [\"legacy\", \"mismatch\", \"invalid\", \"disconnect\"])",
+      "reason": "Each registration closes over its own replyMode instead of mutating one server across rows. The four inputs and all row assertions are unchanged."
+    }]
+  },
   "adapter": {
     "mechanical": [{
       "before": "four unowned spawn calls and a SIGKILLed Perl zombie holder",
