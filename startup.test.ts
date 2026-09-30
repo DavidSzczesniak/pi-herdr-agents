@@ -114,6 +114,20 @@ async function withStartup(check: (suite: ReturnType<typeof startupFixture>) => 
   }
 }
 
+test("nested cleanup exposes body and teardown failures separately", async () => {
+  const body = new Error("body failure"), close = new Error("close failure"), removal = new Error("removal failure");
+  await assert.rejects(finishCleanup([], [
+    () => finishCleanup([body], [() => { throw close; }]),
+    () => { throw removal; },
+  ]), error => {
+    assert.ok(error instanceof AggregateError);
+    assert.deepEqual(error.errors, [body, close, removal]);
+    return true;
+  });
+  const empty = new AggregateError([], "empty aggregate body failure");
+  await assert.rejects(finishCleanup([empty], []), error => error === empty);
+});
+
 for (const mode of ["rpc", "json", "print", undefined]) {
   test(`is inert in ${mode ?? "sdk"}`, () => withStartup(async ({ fixture, inert, stateRoot }) => {
     const instance = fixture({ mode: mode ?? "sdk" });
